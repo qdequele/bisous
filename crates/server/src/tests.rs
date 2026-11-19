@@ -42,6 +42,8 @@ struct Probe {
     teardown_delay_ms: AtomicU64,
     /// The config of the last source the engine opened.
     last_opened: std::sync::Mutex<Option<Value>>,
+    /// The configs torn down, in order.
+    torn_down: std::sync::Mutex<Vec<Value>>,
 }
 
 struct FakeSources(Arc<Probe>);
@@ -172,6 +174,11 @@ impl Source for FakeSource {
 
     async fn teardown(&mut self) -> Result<(), SourceError> {
         self.probe.teardowns.fetch_add(1, Ordering::SeqCst);
+        self.probe
+            .torn_down
+            .lock()
+            .unwrap()
+            .push(self.config.clone());
         let delay = self.probe.teardown_delay_ms.load(Ordering::SeqCst);
         if delay > 0 {
             tokio::time::sleep(Duration::from_millis(delay)).await;
@@ -1094,6 +1101,134 @@ async fn resume_racing_put_runs_the_stored_spec() {
         let opened = a.probe.last_opened.lock().unwrap().clone().unwrap();
         assert_eq!(opened["rows"], want, "round {round}");
     }
+}
+
+// ------------------------------------------------------------- put
+
+async fn written(a: &App, id: &str) -> u64 {
+    let (_, st) = call(&a.router, "GET", &format!("/syncs/{id}/status"), &[], None).await;
+    st["progress"]["written"].as_u64().unwrap()
+}
+
+async fn streaming(a: &App, id: &str) {
+    let uri = format!("/syncs/{id}/status");
+    wait_for(async || {
+        let st = call(&a.router, "GET", &uri, &[], None).await.1;
+        st["phase"] == "streaming" && st["has_checkpoint"] == true
+    })
+    .await;
+}
+
+async fn put(a: &App, id: &str, query: &str, body: Value) -> (StatusCode, Value) {
+    call(
+        &a.router,
+        "PUT",
+        &format!("/syncs/{id}{query}"),
+        &[],
+        Some(body),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn a_new_origin_is_torn_down_with_the_old_spec_and_synced_fresh() {
+    let a = app(AuthConfig::default());
+    let mut body = sync_body("s");
+    body["source"]["config"]["host"] = json!("old-db");
+    let (_, created) = call(&a.router, "POST", "/syncs", &[], Some(body.clone())).await;
+    let id = created["id"].as_str().unwrap().to_owned();
+    streaming(&a, &id).await;
+    assert_eq!(written(&a, &id).await, 3);
+
+    body["source"]["config"]["host"] = json!("new-db");
+    body["source"]["config"]["rows"] = json!(5);
+    let (status, resp) = put(&a, &id, "", body.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{resp}");
+    let torn: Vec<Value> = a.probe.torn_down.lock().unwrap().clone();
+    assert_eq!(torn.len(), 1);
+    assert_eq!(torn[0]["host"], "old-db", "torn down with the old spec");
+    // The checkpoint was cleared: the new origin is snapshotted.
+    wait_for(async || written(&a, &id).await == 8).await;
+    streaming(&a, &id).await;
+
+    // A teardown that fails changes nothing, unless forced.
+    a.probe.teardown_fails.store(true, Ordering::SeqCst);
+    body["source"]["config"]["host"] = json!("third-db");
+    let (status, resp) = put(&a, &id, "", body.clone()).await;
+    assert_eq!(
+        (status, resp["code"].as_str()),
+        (StatusCode::BAD_GATEWAY, Some("teardown_failed")),
+        "{resp}"
+    );
+    let stored = a.store.get_sync(None, &id).await.unwrap().unwrap().spec;
+    assert_eq!(stored.source.config["host"], "new-db");
+    assert_eq!(a.state.manager.running_ids(), vec![id.clone()]);
+    streaming(&a, &id).await;
+    let (status, _) = put(&a, &id, "?force=true", body).await;
+    assert_eq!(status, StatusCode::OK);
+    let stored = a.store.get_sync(None, &id).await.unwrap().unwrap().spec;
+    assert_eq!(stored.source.config["host"], "third-db");
+}
+
+#[tokio::test]
+async fn changed_streams_are_backfilled_and_a_rename_only_restarts() {
+    let a = app(AuthConfig::default());
+    let id = create(&a, &[], "s").await;
+    streaming(&a, &id).await;
+    assert_eq!(written(&a, &id).await, 3);
+    let (_, mut current) = call(&a.router, "GET", &format!("/syncs/{id}"), &[], None).await;
+
+    // Name and guard only: no new snapshot, no teardown.
+    current["name"] = json!("renamed");
+    current["mass_delete_guard"] = json!(0.9);
+    let (status, _) = put(&a, &id, "", current.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    streaming(&a, &id).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(written(&a, &id).await, 3);
+
+    // Another index, primary key or field selection: everything again.
+    current["streams"][0]["index"] = json!("items_v2");
+    current["streams"][0]["fields"] = json!({"include": ["n"]});
+    let (status, _) = put(&a, &id, "", current.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    wait_for(async || written(&a, &id).await == 6).await;
+    // A new collection too.
+    current["streams"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"collection": "public.other", "index": "other"}));
+    let (status, _) = put(&a, &id, "", current).await;
+    assert_eq!(status, StatusCode::OK);
+    wait_for(async || written(&a, &id).await == 9).await;
+    assert_eq!(a.probe.teardowns.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn put_on_a_paused_sync_leaves_it_paused() {
+    let a = app(AuthConfig::default());
+    let id = create(&a, &[], "s").await;
+    streaming(&a, &id).await;
+    call(&a.router, "POST", &format!("/syncs/{id}/pause"), &[], None).await;
+    let (_, mut current) = call(&a.router, "GET", &format!("/syncs/{id}"), &[], None).await;
+    for edit in ["name", "streams"] {
+        if edit == "name" {
+            current["name"] = json!("still paused");
+        } else {
+            current["streams"][0]["index"] = json!("elsewhere");
+        }
+        let (status, resp) = put(&a, &id, "", current.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{resp}");
+        let (_, st) = call(&a.router, "GET", &format!("/syncs/{id}/status"), &[], None).await;
+        assert_eq!(
+            (st["phase"].as_str(), st["running"].as_bool()),
+            (Some("paused"), Some(false)),
+            "{edit}: {st}"
+        );
+    }
+    // Resuming runs the new spec from scratch (its streams changed).
+    call(&a.router, "POST", &format!("/syncs/{id}/resume"), &[], None).await;
+    wait_for(async || written(&a, &id).await == 6).await;
 }
 
 // ------------------------------------------------------------- lifecycle

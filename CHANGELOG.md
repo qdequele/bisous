@@ -53,3 +53,8 @@ All notable changes to meili-connect are listed here. The format follows
   release) runs under the sync's lock on the row read inside it: a `PUT`
   racing a `DELETE` no longer restarts a deleted sync, and a `resume` racing a
   `PUT` no longer brings back the old spec.
+- `PUT` acts on what changed: a new origin is torn down with the old spec
+  first (`502 teardown_failed` and nothing changed when that fails, unless
+  `?force=true`) and synced fresh; new streams or another Meilisearch URL
+  clear the checkpoint so the data is backfilled; anything else restarts.
+  A paused sync stays paused.

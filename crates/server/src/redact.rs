@@ -9,7 +9,7 @@
 //! puts the stored value back at the same path, so a client can `GET`,
 //! edit and `PUT` a sync without ever seeing its secrets.
 
-use meili_connect_core::SourceKind;
+use meili_connect_core::{SourceKind, SourceSpec};
 use serde_json::Value;
 
 pub const REDACTED: &str = "<redacted>";
@@ -185,6 +185,26 @@ fn identity_paths(kind: SourceKind) -> &'static [&'static [&'static str]] {
             &["credentials", "session_name"],
         ],
     }
+}
+
+/// Fields that name objects the sync owns on the origin, besides the
+/// identity: changing them orphans the old objects like a new host would.
+fn origin_object_paths(kind: SourceKind) -> &'static [&'static [&'static str]] {
+    match kind {
+        SourceKind::Postgres | SourceKind::Supabase => &[&["slot_name"], &["publication_name"]],
+        SourceKind::Mysql => &[&["server_id"]],
+        _ => &[],
+    }
+}
+
+/// Both source specs (real values, no placeholders) reach the same origin
+/// as the same user and own the same objects there.
+pub fn same_origin(old: &SourceSpec, new: &SourceSpec) -> bool {
+    old.kind == new.kind
+        && identity_paths(old.kind)
+            .iter()
+            .chain(origin_object_paths(old.kind))
+            .all(|path| at(&old.config, path) == at(&new.config, path))
 }
 
 fn at<'a>(value: &'a Value, path: &[&str]) -> Option<&'a Value> {

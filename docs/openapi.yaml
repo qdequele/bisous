@@ -145,12 +145,23 @@ paths:
         "401": { $ref: "#/components/responses/Error" }
         "404": { $ref: "#/components/responses/Error" }
     put:
-      summary: Replace a sync's spec, then restart it
+      summary: Replace a sync's spec
       description: |
-        Stops the sync, stores the new spec and starts it again. Send
+        Stores the new spec. A new origin (kind, host, port, URL, user,
+        database, TLS, slot or publication name) is a fresh sync: the old
+        origin is torn down first with the old spec, and when that fails
+        nothing changes (`502 teardown_failed`) unless `?force=true`. Other
+        streams or another Meilisearch URL clear the checkpoint, so
+        everything is snapshotted again. Any other change restarts the sync.
+        A paused sync stays paused. Send
         `"<redacted>"` for a secret to keep the stored value. `id`, `tenant`,
         `created_at` and `updated_at` may be sent (a `GET` body works as is)
         and are ignored.
+      parameters:
+        - name: force
+          in: query
+          schema: { type: boolean, default: false }
+          description: Go on when the old origin cannot be torn down.
       requestBody:
         required: true
         content:
@@ -167,6 +178,7 @@ paths:
         "404": { $ref: "#/components/responses/Error" }
         "409": { $ref: "#/components/responses/Error" }
         "422": { $ref: "#/components/responses/Error" }
+        "502": { $ref: "#/components/responses/Error" }
     delete:
       summary: Delete a sync
       description: |

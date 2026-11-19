@@ -281,8 +281,10 @@ pub async fn update_sync(
     State(state): State<AppState>,
     scope: Scope,
     Path(id): Path<String>,
+    query: Result<Query<ForceQuery>, QueryRejection>,
     input: Result<Json<Value>, JsonRejection>,
 ) -> ApiResult<Json<SyncView>> {
+    let Query(query) = query?;
     let mut value = body(input)?;
     let coarse = coarse(&scope);
     // Everything that depends on the stored spec runs inside the sync's
@@ -298,12 +300,16 @@ pub async fn update_sync(
         validate(&state, &spec, coarse).await?;
         Ok(spec)
     };
-    let stored = state.manager.update(scope.tenant(), &id, prepare).await?;
+    let stored = state
+        .manager
+        .update(scope.tenant(), &id, query.force, prepare)
+        .await?;
     Ok(Json(view(&stored)?))
 }
 
+/// `?force=true`: go on when the origin cannot be cleaned up.
 #[derive(Debug, Deserialize)]
-pub struct DeleteQuery {
+pub struct ForceQuery {
     #[serde(default)]
     force: bool,
 }
@@ -312,7 +318,7 @@ pub async fn delete_sync(
     State(state): State<AppState>,
     scope: Scope,
     Path(id): Path<String>,
-    query: Result<Query<DeleteQuery>, QueryRejection>,
+    query: Result<Query<ForceQuery>, QueryRejection>,
 ) -> ApiResult<StatusCode> {
     let Query(query) = query?;
     state

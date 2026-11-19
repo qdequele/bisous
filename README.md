@@ -119,7 +119,20 @@ spec the API returns has the Meilisearch key and the source's secrets
 
 ### Update
 
-`PUT` replaces the spec, then stops and restarts the sync. Send
+`PUT` replaces the spec. What happens next depends on what changed:
+
+- **Another origin** (kind, host, port, URL, user, database, TLS, slot or
+  publication name): the old origin is cleaned up first with the old spec
+  (slot, publication…); if that fails nothing changes (`502
+  teardown_failed`, or `?force=true` to go on and clean up by hand). Then the
+  sync starts fresh: full snapshot.
+- **Other streams** (index, primary key, fields, renames, vector, a new
+  collection) **or another Meilisearch URL**: the checkpoint is cleared and
+  the sync snapshots everything again, into shadow indexes where the live
+  ones hold data, so new mappings are backfilled.
+- **Anything else** (name, guard, secrets, tuning): a plain restart.
+
+A paused sync stays paused. Send
 `"<redacted>"` for any secret to keep the stored value, so a `GET` body can be
 edited and sent back. A placeholder is only accepted while the connection it
 belongs to is unchanged: the source's kind, hosts, ports, URLs, user,
@@ -357,7 +370,6 @@ Known limits:
 - One collection per index; no joins across tables; transforms are field
   selection, renames and a vector field only.
 - Usage counts not yet enqueued are lost on a crash (see above).
-- `PUT` restarts the sync even when it was paused.
 - No web UI: the Lab console is the UI.
 
 ## Development

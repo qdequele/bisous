@@ -34,6 +34,7 @@ use tracing::{info, warn};
 
 use crate::error::ApiError;
 use crate::guard::{CoarseSink, GuardedSources};
+use crate::redact::same_origin;
 use crate::state::Backend;
 use crate::usage::UsageMeter;
 
@@ -229,11 +230,23 @@ impl SyncManager {
     }
 
     /// Replace a sync's spec. `prepare` turns the row read inside the lock
-    /// into the new spec (placeholders restored, validated).
+    /// into the new spec (placeholders restored, validated). What happens
+    /// next depends on what changed ([`SpecChange`]):
+    ///
+    /// - the origin: the old origin is torn down first (slot, publication…)
+    ///   with the **old** spec; when that fails nothing changes (`502`)
+    ///   unless `force`. Then the checkpoint is cleared: a fresh sync.
+    /// - the streams or the Meilisearch URL: the checkpoint is cleared, so
+    ///   the next start snapshots everything again (into shadow indexes
+    ///   where the live ones hold data).
+    /// - anything else (name, guard, secrets, tuning): a plain restart.
+    ///
+    /// A paused sync stays paused.
     pub async fn update<F>(
         &self,
         tenant: Option<&str>,
         id: &str,
+        force: bool,
         prepare: F,
     ) -> ApiResult<StoredSync>
     where
@@ -242,9 +255,62 @@ impl SyncManager {
         let _op = self.serialize(id).await;
         let current = self.row(tenant, id).await?;
         let spec = prepare(&current).await?;
+        let old = &current.spec;
+        let change = SpecChange::between(old, &spec);
+        let saved = self.store.load(id).await?;
+        let paused = saved.as_ref().is_some_and(|s| s.phase == SyncPhase::Paused);
+
+        match change {
+            SpecChange::Origin => match self.remove_locked(old, force).await {
+                Ok(()) => {}
+                Err(RemoveError::Teardown(message)) => {
+                    // Nothing changed: the old spec runs again.
+                    if !paused {
+                        self.run_locked(old.clone()).await?;
+                    }
+                    return Err(ApiError::new(
+                        StatusCode::BAD_GATEWAY,
+                        "teardown_failed",
+                        format!(
+                            "the source changed and the old one could not be cleaned up \
+                             ({message}); nothing was changed. Retry, or update with \
+                             ?force=true and clean up the old origin by hand"
+                        ),
+                    ));
+                }
+                Err(RemoveError::Supervisor(e)) => return Err(e.into()),
+            },
+            // Stop it before its state is reset under it.
+            SpecChange::Streams => self.retire(id).await,
+            SpecChange::Other => {}
+        }
+
         let stored = self.backend.update_sync(tenant, &spec).await?;
-        self.run_locked(spec).await?;
-        info!(sync_id = %id, "sync updated and restarted");
+        if change != SpecChange::Other {
+            let phase = if paused {
+                SyncPhase::Paused
+            } else {
+                SyncPhase::Pending
+            };
+            self.store
+                .save(&SyncState {
+                    sync_id: id.to_owned(),
+                    phase,
+                    checkpoint: None,
+                    message: None,
+                    resyncing: false,
+                    updated_at: Utc::now(),
+                })
+                .await?;
+        }
+        if paused {
+            self.retire(id).await;
+            self.meter.register(id, spec.tenant.as_deref());
+            info!(sync_id = %id, ?change, "paused sync updated; it stays paused");
+        } else {
+            self.run_locked(spec).await?;
+            info!(sync_id = %id, ?change, "sync updated and restarted");
+        }
         Ok(stored)
     }
 
@@ -443,6 +509,32 @@ impl SyncManager {
 
     pub fn running_ids(&self) -> Vec<String> {
         lock(&self.supervisors).keys().cloned().collect()
+    }
+}
+
+/// What a `PUT` changed, by the reaction it needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpecChange {
+    /// Another origin (kind, host, port, URL, user, database, TLS, slot or
+    /// publication name…): tear the old one down, start fresh.
+    Origin,
+    /// Other streams, or another Meilisearch: start fresh (full snapshot).
+    Streams,
+    /// Name, guard, secrets, tuning: restart.
+    Other,
+}
+
+impl SpecChange {
+    pub fn between(old: &SyncSpec, new: &SyncSpec) -> Self {
+        if !same_origin(&old.source, &new.source) {
+            SpecChange::Origin
+        } else if old.streams != new.streams
+            || old.destination.url.trim() != new.destination.url.trim()
+        {
+            SpecChange::Streams
+        } else {
+            SpecChange::Other
+        }
     }
 }
 
