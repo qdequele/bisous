@@ -2,6 +2,7 @@
 //! checkpoint offsets. The checkpoint in our store is the source of truth;
 //! offsets committed to the broker only serve lag monitoring.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -21,7 +22,7 @@ use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
 
 use crate::checkpoint::{self, Positions};
-use crate::client::{self, Ctx, KafkaConsumer};
+use crate::client::{self, Ctx, KafkaConsumer, Phase};
 use crate::config::{KafkaConfig, StartFrom, group_id};
 use crate::decode::{DecodeError, Decoded, Decoder};
 
@@ -129,7 +130,8 @@ impl Source for KafkaSource {
             }
             for topic in &topics {
                 let name = "topic";
-                match client::partitions_of(&consumer, &config, topic, config.request_timeout()) {
+                let timeout = config.request_timeout();
+                match client::partitions_of(&consumer, &config, topic, timeout, Phase::Open) {
                     Ok(p) => items.push((
                         name,
                         CheckStatus::Ok,
@@ -253,6 +255,7 @@ impl Source for KafkaSource {
             dirty: self.pending_checkpoint,
             since_checkpoint: 0,
             skipped: self.skipped.clone(),
+            leads: HashMap::new(),
         };
         let tpl = run.assignment(None)?;
         consumer
@@ -407,6 +410,24 @@ struct Record {
     partition: i32,
     offset: i64,
     outcome: Result<Decoded, DecodeError>,
+    /// The value starts with the Confluent Schema Registry framing.
+    schema_registry: bool,
+}
+
+/// Whether a value is framed for the Confluent Schema Registry: magic byte
+/// `0`, then a 4-byte schema id. No JSON document starts with a NUL byte.
+fn is_schema_registry_framed(payload: Option<&[u8]>) -> bool {
+    payload.is_some_and(|p| p.len() >= 5 && p[0] == 0)
+}
+
+/// Decoding state of one partition since the stream started.
+#[derive(Debug, Default)]
+struct Lead {
+    /// A record of this partition decoded: later failures are sporadic.
+    proven: bool,
+    /// Leading failures `(offset, reason)`, not yet reported nor
+    /// checkpointed past. At most `max_leading_decode_failures`.
+    held: Vec<(i64, String)>,
 }
 
 /// State of one `stream` call.
@@ -421,6 +442,7 @@ struct Run {
     dirty: bool,
     since_checkpoint: u64,
     skipped: Arc<AtomicU64>,
+    leads: HashMap<(String, i32), Lead>,
 }
 
 impl Run {
@@ -431,7 +453,40 @@ impl Run {
             partition: m.partition(),
             offset: m.offset(),
             outcome: self.decoder.decode(topic, m.key(), m.payload()),
+            schema_registry: is_schema_registry_framed(m.payload()),
         }
+    }
+
+    fn skipped_event(
+        &self,
+        topic: &str,
+        partition: i32,
+        offset: i64,
+        reason: String,
+    ) -> SourceEvent {
+        let total = self.skipped.fetch_add(1, Ordering::Relaxed) + 1;
+        tracing::warn!(
+            sync_id = %self.source_id,
+            topic, partition, offset,
+            skipped_total = total,
+            "skipping undecodable record: {reason}"
+        );
+        SourceEvent::Skipped {
+            collection: topic.to_owned(),
+            position: format!("{topic}/{partition}@{offset}"),
+            reason,
+        }
+    }
+
+    fn wrong_format(&self, topic: &str, partition: i32, detail: &str) -> SourceError {
+        let format = match self.config.format {
+            crate::config::Format::Json => "json",
+            crate::config::Format::Debezium => "debezium",
+        };
+        SourceError::Config(format!(
+            "topic `{topic}` (partition {partition}) does not look like the configured \
+             `{format}` format: {detail}; nothing past these records was checkpointed"
+        ))
     }
 
     /// Emits what the record produced and moves its partition. Returns
@@ -442,29 +497,69 @@ impl Run {
         events: &EventSender,
         cancel: &CancellationToken,
     ) -> Result<bool, SourceError> {
-        let event = match record.outcome {
-            Ok(Decoded::Change(change)) => Some(SourceEvent::Change(change)),
-            Ok(Decoded::Truncate) => Some(SourceEvent::Truncate {
-                collection: record.topic.clone(),
-            }),
-            Ok(Decoded::Ignored) => None,
-            Err(reason) => {
-                let total = self.skipped.fetch_add(1, Ordering::Relaxed) + 1;
-                tracing::warn!(
-                    sync_id = %self.source_id,
-                    topic = %record.topic,
-                    partition = record.partition,
-                    offset = record.offset,
-                    skipped_total = total,
-                    "skipping undecodable record: {reason}"
-                );
-                None
+        let lead_key = (record.topic.clone(), record.partition);
+        let lead = self.leads.entry(lead_key.clone()).or_default();
+        let proven = lead.proven;
+        let mut out: Vec<SourceEvent> = Vec::new();
+        match record.outcome {
+            Ok(decoded) => {
+                // The format is right: report the leading failures held so
+                // far, then the record.
+                let held = std::mem::take(&mut lead.held);
+                lead.proven = true;
+                for (offset, reason) in held {
+                    out.push(self.skipped_event(&record.topic, record.partition, offset, reason));
+                }
+                match decoded {
+                    Decoded::Change(change) => out.push(SourceEvent::Change(change)),
+                    Decoded::Truncate => out.push(SourceEvent::Truncate {
+                        collection: record.topic.clone(),
+                    }),
+                    Decoded::Ignored => {}
+                }
             }
-        };
-        if let Some(event) = event
-            && !send(events, event, cancel).await
-        {
-            return Ok(false);
+            Err(_) if record.schema_registry => {
+                return Err(self.wrong_format(
+                    &record.topic,
+                    record.partition,
+                    &format!(
+                        "the record at offset {} uses the Confluent Schema Registry wire format \
+                         (magic byte 0 and a schema id); Avro, Protobuf and JSON Schema through \
+                         the Schema Registry are not supported, produce plain JSON values",
+                        record.offset
+                    ),
+                ));
+            }
+            Err(DecodeError(reason)) if proven => {
+                out.push(self.skipped_event(
+                    &record.topic,
+                    record.partition,
+                    record.offset,
+                    reason,
+                ));
+            }
+            Err(DecodeError(reason)) => {
+                lead.held.push((record.offset, reason.clone()));
+                let held = lead.held.len();
+                if held >= self.config.max_leading_decode_failures as usize {
+                    return Err(self.wrong_format(
+                        &record.topic,
+                        record.partition,
+                        &format!(
+                            "its first {held} records since the sync started could not be \
+                             decoded (last: {reason})"
+                        ),
+                    ));
+                }
+                // Held: the position does not move past it until a record
+                // of this partition decodes.
+                return Ok(true);
+            }
+        }
+        for event in out {
+            if !send(events, event, cancel).await {
+                return Ok(false);
+            }
         }
         self.positions
             .entry(record.topic)
@@ -500,10 +595,11 @@ impl Run {
             tracing::warn!(sync_id = %self.source_id, "kafka consumer: {code} (retrying)");
             return Ok(());
         }
-        // Authorization, unknown topic → Config; offset out of range →
-        // PositionLost; all brokers down and anything else → Transient.
+        // Authorization → Config; offset out of range → PositionLost;
+        // unknown topic (leader election, restart), all brokers down and
+        // anything else → Transient.
         let last = self.consumer.context().last_error();
-        Err(client::map_error(&self.config, "consume", e, last))
+        Err(client::map_stream_error(&self.config, "consume", e, last))
     }
 
     /// The assignment for every known partition, or only for `only`.
@@ -538,10 +634,13 @@ impl Run {
         let lookup = client::blocking(move || {
             let mut added = Vec::new();
             for topic in &topics {
-                for p in client::partitions_of(&consumer, &config, topic, config.request_timeout())?
+                let timeout = config.request_timeout();
+                for p in
+                    client::partitions_of(&consumer, &config, topic, timeout, Phase::Streaming)?
                 {
                     if !known.iter().any(|(t, kp)| t == topic && *kp == p) {
-                        let wm = client::watermarks(&consumer, &config, topic, p)?;
+                        let wm =
+                            client::watermarks(&consumer, &config, topic, p, Phase::Streaming)?;
                         added.push((topic.clone(), p, wm.low));
                     }
                 }
@@ -604,5 +703,223 @@ async fn send(events: &EventSender, event: SourceEvent, cancel: &CancellationTok
         biased;
         _ = cancel.cancelled() => false,
         sent = events.send(event) => sent.is_ok(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use meili_connect_core::{Change, Op};
+    use serde_json::json;
+    use tokio::sync::mpsc;
+
+    fn config(extra: serde_json::Value) -> KafkaConfig {
+        let mut v = json!({"bootstrap_servers": ["127.0.0.1:1"], "checkpoint_every_records": 1000});
+        if let (serde_json::Value::Object(base), serde_json::Value::Object(extra)) = (&mut v, extra)
+        {
+            base.extend(extra);
+        }
+        KafkaConfig::from_value(&v).unwrap()
+    }
+
+    fn run(extra: serde_json::Value) -> Run {
+        let config = config(extra);
+        let consumer = client::consumer(&config, "t").unwrap();
+        Run {
+            source_id: "t".into(),
+            topics: vec!["t".into()],
+            decoder: Decoder {
+                format: config.format,
+                key_fields: vec![],
+            },
+            consumer,
+            positions: Positions::from([("t".to_owned(), [(0, 0), (1, 0)].into())]),
+            dirty: false,
+            since_checkpoint: 0,
+            skipped: Arc::default(),
+            leads: HashMap::new(),
+            config,
+        }
+    }
+
+    fn rec(run: &Run, partition: i32, offset: i64, value: &[u8]) -> Record {
+        Record {
+            topic: "t".into(),
+            partition,
+            offset,
+            outcome: run.decoder.decode("t", Some(b"1"), Some(value)),
+            schema_registry: is_schema_registry_framed(Some(value)),
+        }
+    }
+
+    const GOOD: &[u8] = br#"{"id": 1}"#;
+    const BAD: &[u8] = b"not json";
+
+    async fn feed(
+        run: &mut Run,
+        records: Vec<Record>,
+    ) -> (Result<bool, SourceError>, Vec<SourceEvent>) {
+        let (tx, mut rx) = mpsc::channel(256);
+        let cancel = CancellationToken::new();
+        let mut result = Ok(true);
+        for r in records {
+            result = run.handle(r, &tx, &cancel).await;
+            if result.is_err() {
+                break;
+            }
+        }
+        drop(tx);
+        let mut events = Vec::new();
+        while let Some(e) = rx.recv().await {
+            events.push(e);
+        }
+        (result, events)
+    }
+
+    fn skipped_positions(events: &[SourceEvent]) -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                SourceEvent::Skipped {
+                    collection,
+                    position,
+                    reason,
+                } => {
+                    assert_eq!(collection, "t");
+                    assert!(!reason.contains("not json"), "{reason}");
+                    Some(position.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn leading_failures_are_reported_once_the_format_is_confirmed() {
+        let mut r = run(json!({}));
+        let records = vec![
+            rec(&r, 0, 0, BAD),
+            rec(&r, 0, 1, BAD),
+            rec(&r, 0, 2, GOOD),
+            rec(&r, 0, 3, BAD),
+        ];
+        let (result, events) = feed(&mut r, records).await;
+        assert!(result.unwrap());
+        assert_eq!(skipped_positions(&events), vec!["t/0@0", "t/0@1", "t/0@3"]);
+        assert!(matches!(
+            &events[2],
+            SourceEvent::Change(Change {
+                op: Op::Upsert { .. },
+                ..
+            })
+        ));
+        assert_eq!(r.positions["t"][&0], 4);
+        assert_eq!(r.skipped.load(Ordering::Relaxed), 3);
+    }
+
+    #[tokio::test]
+    async fn a_partition_that_never_decodes_is_a_config_error() {
+        let mut r = run(json!({"max_leading_decode_failures": 3, "checkpoint_every_records": 1}));
+        let records = (0..3).map(|o| rec(&r, 0, o, BAD)).collect();
+        let (result, events) = feed(&mut r, records).await;
+        match result {
+            Err(SourceError::Config(m)) => {
+                assert!(
+                    m.contains("does not look like") && m.contains("`json`"),
+                    "{m}"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        // Nothing reported, nothing checkpointed past the records.
+        assert!(events.is_empty(), "{events:?}");
+        assert_eq!(r.positions["t"][&0], 0);
+    }
+
+    #[tokio::test]
+    async fn sporadic_failures_after_a_success_are_skipped() {
+        let mut r = run(json!({"max_leading_decode_failures": 2}));
+        let mut records = vec![rec(&r, 0, 0, GOOD)];
+        records.extend((1..6).map(|o| rec(&r, 0, o, BAD)));
+        // Another partition has its own count.
+        records.push(rec(&r, 1, 0, BAD));
+        let (result, events) = feed(&mut r, records).await;
+        assert!(result.unwrap());
+        assert_eq!(skipped_positions(&events).len(), 5);
+        assert_eq!(r.positions["t"][&0], 6);
+        assert_eq!(r.positions["t"][&1], 0, "held, not checkpointed past");
+    }
+
+    #[tokio::test]
+    async fn snapshot_and_stream_return_ok_promptly_on_cancel() {
+        let mut s = KafkaSource::new("t", config(json!({})), vec!["t".into()]);
+        let (tx, _rx) = mpsc::channel(4);
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        assert!(s.snapshot(tx.clone(), cancel.clone()).await.is_ok());
+
+        // Positions as `open` would set them; the broker is unreachable, so
+        // the stream only waits.
+        s.positions = Some(Positions::from([("t".to_owned(), [(0, 0)].into())]));
+        let (ack_tx, ack_rx) = meili_connect_core::ack_channel();
+        drop(ack_tx); // the engine may drop its side
+        let r = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            s.stream(tx.clone(), ack_rx, cancel),
+        )
+        .await
+        .expect("stream ignored an already-cancelled token");
+        assert!(r.is_ok(), "{r:?}");
+
+        let (_ack_tx, ack_rx) = meili_connect_core::ack_channel();
+        let cancel = CancellationToken::new();
+        let c = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            c.cancel();
+        });
+        let r = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            s.stream(tx, ack_rx, cancel),
+        )
+        .await
+        .expect("stream did not stop on cancel");
+        assert!(r.is_ok(), "{r:?}");
+    }
+
+    #[tokio::test]
+    async fn unknown_topic_while_consuming_is_transient() {
+        // Leader election or a rolling restart: the engine reopens, and
+        // `open` confirms with a metadata lookup whether the topic is gone.
+        let r = run(json!({}));
+        let e = KafkaError::MessageConsumption(RDKafkaErrorCode::UnknownTopicOrPartition);
+        assert!(matches!(
+            r.on_consumer_error(&e),
+            Err(SourceError::Transient(_))
+        ));
+        let e = KafkaError::MessageConsumption(RDKafkaErrorCode::TopicAuthorizationFailed);
+        assert!(matches!(
+            r.on_consumer_error(&e),
+            Err(SourceError::Config(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn schema_registry_framing_is_a_config_error() {
+        let mut r = run(json!({}));
+        let avro = [0u8, 0, 0, 0, 7, 2, 104, 105];
+        let records = vec![rec(&r, 0, 0, &avro)];
+        let (result, events) = feed(&mut r, records).await;
+        match result {
+            Err(SourceError::Config(m)) => assert!(
+                m.contains("Schema Registry") && m.contains("not supported"),
+                "{m}"
+            ),
+            other => panic!("{other:?}"),
+        }
+        assert!(events.is_empty());
+        assert_eq!(r.positions["t"][&0], 0);
+        assert!(!is_schema_registry_framed(Some(GOOD)));
+        assert!(!is_schema_registry_framed(Some(&[0, 1])));
     }
 }

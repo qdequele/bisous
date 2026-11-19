@@ -4,7 +4,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use meili_connect_core::SourceError;
 use rdkafka::ClientConfig;
@@ -19,17 +19,36 @@ use crate::config::KafkaConfig;
 
 pub type KafkaConsumer = StreamConsumer<Ctx>;
 
+/// How long a global error may explain a later request failure.
+pub const LAST_ERROR_WINDOW: Duration = Duration::from_secs(10);
+
 /// Routes librdkafka logs to `tracing` and remembers the last global error,
 /// so a metadata timeout can be explained (authentication failed, TLS
 /// handshake failed, brokers unreachable).
 #[derive(Default)]
 pub struct Ctx {
-    last_error: Mutex<Option<RDKafkaErrorCode>>,
+    last_error: Mutex<Option<(RDKafkaErrorCode, Instant)>>,
 }
 
 impl Ctx {
+    /// The last global error, if it happened within [`LAST_ERROR_WINDOW`]:
+    /// an old one (a TLS handshake that failed once during a broker
+    /// restart) must not explain every later timeout.
     pub fn last_error(&self) -> Option<RDKafkaErrorCode> {
-        *self.last_error.lock().unwrap_or_else(|e| e.into_inner())
+        self.last_error_at(Instant::now())
+    }
+
+    pub fn last_error_at(&self, now: Instant) -> Option<RDKafkaErrorCode> {
+        match *self.last_error.lock().unwrap_or_else(|e| e.into_inner()) {
+            Some((code, at)) if now.saturating_duration_since(at) <= LAST_ERROR_WINDOW => {
+                Some(code)
+            }
+            _ => None,
+        }
+    }
+
+    fn record(&self, code: RDKafkaErrorCode, at: Instant) {
+        *self.last_error.lock().unwrap_or_else(|e| e.into_inner()) = Some((code, at));
     }
 }
 
@@ -56,7 +75,7 @@ impl ClientContext for Ctx {
 
     fn error(&self, error: KafkaError, reason: &str) {
         if let Some(code) = error.rdkafka_error_code() {
-            *self.last_error.lock().unwrap_or_else(|e| e.into_inner()) = Some(code);
+            self.record(code, Instant::now());
         }
         tracing::warn!(target: "librdkafka", "{error}: {reason}");
     }
@@ -117,6 +136,43 @@ pub fn map_error(
         Class::PositionLost => SourceError::PositionLost(text),
         Class::Transient => SourceError::Transient(text),
     }
+}
+
+/// [`map_error`] for errors raised while streaming. The topics were found
+/// by `open`, so an unknown topic or partition now is most likely a leader
+/// election or a rolling restart: `Transient`. The engine reopens, and the
+/// metadata lookup of `open` reports a topic that is really gone as
+/// `Config`.
+pub fn map_stream_error(
+    config: &KafkaConfig,
+    what: &str,
+    error: &KafkaError,
+    last_global: Option<RDKafkaErrorCode>,
+) -> SourceError {
+    if error.rdkafka_error_code().is_some_and(is_unknown_topic) {
+        return SourceError::Transient(scrub(
+            config,
+            &format!("{what}: {error} (topic or partition temporarily unknown)"),
+        ));
+    }
+    let last = last_global.filter(|g| !is_unknown_topic(*g));
+    map_error(config, what, error, last)
+}
+
+fn is_unknown_topic(code: RDKafkaErrorCode) -> bool {
+    use RDKafkaErrorCode as E;
+    matches!(
+        code,
+        E::UnknownTopicOrPartition | E::UnknownTopic | E::UnknownPartition
+    )
+}
+
+/// When a lookup runs: at `open`/`check`, a missing topic is the user's to
+/// fix; while streaming it is presumed temporary (see [`map_stream_error`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Phase {
+    Open,
+    Streaming,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -204,10 +260,24 @@ pub fn topic_partitions(
     for topic in topics {
         out.insert(
             topic.clone(),
-            partitions_of(consumer, config, topic, timeout)?,
+            partitions_of(consumer, config, topic, timeout, Phase::Open)?,
         );
     }
     Ok(out)
+}
+
+/// Maps a client error for `phase`.
+fn map_in(
+    phase: Phase,
+    config: &KafkaConfig,
+    what: &str,
+    error: &KafkaError,
+    last_global: Option<RDKafkaErrorCode>,
+) -> SourceError {
+    match phase {
+        Phase::Open => map_error(config, what, error, last_global),
+        Phase::Streaming => map_stream_error(config, what, error, last_global),
+    }
 }
 
 pub fn partitions_of(
@@ -215,27 +285,31 @@ pub fn partitions_of(
     config: &KafkaConfig,
     topic: &str,
     timeout: Duration,
+    phase: Phase,
 ) -> Result<Vec<i32>, SourceError> {
     let last = || consumer.context().last_error();
     let md = consumer.fetch_metadata(Some(topic), timeout).map_err(|e| {
-        map_error(
+        map_in(
+            phase,
             config,
             &format!("read metadata of topic `{topic}`"),
             &e,
             last(),
         )
     })?;
+    let missing = || match phase {
+        Phase::Open => SourceError::Config(format!("topic `{topic}` does not exist")),
+        Phase::Streaming => SourceError::Transient(format!(
+            "topic `{topic}` is not in the metadata (temporarily, or deleted)"
+        )),
+    };
     let Some(t) = md.topics().iter().find(|t| t.name() == topic) else {
-        return Err(SourceError::Config(format!(
-            "topic `{topic}` does not exist"
-        )));
+        return Err(missing());
     };
     if let Some(err) = t.error() {
         let code = RDKafkaErrorCode::from(err);
         return Err(match code {
-            RDKafkaErrorCode::UnknownTopicOrPartition | RDKafkaErrorCode::UnknownTopic => {
-                SourceError::Config(format!("topic `{topic}` does not exist"))
-            }
+            RDKafkaErrorCode::UnknownTopicOrPartition | RDKafkaErrorCode::UnknownTopic => missing(),
             RDKafkaErrorCode::TopicAuthorizationFailed => {
                 SourceError::Config(format!("not authorized to read topic `{topic}`"))
             }
@@ -260,11 +334,13 @@ pub fn watermarks(
     config: &KafkaConfig,
     topic: &str,
     partition: i32,
+    phase: Phase,
 ) -> Result<Watermarks, SourceError> {
     let (low, high) = consumer
         .fetch_watermarks(topic, partition, config.request_timeout())
         .map_err(|e| {
-            map_error(
+            map_in(
+                phase,
                 config,
                 &format!("read offsets of {topic}/{partition}"),
                 &e,
@@ -284,7 +360,7 @@ pub fn all_watermarks(
     for (topic, partitions) in topic_partitions(consumer, config, topics)? {
         let mut wms = BTreeMap::new();
         for p in partitions {
-            wms.insert(p, watermarks(consumer, config, &topic, p)?);
+            wms.insert(p, watermarks(consumer, config, &topic, p, Phase::Open)?);
         }
         out.insert(topic, wms);
     }
@@ -358,6 +434,69 @@ mod tests {
         let e = KafkaError::MessageConsumption(RDKafkaErrorCode::AutoOffsetReset);
         assert!(matches!(
             map_error(&c, "x", &e, None),
+            SourceError::PositionLost(_)
+        ));
+    }
+
+    #[test]
+    fn global_errors_only_explain_recent_failures() {
+        let ctx = Ctx::default();
+        assert_eq!(ctx.last_error(), None);
+        let now = Instant::now();
+        ctx.record(RDKafkaErrorCode::SSL, now);
+        assert_eq!(ctx.last_error_at(now), Some(RDKafkaErrorCode::SSL));
+        assert_eq!(
+            ctx.last_error_at(now + LAST_ERROR_WINDOW),
+            Some(RDKafkaErrorCode::SSL)
+        );
+        // A TLS failure during a restart long ago does not turn a later
+        // timeout into a configuration error.
+        let later = now + LAST_ERROR_WINDOW + Duration::from_secs(1);
+        assert_eq!(ctx.last_error_at(later), None);
+        let e = KafkaError::MetadataFetch(RDKafkaErrorCode::OperationTimedOut);
+        assert!(matches!(
+            map_error(&cfg(), "x", &e, ctx.last_error_at(later)),
+            SourceError::Transient(_)
+        ));
+    }
+
+    #[test]
+    fn unknown_topics_are_config_only_before_streaming() {
+        use RDKafkaErrorCode as E;
+        let c = cfg();
+        for code in [
+            E::UnknownTopicOrPartition,
+            E::UnknownTopic,
+            E::UnknownPartition,
+        ] {
+            let e = KafkaError::MessageConsumption(code);
+            assert!(matches!(
+                map_error(&c, "x", &e, None),
+                SourceError::Config(_)
+            ));
+            assert!(
+                matches!(
+                    map_stream_error(&c, "x", &e, None),
+                    SourceError::Transient(_)
+                ),
+                "{code:?}"
+            );
+            // Nor does a global unknown-topic error turn a timeout into one.
+            let t = KafkaError::MessageConsumption(E::RequestTimedOut);
+            assert!(matches!(
+                map_stream_error(&c, "x", &t, Some(code)),
+                SourceError::Transient(_)
+            ));
+        }
+        // Other classes are unchanged mid-stream.
+        let e = KafkaError::MessageConsumption(E::TopicAuthorizationFailed);
+        assert!(matches!(
+            map_stream_error(&c, "x", &e, None),
+            SourceError::Config(_)
+        ));
+        let e = KafkaError::MessageConsumption(E::AutoOffsetReset);
+        assert!(matches!(
+            map_stream_error(&c, "x", &e, None),
             SourceError::PositionLost(_)
         ));
     }

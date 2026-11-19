@@ -31,7 +31,12 @@
 //! `since`, the time before which its content is known to be read. If 23 h
 //! pass without progress (a snapshot longer than the retention, a long
 //! outage), records may have been trimmed silently, so the position is
-//! reported lost instead of skipping them.
+//! reported lost instead of skipping them. For a leaf tracked by `open`,
+//! `since` starts at the open time (older records are covered by the
+//! snapshot). For an adopted child it starts at the child's *creation*
+//! time, read from its id, because all of a child's records are needed: a
+//! child adopted late (after an outage, or deep in a catch-up) may already
+//! be close to the retention limit.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -44,6 +49,9 @@ pub const RETENTION_GUARD_SECS: u64 = 23 * 3600;
 /// Granularity of `since` updates on idle shards, to keep checkpoints from
 /// changing on every empty poll.
 pub const SINCE_GRANULARITY_SECS: u64 = 60;
+
+/// 2014-01-01: no stream shard is older.
+const MIN_PLAUSIBLE_SHARD_TIME: u64 = 1_388_534_400;
 
 /// `{ table: { stream_arn, shards: { shard_id: { seq, done } } } }`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -176,13 +184,14 @@ impl Lineage {
                 break;
             }
             for d in adopt {
+                let since = adopted_since(d, now);
                 self.shards.insert(
                     d.id.clone(),
                     Tracked {
                         parent: d.parent.clone(),
                         seq: None,
                         done: false,
-                        since: Some(now),
+                        since: Some(since),
                     },
                 );
             }
@@ -284,6 +293,38 @@ impl Lineage {
                 .collect(),
         }
     }
+}
+
+/// `since` of an adopted child: everything the child holds must be read,
+/// so it is the child's creation time, never the adoption time (a child
+/// may be adopted hours after it appeared, after an outage or during a
+/// long catch-up). Without a readable creation time, the parent's is a
+/// lower bound (a child is created after its parent); without either,
+/// the shard is treated as old, which reports the position lost rather
+/// than risk a silent gap. Capped at `now` against clock skew.
+fn adopted_since(d: &ShardDesc, now: u64) -> u64 {
+    let created = shard_created_at(&d.id).or_else(|| {
+        let parent = d.parent.as_deref().and_then(shard_created_at);
+        if parent.is_none() {
+            tracing::warn!(shard = %d.id, "shard id carries no creation time, treating the shard as old");
+        }
+        parent
+    });
+    created.unwrap_or(0).min(now)
+}
+
+/// The creation time of a shard (Unix seconds), read from its id:
+/// `shardId-<creation millis, zero-padded>-<suffix>`. `None` when the id
+/// does not follow that format or the time is implausible.
+fn shard_created_at(id: &str) -> Option<u64> {
+    let rest = id.strip_prefix("shardId-")?;
+    let digits = rest.split('-').next()?;
+    if digits.len() < 13 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let secs = digits.parse::<u64>().ok()? / 1000;
+    // DynamoDB Streams did not exist before 2014.
+    (secs >= MIN_PLAUSIBLE_SHARD_TIME).then_some(secs)
 }
 
 fn stale(id: &str, t: &Tracked, now: u64) -> Result<(), String> {
@@ -485,6 +526,107 @@ mod tests {
         l.advance("s", "9".into());
         assert!(!l.idle("s", T0 + 10_000));
         assert_eq!(l.to_checkpoint("a").shards["s"].since, None);
+    }
+
+    /// A real shard id: `shardId-<20-digit zero-padded creation millis>-<suffix>`.
+    fn sid(created_secs: u64, suffix: &str) -> String {
+        format!("shardId-{:020}-{suffix}", created_secs * 1000)
+    }
+
+    #[test]
+    fn shard_creation_time_is_read_from_the_id() {
+        assert_eq!(shard_created_at(&sid(T0, "ab12cd34")), Some(T0));
+        assert_eq!(
+            shard_created_at("shardId-00000001795099544717-e12d6529"),
+            Some(1_795_099_544)
+        );
+        // 13 digits without padding.
+        assert_eq!(shard_created_at("shardId-1700000000123-x"), Some(T0));
+        for bad in [
+            "c1",
+            "shardId-",
+            "shardId-abc-1",
+            "shardId-000000000000",
+            "shardId-00000000000000000000-deadbeef",
+            "shardId-99999999999999999999999-x",
+        ] {
+            assert_eq!(shard_created_at(bad), None, "{bad}");
+        }
+    }
+
+    /// Down 20 h; on resume children C and G (created early in the outage)
+    /// are adopted; the sync stops again before C returns a record and
+    /// resumes 10 h later. C's first hours are trimmed by then: the
+    /// position must be lost, not silently skipped.
+    #[test]
+    fn late_adopted_children_keep_their_creation_time() {
+        const H: u64 = 3600;
+        let p = sid(T0 - 2 * H, "p");
+        let c = sid(T0 + H, "c");
+        let g = sid(T0 + 5 * H, "g");
+        let cp = TableCheckpoint {
+            stream_arn: "arn:s".into(),
+            shards: BTreeMap::from([(
+                p.clone(),
+                ShardCheckpoint {
+                    seq: Some("10".into()),
+                    done: false,
+                    since: None,
+                },
+            )]),
+        };
+        let desc = [
+            d(&p, None, true),
+            d(&c, Some(&p), true),
+            d(&g, Some(&c), false),
+        ];
+        let resumed_at = T0 + 20 * H;
+        let mut l = Lineage::resume(&cp, &desc, resumed_at).unwrap();
+        assert!(l.is_tracked(&c) && l.is_tracked(&g));
+        let saved = l.to_checkpoint("arn:s");
+        assert_eq!(saved.shards[&c].since, Some(T0 + H));
+        assert_eq!(saved.shards[&g].since, Some(T0 + 5 * H));
+        // The parent is read to its end; C has not returned a record yet.
+        l.finish(&p);
+        let saved = l.to_checkpoint("arn:s");
+
+        // Stopped, resumed 10 h later.
+        let later = resumed_at + 10 * H;
+        let err = Lineage::resume(&saved, &desc, later).unwrap_err();
+        assert!(err.contains(&c), "{err}");
+
+        // Same within one run when catch-up lag approaches the retention.
+        assert!(l.check_fresh(&c, T0 + H + RETENTION_GUARD_SECS).is_err());
+        assert!(l.check_fresh(&c, resumed_at).is_ok());
+    }
+
+    #[test]
+    fn unparseable_children_fall_back_to_the_parent_or_to_old() {
+        let p = sid(T0, "p");
+        let mut l = Lineage::fresh(&[d(&p, None, false)], T0 + 100);
+        l.advance(&p, "1".into());
+        // A child id without a timestamp: created after its parent.
+        l.refresh(
+            &[d(&p, None, true), d("child", Some(&p), false)],
+            T0 + 50_000,
+        );
+        assert_eq!(l.to_checkpoint("a").shards["child"].since, Some(T0));
+        // Neither id carries a time: treated as old.
+        let mut l = Lineage::fresh(&[d("q", None, false)], T0);
+        l.advance("q", "1".into());
+        l.refresh(&[d("q", None, true), d("r", Some("q"), false)], T0 + 10);
+        l.finish("q");
+        assert!(l.check_fresh("r", T0 + 10).is_err());
+        // A creation time in the future (clock skew) is capped at now.
+        let mut l = Lineage::fresh(&[d("q", None, false)], T0);
+        l.refresh(
+            &[d("q", None, true), d(&sid(T0 + 500, "f"), Some("q"), false)],
+            T0 + 10,
+        );
+        assert_eq!(
+            l.to_checkpoint("a").shards[&sid(T0 + 500, "f")].since,
+            Some(T0 + 10)
+        );
     }
 
     #[test]

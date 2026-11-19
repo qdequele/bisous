@@ -41,6 +41,13 @@ pub struct KafkaConfig {
     /// Upper bound of the client's prefetch buffer, in KiB. Bounds memory.
     #[serde(default = "default_max_buffer_kbytes")]
     pub max_buffer_kbytes: u32,
+    /// When this many records in a row fail to decode on a partition before
+    /// any record of it decodes (since the stream started), the topic is
+    /// taken to be in another format and the sync stops with a
+    /// configuration error instead of skipping everything. Later, sporadic
+    /// failures are skipped.
+    #[serde(default = "default_max_leading_decode_failures")]
+    pub max_leading_decode_failures: u32,
 }
 
 fn default_checkpoint_every_records() -> u64 {
@@ -57,6 +64,9 @@ fn default_request_timeout_ms() -> u64 {
 }
 fn default_max_buffer_kbytes() -> u32 {
     16 * 1024
+}
+fn default_max_leading_decode_failures() -> u32 {
+    20
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -221,6 +231,9 @@ impl KafkaConfig {
         if self.max_buffer_kbytes < 1024 {
             return bad("max_buffer_kbytes must be at least 1024");
         }
+        if self.max_leading_decode_failures == 0 {
+            return bad("max_leading_decode_failures must be at least 1");
+        }
         let sec = &self.security;
         match (sec.protocol.uses_sasl(), &sec.sasl) {
             (true, None) => return bad("security.sasl is required with a sasl_* protocol"),
@@ -355,6 +368,7 @@ mod tests {
         assert_eq!(c.security.protocol, Protocol::Plaintext);
         assert!(c.key_fields.is_empty());
         assert_eq!(c.checkpoint_every_records, 1000);
+        assert_eq!(c.max_leading_decode_failures, 20);
     }
 
     #[test]
@@ -426,6 +440,7 @@ mod tests {
             json!({"bootstrap_servers": ["a:1"], "security": {"protocol": "ssl", "tls": {"cert_pem": "x"}}}),
             json!({"bootstrap_servers": ["a:1"], "key_fields": [""]}),
             json!({"bootstrap_servers": ["a:1"], "checkpoint_every_records": 0}),
+            json!({"bootstrap_servers": ["a:1"], "max_leading_decode_failures": 0}),
             json!({"bootstrap_servers": ["a:1"], "format": "avro"}),
             json!({"bootstrap_servers": ["a:1"], "bogus": 1}),
             json!({"bootstrap_servers": ["a:1"], "security": {"protocol": "sasl_ssl",
