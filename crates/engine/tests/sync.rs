@@ -422,6 +422,15 @@ async fn truncate_is_held_then_released() {
         json!({"rankingRules": ["words"]}),
         "settings survive the truncate"
     );
+    // Cleared in place: no shadow index to leak on a crash.
+    let calls = h.sink.calls();
+    assert!(calls.contains(&format!("delete_all {INDEX}")), "{calls:?}");
+    assert!(
+        !calls
+            .iter()
+            .any(|c| c.starts_with("swap") || c.contains("__connect_")),
+        "{calls:?}"
+    );
     assert!(h.store.state(SYNC_ID).expect("state").message.is_none());
     h.assert_acks_sound();
 }
@@ -578,8 +587,9 @@ async fn unmapped_collections_and_patches() {
     stop(cancel, handle).await;
     let docs = h.sink.docs(INDEX);
     assert_eq!(docs.len(), 1);
-    // Upsert + patch coalesced into one replace: `b` is gone, not null.
-    assert_eq!(docs["2"], doc(json!({"id": "2", "a": 5})));
+    // Upsert + patch coalesced into one replace: `b` is null, as when the
+    // two land in separate batches.
+    assert_eq!(docs["2"], doc(json!({"id": "2", "a": 5, "b": null})));
     assert_eq!(h.sink.state().batch_sizes.last(), Some(&1));
 }
 
@@ -590,4 +600,88 @@ async fn a_spec_without_streams_is_rejected() {
     spec.streams.clear();
     let result = finish(spawn(&h, spec, options()).1).await;
     assert!(matches!(result, Err(EngineError::Spec(_))), "{result:?}");
+}
+
+#[tokio::test]
+async fn a_spec_sharing_an_index_is_rejected() {
+    let h = Harness::new();
+    let mut spec = spec();
+    let mut other = spec.streams[0].clone();
+    other.collection = "public.other".into();
+    spec.streams.push(other);
+    let result = finish(spawn(&h, spec, options()).1).await;
+    assert!(matches!(result, Err(EngineError::Spec(_))), "{result:?}");
+    assert!(h.origin.state().opens.is_empty(), "nothing ran");
+}
+
+#[tokio::test]
+async fn skipped_records_are_dead_lettered_and_do_not_block_checkpoints() {
+    let h = Harness::new();
+    let (cancel, handle) = spawn(&h, spec(), options());
+    wait_synced(&h).await;
+
+    h.origin
+        .skipped(COLLECTION, "products/0@17", "undecodable payload");
+    h.origin
+        .skipped("public.unmapped", "unmapped/1@3", "no key");
+    h.origin.tx(vec![upsert(1, json!({}))]);
+    wait_synced(&h).await;
+    assert!(!handle.is_finished());
+    stop(cancel, handle).await;
+
+    let st = h.store.inner();
+    assert_eq!(st.dead.len(), 2, "{:?}", st.dead);
+    assert_eq!(st.dead[0].index, INDEX);
+    assert_eq!(st.dead[0].document_id, "products/0@17");
+    assert_eq!(st.dead[0].payload, json!(null));
+    assert_eq!(st.dead[0].reason, "undecodable payload");
+    assert_eq!(st.dead[1].index, "public.unmapped");
+    assert_eq!(st.progress[SYNC_ID], (1, 0, 2));
+    drop(st);
+    h.assert_acks_sound();
+}
+
+#[tokio::test]
+async fn a_source_may_drop_its_ack_receiver() {
+    let h = Harness::new();
+    h.origin.state().drop_acks = true;
+    let (cancel, handle) = spawn(&h, spec(), options());
+    wait_synced(&h).await;
+    h.origin.tx(vec![upsert(1, json!({}))]);
+    wait_synced(&h).await;
+    h.origin.tx(vec![upsert(2, json!({}))]);
+    wait_synced(&h).await;
+    assert!(!handle.is_finished());
+    stop(cancel, handle).await;
+}
+
+#[tokio::test]
+async fn an_index_keyed_differently_is_refused_before_any_shadow() {
+    let h = Harness::new();
+    seed_rows(&h, 1..=3);
+    h.sink.create(
+        INDEX,
+        json!({}),
+        vec![("x".into(), doc(json!({"sku": "x"})))],
+    );
+    h.sink
+        .state()
+        .indexes
+        .get_mut(INDEX)
+        .expect("live")
+        .primary_key = "sku".into();
+
+    let result = finish(spawn(&h, spec(), options()).1).await;
+    assert!(
+        matches!(result, Err(EngineError::Sink(SinkError::Config(_)))),
+        "{result:?}"
+    );
+    let calls = h.sink.calls();
+    assert!(
+        !calls.iter().any(|c| c.contains("__connect_")),
+        "no shadow built: {calls:?}"
+    );
+    assert_eq!(h.sink.state().indexes[INDEX].primary_key, "sku");
+    assert_eq!(h.sink.docs(INDEX).len(), 1, "live index untouched");
+    assert_eq!(h.origin.state().snapshots, 0);
 }

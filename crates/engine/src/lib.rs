@@ -17,4 +17,4 @@ pub use coalesce::coalesce;
 pub use error::{EngineError, Reaction};
 pub use mapping::{Mapper, map_change, map_document};
 pub use supervisor::{Supervisor, SupervisorConfig, SupervisorError, SyncStatus, backoff_delay};
-pub use sync::{SyncDeps, SyncOptions, run_sync, shadow_index_uid};
+pub use sync::{RunMonitor, SyncDeps, SyncOptions, run_sync, run_sync_monitored, shadow_index_uid};

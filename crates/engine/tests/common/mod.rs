@@ -69,6 +69,9 @@ pub struct OriginState {
     pub ack_violations: Vec<String>,
     pub stream_active: bool,
     pub store: Option<Arc<MemStore>>,
+    /// `stream` drops its `AckReceiver` right away.
+    pub drop_acks: bool,
+    pub teardowns: usize,
 }
 
 impl Default for OriginState {
@@ -92,6 +95,8 @@ impl Default for OriginState {
             ack_violations: Vec::new(),
             stream_active: false,
             store: None,
+            drop_acks: false,
+            teardowns: 0,
         }
     }
 }
@@ -201,6 +206,20 @@ impl Origin {
             st.rows.retain(|(c, _), _| c != collection);
             st.log.push(SourceEvent::Truncate {
                 collection: collection.into(),
+            });
+            st.log.push(SourceEvent::Checkpoint(Checkpoint(json!(0))));
+        }
+        self.notify.notify_waiters();
+    }
+
+    /// A record the source cannot decode, then a commit marker.
+    pub fn skipped(&self, collection: &str, position: &str, reason: &str) {
+        {
+            let mut st = self.state();
+            st.log.push(SourceEvent::Skipped {
+                collection: collection.into(),
+                position: position.into(),
+                reason: reason.into(),
             });
             st.log.push(SourceEvent::Checkpoint(Checkpoint(json!(0))));
         }
@@ -362,20 +381,27 @@ impl Source for FakeSource {
     async fn stream(
         &mut self,
         events: EventSender,
-        mut acks: AckReceiver,
+        acks: AckReceiver,
         cancel: CancellationToken,
     ) -> Result<(), SourceError> {
         let origin = Arc::clone(&self.origin);
-        let fault = {
+        let (fault, drop_acks) = {
             let mut st = origin.state();
             st.stream_active = true;
-            st.stream_faults.pop_front()
+            (st.stream_faults.pop_front(), st.drop_acks)
+        };
+        let mut acks = if drop_acks {
+            drop(acks);
+            None
+        } else {
+            Some(acks)
         };
         let _active = Active(Arc::clone(&origin));
         let mut fault = fault;
         let mut sent_here = 0usize;
         loop {
-            if acks.has_changed().unwrap_or(false)
+            if let Some(acks) = acks.as_mut()
+                && acks.has_changed().unwrap_or(false)
                 && let Some(ack) = acks.borrow_and_update().clone()
             {
                 origin.check_ack(&ack);
@@ -410,8 +436,11 @@ impl Source for FakeSource {
                     tokio::select! {
                         _ = cancel.cancelled() => return Ok(()),
                         _ = origin.notify.notified() => {}
-                        r = acks.changed() => {
-                            if r.is_ok() && let Some(ack) = acks.borrow_and_update().clone() {
+                        r = async { match acks.as_mut() {
+                            Some(a) => a.changed().await.map(|()| a.borrow_and_update().clone()).ok().flatten(),
+                            None => std::future::pending().await,
+                        } } => {
+                            if let Some(ack) = r {
                                 origin.check_ack(&ack);
                             }
                         }
@@ -423,6 +452,7 @@ impl Source for FakeSource {
     }
 
     async fn teardown(&mut self) -> Result<(), SourceError> {
+        self.origin.state().teardowns += 1;
         Ok(())
     }
 }
@@ -579,6 +609,15 @@ impl Sink for FakeSink {
         };
         st.indexes.insert(a.into(), ib);
         st.indexes.insert(b.into(), ia);
+        Ok(())
+    }
+
+    async fn delete_all_documents(&self, uid: &str) -> Result<(), SinkError> {
+        let mut st = self.state();
+        st.calls.push(format!("delete_all {uid}"));
+        if let Some(index) = st.indexes.get_mut(uid) {
+            index.docs.clear();
+        }
         Ok(())
     }
 
