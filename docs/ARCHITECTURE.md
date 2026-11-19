@@ -143,6 +143,26 @@ sink); Kafka brokers advertised in metadata and MongoDB members discovered
 from the seeds are not vetted. A hosted deployment must also restrict egress
 at the network level.
 
+## Changes to a sync (`server::manager`)
+
+Every mutation (create, update, delete, pause, resume, resync, release) is
+one `SyncManager` entry point: it takes the sync's lock, reads the stored row
+again inside it, writes, then starts or stops the supervisor. The HTTP
+handler runs it detached from the request, so a client that hangs up (or the
+request timeout) never leaves a change half done. Stopping a sync inside the
+lock is bounded by `SHUTDOWN_GRACE_SECS`.
+
+`PUT` diffs the old and the new spec inside the lock: a new origin is torn
+down with the old spec first (nothing changes when that fails, unless
+`force`), then the checkpoint is cleared; new streams or another Meilisearch
+URL clear the checkpoint (full snapshot, into shadow indexes where the live
+ones hold data); anything else restarts. A paused sync stays paused.
+
+Bounds: `MAX_SYNCS_PER_TENANT`, probe slots (global and per tenant), a
+request timeout, dead letters per sync (enforced by the store, overflow
+counted in `sync_progress.dead_letters_dropped`), and the Lab outbox
+(per-event backoff, sender backoff, backlog cap on the enqueue side).
+
 ## Not in the first version
 
 Resumable snapshots, joins across tables, transforms beyond field selection

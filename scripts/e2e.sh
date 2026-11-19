@@ -2,8 +2,11 @@
 # End-to-end check of meili-connect against real containers, through the
 # HTTP API only.
 #
-#   scripts/e2e.sh            # Postgres scenarios, then MongoDB
+#   scripts/e2e.sh            # Postgres scenarios, then MongoDB, then the host policy
 #   E2E_SKIP_MONGO=1 scripts/e2e.sh
+#
+# The main server runs standalone (host policy `any`); a second one runs with
+# CONNECT_HOST_POLICY=public to check what it refuses.
 #
 # Needs: docker, curl, jq, python3, cargo. Starts containers named `mc-e2e-<pid>-*`
 # on random host ports and removes them (and the server) on exit, whatever
@@ -24,6 +27,7 @@ ROWS="${E2E_ROWS:-5000}"
 TIMEOUT="${E2E_TIMEOUT:-120}"
 
 SERVER_PID=""
+PUBLIC_PID=""
 RESULTS=()
 FAILED=0
 
@@ -32,9 +36,11 @@ pass() { RESULTS+=("PASS  $1"); log "PASS: $1"; }
 fail() { RESULTS+=("FAIL  $1: $2"); FAILED=1; printf '\033[1;31m[e2e] FAIL: %s: %s\033[0m\n' "$1" "$2"; }
 
 cleanup() {
-  if [[ -n "$SERVER_PID" ]] && kill -0 "$SERVER_PID" 2>/dev/null; then
-    kill -9 "$SERVER_PID" 2>/dev/null || true
-  fi
+  for pid in "$SERVER_PID" "$PUBLIC_PID"; do
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+      kill -9 "$pid" 2>/dev/null || true
+    fi
+  done
   docker ps -aq --filter "name=^${PREFIX}-" | xargs -r docker rm -f >/dev/null 2>&1 || true
   if [[ "${E2E_KEEP_LOGS:-}" != "" ]]; then
     log "logs kept in $WORK"
@@ -310,6 +316,31 @@ scenario_delete() {
   pass "$name"
 }
 
+# The state database is never a source, whatever the policy: same host as the
+# origin (127.0.0.1), the state database's port.
+scenario_state_db_refused() {
+  local name="host policy any: the state database is refused as an origin"
+  local state_src resp code
+  state_src=$(jq -nc --arg url "postgres://postgres:state@127.0.0.1:$STATE_PORT/connect?sslmode=disable" \
+    '{kind: "postgres", config: {url: $url}}')
+  for path in /sources/check /sources/discover; do
+    resp=$(api POST "$path" "$(jq -nc --argjson s "$state_src" '{source: $s, streams: [{collection: "public.syncs", index: "x"}]}')")
+    code=$(tail -n1 <<<"$resp")
+    if [[ "$code" != 422 ]] || [[ "$(sed '$d' <<<"$resp" | jq -r .code)" != host_not_allowed ]]; then
+      fail "$name" "$path answered $code: $(sed '$d' <<<"$resp")"; return
+    fi
+  done
+  resp=$(api POST /syncs "$(jq -nc --argjson s "$state_src" --arg mu "http://127.0.0.1:$MEILI_PORT" --arg mk "$MEILI_KEY" \
+    '{name: "steal", source: $s, destination: {url: $mu, api_key: $mk}, streams: [{collection: "public.syncs", index: "stolen"}]}')")
+  code=$(tail -n1 <<<"$resp")
+  [[ "$code" == 422 ]] || { fail "$name" "create answered $code"; return; }
+  # The origin on the same host but another port is fine.
+  [[ "$(api_code POST /sources/check "$(jq -nc --argjson s "$SOURCE" '{source: $s}')")" == 200 ]] \
+    || { fail "$name" "the real origin was refused"; return; }
+  pass "$name"
+}
+
+scenario_state_db_refused
 scenario_check_discover
 scenario_snapshot
 if [[ -n "$SYNC_ID" ]]; then
@@ -374,6 +405,69 @@ if [[ -z "${E2E_SKIP_MONGO:-}" ]]; then
   scenario_mongo
 fi
 
+# ------------------------------------------------------------------ host policy
+
+PUBLIC_PORT=""
+public_api() { # <method> <path> <json body>
+  curl -sS -X "$1" "http://127.0.0.1:$PUBLIC_PORT$2" \
+    -H "Authorization: Bearer $ADMIN_KEY" -H 'Content-Type: application/json' \
+    --data-binary "$3" -w '\n%{http_code}'
+}
+
+scenario_public_policy() {
+  local name="host policy public: internal origins and destinations are refused"
+  PUBLIC_PORT=$(free_port)
+  log "starting a second server with CONNECT_HOST_POLICY=public (log: $WORK/public.log)"
+  CONNECT_HOST_POLICY=public \
+  ADMIN_API_KEY="$ADMIN_KEY" \
+  LISTEN_ADDR="127.0.0.1:$PUBLIC_PORT" \
+  RUST_LOG="${E2E_RUST_LOG:-info}" \
+    "$BIN" >>"$WORK/public.log" 2>&1 &
+  PUBLIC_PID=$!
+  wait_until "public server health" 60 curl -sf "http://127.0.0.1:$PUBLIC_PORT/health" \
+    || { fail "$name" "the server did not start"; return; }
+
+  local host src resp code body
+  # 127.0.0.1 is the real origin: refused even though it is reachable.
+  for host in 127.0.0.1 10.1.2.3 169.254.169.254 localhost; do
+    src=$(jq -nc --arg url "postgres://postgres:origin@$host:$ORIGIN_PORT/app?sslmode=disable" \
+      '{kind: "postgres", config: {url: $url}}')
+    for path in /sources/check /sources/discover; do
+      resp=$(public_api POST "$path" "$(jq -nc --argjson s "$src" '{source: $s}')")
+      code=$(tail -n1 <<<"$resp"); body=$(sed '$d' <<<"$resp")
+      if [[ "$code" != 422 ]] || [[ "$(jq -r .code <<<"$body")" != host_not_allowed ]]; then
+        fail "$name" "$path $host answered $code: $body"; return
+      fi
+      if [[ "$host" == localhost ]] && grep -q '127.0.0.1\|::1' <<<"$body"; then
+        fail "$name" "the refusal tells what localhost resolved to: $body"; return
+      fi
+    done
+    resp=$(public_api POST /syncs "$(jq -nc --argjson s "$src" --arg mk "$MEILI_KEY" \
+      '{name: "x", source: $s, destination: {url: "https://8.8.8.8", api_key: $mk},
+        streams: [{collection: "public.items", index: "x"}]}')")
+    code=$(tail -n1 <<<"$resp")
+    [[ "$code" == 422 ]] || { fail "$name" "create with origin $host answered $code: $(sed '$d' <<<"$resp")"; return; }
+  done
+  # A Meilisearch destination on loopback, with a public origin.
+  src=$(jq -nc '{kind: "postgres", config: {url: "postgres://u:p@8.8.8.8:5432/app"}}')
+  for dest in "http://127.0.0.1:$MEILI_PORT" "http://localhost:$MEILI_PORT"; do
+    resp=$(public_api POST /syncs "$(jq -nc --argjson s "$src" --arg mu "$dest" --arg mk "$MEILI_KEY" \
+      '{name: "d", source: $s, destination: {url: $mu, api_key: $mk},
+        streams: [{collection: "public.items", index: "x"}]}')")
+    code=$(tail -n1 <<<"$resp"); body=$(sed '$d' <<<"$resp")
+    if [[ "$code" != 422 ]] || [[ "$(jq -r .code <<<"$body")" != host_not_allowed ]]; then
+      fail "$name" "destination $dest answered $code: $body"; return
+    fi
+  done
+  # Nothing was stored.
+  local n
+  n=$(curl -sS "http://127.0.0.1:$PUBLIC_PORT/syncs" -H "Authorization: Bearer $ADMIN_KEY" | jq '.syncs | length')
+  [[ "$n" == 0 ]] || { fail "$name" "$n sync(s) stored"; return; }
+  kill -TERM "$PUBLIC_PID" 2>/dev/null; wait "$PUBLIC_PID" 2>/dev/null; PUBLIC_PID=""
+  pass "$name"
+}
+scenario_public_policy
+
 scenario_sigterm() {
   local name="SIGTERM stops the server gracefully"
   kill -TERM "$SERVER_PID"
@@ -390,7 +484,7 @@ scenario_sigterm
 
 # ------------------------------------------------------------------ report
 
-if grep -q "$MEILI_KEY\|postgres:origin@" "$WORK/server.log"; then
+if grep -q "$MEILI_KEY\|postgres:origin@" "$WORK/server.log" "$WORK/public.log" 2>/dev/null; then
   fail "logs" "the server log contains a secret"
 else
   pass "logs: no secret in the server log"
