@@ -154,7 +154,10 @@ curl -s $API/syncs/$ID -H "$AUTH" | jq '.name = "products v2"' \
 ```bash
 curl -s $API/syncs/$ID/status -H "$AUTH"
 # {"phase": "streaming", "message": null, "has_checkpoint": true, "resyncing": false,
-#  "running": true, "progress": {"written": 1000, "deleted": 0, "rejected": 0}, ...}
+#  "running": true, "progress": {"written": 1000, "deleted": 0, "rejected": 0},
+#  "documents": {"documents_streamed": 0, "documents_snapshot": 1000, "documents_resync": 0},
+#  "bytes": 98213, "sync_seconds": 42, "lag": {"seconds": 0.0, "bytes": 0},
+#  "lag_warning": null, "dead_letters": 0, ...}
 
 curl -s "$API/syncs/$ID/progress?from=2026-11-01&to=2026-11-19" -H "$AUTH"
 curl -s "$API/syncs/$ID/dead-letters?limit=100" -H "$AUTH"     # page with ?after=<next_after>
@@ -163,7 +166,27 @@ curl -s -X DELETE $API/syncs/$ID/dead-letters -H "$AUTH"
 
 Phases: `pending`, `snapshotting`, `streaming`, `paused` (by you),
 `source_paused` (the origin is deliberately down, retried slowly), `held`
-(needs you: a guard or a configuration error, see `message`), `failed`.
+(needs you: a guard or a configuration error, see `message`; or
+`out_of_credits`, which resumes by itself), `failed`.
+
+`lag` is how far behind its origin the sync is while streaming, when the
+source can tell (`null` otherwise): Postgres reports `seconds` (age of the
+last commit, 0 once caught up) and `bytes` (WAL the slot retains past the
+confirmed position), MongoDB and DynamoDB `seconds`, Kafka `seconds` and
+`records` (behind the high watermarks); MySQL does not report it yet.
+
+### Usage
+
+```bash
+curl -s "$API/usage?from=2026-11-01&to=2026-11-19&group_by=day" -H "$AUTH"
+# {"rows": [{"day": "2026-11-18", "units": {"documents_streamed": 1200, "documents_snapshot": 0,
+#   "documents_resync": 0, "bytes": 1482113, "sync_seconds": 86400}}, ...],
+#  "totals": {...}, "from": "2026-11-01", "to": "2026-11-19", "group_by": "day", "source": "state"}
+curl -s "$API/usage?group_by=sync" -H "$AUTH"   # rows: {"sync_id", "name", "units"}
+```
+
+The caller's metered units (see [Pricing and usage](#pricing-and-usage)) per
+UTC day or per sync; at most 366 days, the last 30 by default.
 
 ### Actions
 
@@ -202,16 +225,21 @@ Every variable, with defaults, is in [`.env.example`](.env.example).
 | `LAB_SERVICE_TOKEN` | unset | Lab token; requires `X-Connect-Tenant-Id`. Set but blank: startup error. |
 | `CONNECT_HOST_POLICY` | `public` with `LAB_SERVICE_TOKEN`, else `any` | Which hosts sources and destinations may point at: `public`, `any` or `allowlist`. See [Host policy](#host-policy). |
 | `CONNECT_HOST_ALLOWLIST` | unset | With `allowlist`: comma-separated `host`, `host:port`, IP addresses and CIDRs. |
-| `LAB_URL`, `LAB_INSTANCE_ID`, `LAB_INSTANCE_SECRET` | unset | Lab usage events. All three or none. |
-| `USAGE_FLUSH_INTERVAL_SECS` | `60` | How often counts become usage events. |
-| `LAB_SEND_INTERVAL_SECS` | `2` | How often the outbox is delivered. |
+| `LAB_URL`, `LAB_INSTANCE_ID`, `LAB_INSTANCE_SECRET` | unset | Lab mode: usage events and credit holds. All three or none. |
+| `USAGE_FLUSH_INTERVAL_SECS` | `60` | How often recorded usage becomes events. |
+| `LAB_SEND_INTERVAL_SECS` | `2` | How often the outbox lanes are delivered. |
+| `CREDITS_CHECK_INTERVAL_SECS` | `15` | Lab mode: how often the teams' credits are checked. |
+| `CREDITS_CACHE_FRESH_SECS` / `CREDITS_CACHE_STALE_SECS` | `30` / `300` | How long a credits answer is reused, and kept quietly while the Lab cannot answer. |
+| `METRICS_TOKEN` | unset | Bearer token of `GET /metrics`; unset: 404. Never a management token. |
+| `TINYBIRD_URL`, `TINYBIRD_TOKEN` | unset | Usage analytics in Tinybird. Both or neither. |
+| `MAX_LAG_HOLD_BYTES` / `MAX_LAG_HOLD_SECS` | unset | Lag guard: a stuck sync past these gets a `lag_warning`. |
 | `SOURCE_PROBE_TIMEOUT_SECS` | `30` | Limit of `check` and `discover`. |
 | `SHUTDOWN_GRACE_SECS` | `30` | Time the syncs get to stop on SIGTERM/SIGINT; also the bound on stopping one sync. |
 | `MAX_SYNCS_PER_TENANT` | `20` | Syncs a tenant may own (`409 sync_quota_exceeded`). The global scope is not limited. |
 | `PROBE_CONCURRENCY` / `PROBE_CONCURRENCY_PER_TENANT` | `16` / `4` | `check` and `discover` running at once, in all and per tenant (`429 too_many_probes`). |
 | `REQUEST_TIMEOUT_SECS` | `180` | Longest API request (`503 request_timeout`); a change to a sync still completes. |
 | `DEAD_LETTERS_MAX_PER_SYNC` | `10000` | Dead letters kept per sync; past it they are counted (`dead_letters_overflow` in the status) but not stored. Payloads over 64 KiB are stored as `{"truncated": true, "bytes": n}`. |
-| `LAB_OUTBOX_MAX_PENDING` | `100000` | Unsent Lab events beyond which usage stays counted in memory instead of enqueued. |
+| `LAB_OUTBOX_MAX_PENDING` | `100000` | Unsent events of an outbox lane beyond which usage stays pending in the state database instead of enqueued. |
 | `LOG_FORMAT` | `pretty` | `pretty` or `json`. |
 | `LOG_LEVEL` / `RUST_LOG` | `info` | `RUST_LOG` wins and takes the full filter syntax. |
 
@@ -246,23 +274,57 @@ SDK) resolve names themselves: between the policy's lookup and the driver's
 connect a DNS rebinding window remains for sources (not for the Meilisearch
 destination, whose connection is pinned to the vetted addresses). Kafka
 brokers advertised in the cluster metadata, and MongoDB replica-set members
-discovered from the seed hosts, are not vetted. DynamoDB with
-`credentials: {"type": "default"}` uses the server's own AWS identity. A
-hosted deployment must therefore also restrict egress at the network level
-(no route to the metadata endpoint, the state database or internal services
-from the connector's network).
+discovered from the seed hosts, are not vetted. A hosted deployment must
+therefore also restrict egress at the network level (no route to the
+metadata endpoint, the state database or internal services from the
+connector's network).
+
+**The server's own identity.** On a hosted server (`LAB_SERVICE_TOKEN` set,
+or `CONNECT_HOST_POLICY=public`) a tenant's source may not use what belongs
+to the server (`422 ambient_credentials`, at check, discover, create and
+update, and a stored one is held at its next start): DynamoDB
+`credentials: default` (the host's AWS chain: give a role to assume or
+static keys), MongoDB URI options reading local files (`tlsCAFile`,
+`tlsCertificateKeyFile`, `tlsCRLFile`, …) or falling back to the host's
+identity (`authMechanism=MONGODB-AWS`, `GSSAPI`, `MONGODB-X509`,
+`MONGODB-OIDC`), and Postgres URL parameters naming local files
+(`sslrootcert`, `sslcert`, `sslkey`, `passfile`, `service`, …; paste the CA
+as `ca_cert`). The standalone global scope keeps them.
+
+### Pricing and usage
+
+The contract with the Lab is [`docs/LAB_INTEGRATION.md`](docs/LAB_INTEGRATION.md)
+("Pricing", "Usage event"). Every applied batch records its units:
+
+| Unit | What |
+|---|---|
+| `documents_streamed` | documents Meilisearch accepted from the change stream (writes and deletes) |
+| `documents_snapshot` | documents written by a first sync or a resync you asked for (`POST /resync`, or a `PUT` that changed the streams) |
+| `documents_resync` | documents rewritten by a resync the engine started after the origin lost its position (free) |
+| `bytes` | uncompressed payload bytes Meilisearch accepted (each document's NDJSON line or id, once) |
+| `sync_seconds` | seconds spent snapshotting or streaming (a paused or held sync costs nothing) |
+
+Rejected and skipped documents are never counted. A crash between
+Meilisearch accepting a batch and its checkpoint replays that batch, which is
+then counted twice: at most one batch per index per crash, accepted by the
+contract. `GET /syncs/{id}/status` shows a sync's totals, `GET /usage` the
+tenant's per day or per sync.
 
 ### Usage events (the Lab)
 
-With the three `LAB_*` event variables set, every successful batch adds its
-written and deleted document counts to the sync. Every
-`USAGE_FLUSH_INTERVAL_SECS` one `usage.recorded` event per tenant-owned sync
-with a non-zero count goes into the outbox (Postgres):
+With the three `LAB_*` variables set, the units are added, in the same
+transaction as the progress counters, to a pending row per tenant-owned
+sync; every `USAGE_FLUSH_INTERVAL_SECS` the pending rows become one
+`usage.recorded` event per sync with non-zero units, in one transaction
+(nothing is lost on a crash, nothing is held in memory):
 
 ```json
 {"id": "<UUIDv7>", "type": "usage.recorded", "occurred_at": "...", "account_id": "<tenant>",
  "api_key_id": null, "product": "connect",
- "data": {"operation": "sync", "units": {"documents": 1234}, "job_id": "<sync id>", "description": "..."}}
+ "data": {"operation": "sync",
+          "units": {"documents_streamed": 1200, "documents_snapshot": 0, "documents_resync": 0,
+                    "bytes": 1482113, "sync_seconds": 60},
+          "job_id": "<sync id>", "description": "postgres → products"}}
 ```
 
 A sender leases up to 500 events, posts `{"events": [...]}` to
@@ -271,13 +333,46 @@ A sender leases up to 500 events, posts `{"events": [...]}` to
 marks the ids the Lab lists in `accepted` as sent and retries the rest. An
 event that failed waits longer after each attempt (10 s doubling up to an
 hour), the sender slows down while the Lab fails and logs it at most every
-5 minutes, and past `LAB_OUTBOX_MAX_PENDING` unsent events usage is kept
-counted in memory (one number per sync) instead of enqueued. Sent events are
-pruned after 7 days. Delivery is **at-least-once from the outbox
-onward** (the event id is stable, the Lab deduplicates). Counts accumulated in
-memory but not yet enqueued **are lost if the process crashes** (at most one
-flush interval); a graceful shutdown enqueues them. Global (non-tenant) syncs
-are not billed.
+5 minutes, and past `LAB_OUTBOX_MAX_PENDING` unsent events usage stays
+pending in the state database (one row per sync) instead of enqueued. Sent
+events are pruned after 7 days. Delivery is **at-least-once** (the event id
+is stable, the Lab deduplicates). Global (non-tenant) syncs are never sent to
+the Lab.
+
+**Out of credits.** In Lab mode the server asks
+`GET <LAB_URL>/internal/accounts/{id}` whether each team can spend (an answer
+is reused for 30 s; when the Lab cannot answer the last known answer stands,
+and a team never answered for runs). A team that cannot spend has its
+running syncs set to `held` with the message `out_of_credits` (nothing torn
+down: the origin keeps the position); new syncs are created held; `release`,
+`resume` and `resync` answer `402 out_of_credits`. They resume by themselves
+once the team can spend again, also after a restart. A pause wins.
+
+### Telemetry and analytics
+
+- **`GET /metrics`** (Prometheus text) with `Authorization: Bearer
+  <METRICS_TOKEN>` only (404 without the variable; the Lab and admin tokens
+  are refused): `connect_syncs{phase}`, `connect_documents_total{kind}`,
+  `connect_bytes_total`, `connect_batch_seconds`,
+  `connect_sink_errors_total{class}`, `connect_source_errors_total{kind,class}`,
+  `connect_lag_seconds` (rebuilt at each scrape from the running syncs' lag),
+  `connect_dead_letters_total`, `connect_outbox_backlog`,
+  `connect_lab_events_sent_total{result}` (`accepted`, `rejected`, `failed`),
+  plus `connect_sync_seconds_total`, `connect_tinybird_*` and `process_*`
+  (Linux). No tenant or sync id in any label. The names are a contract with
+  the deploy box's dashboards: never rename one.
+- **Tinybird** (optional, `TINYBIRD_URL` + `TINYBIRD_TOKEN`): every usage
+  flush is also appended to the `connect_usage` data source, from its own
+  outbox lane (deduplicated by `event_id`, at least once, its own backoff and
+  backlog cap: the Lab failing never holds it back, nor the other way round);
+  global syncs go with `tenant_id ""`. `GET /usage` then reads the
+  `connect_tenant_usage` pipe. The data files, `tb` commands and the rule
+  that column names never change are in [`tinybird/`](tinybird/README.md).
+- **Lag guard**: with `MAX_LAG_HOLD_BYTES` and/or `MAX_LAG_HOLD_SECS`, a
+  sync past them that saved no checkpoint for 5 minutes gets a `lag_warning`
+  in its status. Nothing is dropped automatically: freeing a customer's
+  replication slot or offsets loses its position, which is an operator's
+  decision (pause or delete the sync, or fix the cause).
 
 ## Per-source prerequisites
 

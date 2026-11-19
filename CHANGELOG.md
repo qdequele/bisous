@@ -28,6 +28,15 @@ All notable changes to meili-connect are listed here. The format follows
 - Errors returned to the Lab and stored for a tenant's sync are reduced to
   their class and a fixed description; non-Meilisearch response bodies are
   never echoed in errors.
+- On a hosted server (`LAB_SERVICE_TOKEN`, or `CONNECT_HOST_POLICY=public`) a
+  tenant's source may no longer use the server's own identity or files:
+  DynamoDB `credentials: default` (the server's AWS identity), MongoDB URI
+  options reading local files or falling back to the host's identity
+  (`tlsCAFile`, `tlsCertificateKeyFile`, `MONGODB-AWS`, `GSSAPI`,
+  `MONGODB-X509`, `MONGODB-OIDC`, …) and Postgres URL file parameters
+  (`sslrootcert`, `passfile`, `service`, …) answer
+  `422 ambient_credentials`; a stored one is held at its next start. The
+  standalone global scope keeps them.
 
 ### Added
 
@@ -47,6 +56,33 @@ All notable changes to meili-connect are listed here. The format follows
 - Lab usage events: `usage.recorded` (`product: "connect"`) per tenant-owned
   sync, delivered from an outbox with signed batches (`LAB_URL`,
   `LAB_INSTANCE_ID`, `LAB_INSTANCE_SECRET`).
+- Metering of the contract's units (`docs/LAB_INTEGRATION.md`):
+  `documents_streamed`, `documents_snapshot` (first sync or a user resync),
+  `documents_resync` (a resync the engine started; free), `bytes` and
+  `sync_seconds`, recorded per batch with the progress (additive migration).
+  Usage events carry all five with `job_id` and a `postgres → products`
+  description. Usage is durable end to end: recorded in the same transaction
+  as the progress and moved into the outbox in one transaction.
+- `GET /syncs/{id}/status` adds `documents` (per unit), `bytes`,
+  `sync_seconds`, `lag` (`{"seconds", "bytes"}` while streaming, when the
+  source can tell; `records` for Kafka), `lag_warning` and `dead_letters`.
+- `GET /usage?from=&to=&group_by=day|sync`: the caller's units per day or
+  per sync with totals, from Tinybird when configured, else from the state
+  database.
+- Out of credits (Lab mode): a team the Lab says cannot spend has its syncs
+  held with `out_of_credits` (nothing torn down) and resumed when it can;
+  new syncs start held; `release`, `resume` and `resync` answer `402
+  out_of_credits` (`CREDITS_CHECK_INTERVAL_SECS`, `CREDITS_CACHE_FRESH_SECS`,
+  `CREDITS_CACHE_STALE_SECS`).
+- `GET /metrics` (Prometheus) behind `METRICS_TOKEN`: syncs per phase,
+  documents per kind, bytes, batch time, sink and source errors by class,
+  lag, dead letters, outbox backlog, Lab sender results.
+- Tinybird analytics (`TINYBIRD_URL`, `TINYBIRD_TOKEN`): every usage flush is
+  appended to `connect_usage` from its own outbox lane; `tinybird/` holds the
+  data sources, a daily materialized view and the per-tenant usage pipe.
+- Lag guard (`MAX_LAG_HOLD_BYTES`, `MAX_LAG_HOLD_SECS`): a sync past them
+  that makes no progress gets a `lag_warning`; nothing is dropped
+  automatically.
 - Graceful shutdown on SIGTERM/SIGINT; syncs resume where they stopped on the
   next start, paused syncs stay paused.
 - Dockerfile, `compose.yaml` with a demo origin, CI, and `scripts/e2e.sh`

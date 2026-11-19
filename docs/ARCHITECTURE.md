@@ -25,10 +25,10 @@ Crawler (scrapix).
 
 | Crate | Role |
 |---|---|
-| `core` | Contracts only: `Change`, `Checkpoint`, `Source`, `SourceFactory` (with `endpoints`), `Sink`, `StateStore`, `SyncSpec`, errors, `Secret`, `document_id`, and `HostPolicy`. No I/O but the DNS lookup of `HostPolicy`. |
+| `core` | Contracts only: `Change`, `Checkpoint`, `Source` (with `report_lag`), `SourceFactory` (with `endpoints`), `Sink`, `StateStore` (`record_progress` takes a `Progress` with its `Usage`), `SyncSpec`, errors, `Secret`, `document_id`, `Lag` / `LagReporter`, and `HostPolicy`. No I/O but the DNS lookup of `HostPolicy`. |
 | `sink` | `MeiliSink`: NDJSON batches, task polling, poison-document bisection, swap, settings copy. |
 | `engine` | `run_sync`: drives one sync through its lifecycle; `Supervisor`: runs many, restarts with backoff. Depends on the three traits only. |
-| `store` | Postgres (`sqlx`): sync specs with sealed secrets, `SyncState`, dead letters, progress counters, Lab usage outbox. Also an in-memory store for tests and single-node trials. |
+| `store` | Postgres (`sqlx`): sync specs with sealed secrets, `SyncState`, dead letters, progress counters and units, pending usage, the events outbox (one lane per consumer). Also an in-memory store for tests and single-node trials. |
 | `sources/*` | One crate per origin, each exporting a `SourceFactory`. |
 | `server` | Binary `meili-connect`: axum API, auth, supervisor wiring, Lab seams. |
 
@@ -88,6 +88,26 @@ engine and recorded with each batch's progress (`core::Progress`, carrying a
   run monitor and recorded by the supervisor every `seconds_interval` and at
   the end of each run. A paused or held sync accrues nothing.
 
+`Progress::batch_age` (first event of the batch to tasks succeeded) feeds
+`connect_batch_seconds` and is never stored.
+
+## Lag
+
+`Source::report_lag` hands a source a `LagReporter` (a `watch` cell, shared
+by the attempts of one supervised sync) before `open`: publishing never
+blocks and reading needs nothing from a source busy streaming. The default
+implementation ignores it (lag unknown: MySQL today). Postgres reports the
+WAL between the slot's confirmed position and the server's (from
+keep-alives, data and commits; no extra query) and the age of the last
+commit; MongoDB the age of each event's cluster time; Kafka the records
+behind the high watermarks (measured every 15 s off the event loop: the
+watermark requests block) and the last record's age; DynamoDB the worst
+shard's `ApproximateCreationDateTime` age. Each reports 0 once caught up.
+The engine clears it whenever a run stops streaming; `SyncStatus` carries it
+with the time since the last checkpoint, which the server's lag guard
+(`MAX_LAG_HOLD_*`) uses to warn about a stuck sync. Nothing is dropped
+automatically.
+
 ## Sources
 
 | Kind | Mechanism | Checkpoint | Snapshot |
@@ -140,6 +160,27 @@ Standalone works with none of the `LAB_*` variables set. With them:
   (`version(1)‖nonce(12)‖ciphertext`, key from `CONNECT_SECRET_KEY`), same
   layout as glutony's connections.
 
+## Telemetry (`server::metrics`)
+
+`GET /metrics` is Prometheus text from a registry per server (the
+`prometheus` crate, no global recorder). Counters are updated where things
+happen (`MeteredStore` for documents, bytes, seconds, batch time and dead
+letters, `InstrumentedSink` for sink errors, `GuardedSource` for source
+errors, the senders for their results); the phases, the outbox backlogs and
+the `connect_lag_seconds` histogram are computed when scraped. No label
+carries a tenant or a sync id. Only `METRICS_TOKEN` is accepted.
+
+## Credits (`server::credits`, Lab mode)
+
+`CreditCache` asks `GET <LAB_URL>/internal/accounts/{id}` (30 s fresh; when
+the Lab cannot answer, the last known answer stands, quietly for 300 s then
+with a warning, and a team never answered for runs). Every
+`CREDITS_CHECK_INTERVAL_SECS` the manager holds the running syncs of a team
+that cannot spend (`Held`, message `out_of_credits`, supervisor stopped,
+nothing torn down) and restarts the syncs it held once the team can spend;
+the state survives a restart (boot leaves them idle). Starting a sync of
+such a team (`resume`, `resync`, `release`) answers `402`.
+
 ## Host policy
 
 Sources and destinations are tenant-supplied addresses that the server
@@ -168,6 +209,13 @@ and the driver's connect a rebinding window remains for sources (not for the
 sink); Kafka brokers advertised in metadata and MongoDB members discovered
 from the seeds are not vetted. A hosted deployment must also restrict egress
 at the network level.
+
+On a hosted server (`LAB_SERVICE_TOKEN` or `CONNECT_HOST_POLICY=public`) a
+tenant's source may not use the server's own identity, files or
+environment (`server::ambient`: DynamoDB `credentials: default`, MongoDB URI
+file options and host-identity auth mechanisms, Postgres URL file
+parameters). Refused by the API (`422 ambient_credentials`) and, for a sync
+stored earlier, by `GuardedSources` before its first connection (held).
 
 ## Changes to a sync (`server::manager`)
 

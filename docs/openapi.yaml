@@ -298,10 +298,11 @@ paths:
       - { $ref: "#/components/parameters/TenantId" }
     post:
       summary: Start a stopped sync again (paused, held or failed)
-      description: A no-op when the sync is running.
+      description: A no-op when the sync is running. `402 out_of_credits` while its team cannot spend (Lab mode).
       responses:
         "200": { $ref: "#/components/responses/Status" }
         "401": { $ref: "#/components/responses/Error" }
+        "402": { $ref: "#/components/responses/Error" }
         "404": { $ref: "#/components/responses/Error" }
 
   /syncs/{id}/resync:
@@ -312,10 +313,13 @@ paths:
       summary: Rebuild every index from a fresh snapshot
       description: |
         The snapshot goes into shadow indexes that are swapped in when
-        complete, so search keeps serving the old data meanwhile.
+        complete, so search keeps serving the old data meanwhile. Its
+        documents are metered as `documents_snapshot`. `402 out_of_credits`
+        while its team cannot spend (Lab mode).
       responses:
         "200": { $ref: "#/components/responses/Status" }
         "401": { $ref: "#/components/responses/Error" }
+        "402": { $ref: "#/components/responses/Error" }
         "404": { $ref: "#/components/responses/Error" }
 
   /syncs/{id}/release:
@@ -327,9 +331,13 @@ paths:
       description: |
         A `TRUNCATE` or a mass delete above `mass_delete_guard` holds the sync
         (phase `held`) instead of emptying the index. Releasing applies it.
+        A sync held with `out_of_credits` cannot be released: `402
+        out_of_credits` while its team cannot spend; it resumes by itself
+        once it can.
       responses:
         "200": { $ref: "#/components/responses/Status" }
         "401": { $ref: "#/components/responses/Error" }
+        "402": { $ref: "#/components/responses/Error" }
         "404": { $ref: "#/components/responses/Error" }
         "409": { $ref: "#/components/responses/Error" }
 
@@ -373,6 +381,11 @@ paths:
                         written: { type: integer }
                         deleted: { type: integer }
                         dead_letters_dropped: { type: integer }
+                        documents_streamed: { type: integer }
+                        documents_snapshot: { type: integer }
+                        documents_resync: { type: integer }
+                        bytes: { type: integer }
+                        sync_seconds: { type: integer }
                         rejected: { type: integer }
         "400": { $ref: "#/components/responses/Error" }
         "401": { $ref: "#/components/responses/Error" }
@@ -495,7 +508,11 @@ components:
             the request took longer than `REQUEST_TIMEOUT_SECS`; a change to
             a sync still completes), `secret_required` (422: a
             `"<redacted>"` placeholder for a secret
-            whose source or destination changed), `host_not_allowed` (422:
+            whose source or destination changed), `ambient_credentials` (422,
+            hosted server: a tenant's source would use the server's own
+            identity or files, e.g. DynamoDB `credentials: default`),
+            `out_of_credits` (402, Lab mode: the team cannot spend; its
+            syncs are held and resume by themselves), `host_not_allowed` (422:
             the host policy refuses the source or
             destination; the message names the host, never what it resolved
             to). For calls with the Lab token, source and Meilisearch errors
