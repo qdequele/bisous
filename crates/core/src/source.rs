@@ -118,6 +118,16 @@ pub struct CollectionInfo {
 ///    until cancelled. Returns `Ok(())` only on cancellation or a closed
 ///    channel; anything else is an error.
 ///
+/// Cancellation: `snapshot` and `stream` return `Ok(())` promptly when the
+/// token fires; the engine never treats a snapshot as complete without
+/// checking the token itself. `check`, `discover`, `open` and `teardown`
+/// take no token: they must be safe to drop at any await point (the engine
+/// races them against its token), leaving at worst an origin-side object
+/// that a later `open` reuses or `teardown` removes.
+///
+/// Acks: a source that needs no origin-side release may ignore the
+/// `AckReceiver`, including dropping it.
+///
 /// After any error the engine drops the value and builds a new one.
 /// Implementations must not hold state that a fresh `open` cannot rebuild.
 #[async_trait]

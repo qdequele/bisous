@@ -57,4 +57,14 @@ pub enum SourceEvent {
     SchemaChanged {
         collection: String,
     },
+    /// A record the source could not turn into a change (undecodable Kafka
+    /// payload, a row without a usable key). The source carries on; the
+    /// engine counts it as rejected and stores `reason` as a dead letter
+    /// without a payload. `position` locates it for the user (for example
+    /// `orders/3@1842`) and must never contain record content.
+    Skipped {
+        collection: String,
+        position: String,
+        reason: String,
+    },
 }

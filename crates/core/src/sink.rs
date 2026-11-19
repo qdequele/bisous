@@ -63,6 +63,17 @@ pub struct ApplyReport {
     pub rejected: Vec<RejectedDoc>,
 }
 
+/// Cancellation: methods take no token. Every method must be safe to drop
+/// at any await point; the engine races calls against its
+/// `CancellationToken` and drops the future. A dropped `apply` may leave
+/// tasks running on Meilisearch, which is harmless because the batch is
+/// replayed from the last checkpoint.
+///
+/// A document that keeps failing for a reason that may be transient
+/// (embedder outage, `internal` task errors) must never be reported in
+/// `rejected`: return `SinkError::Transient` for the whole call instead.
+/// `rejected` is only for documents Meilisearch refuses deterministically.
+/// The engine bounds identical consecutive `Transient` failures itself.
 #[async_trait]
 pub trait Sink: Send + Sync {
     /// Create the index if missing with this primary key. Fails with
@@ -79,11 +90,19 @@ pub trait Sink: Send + Sync {
     /// Atomically swap two indexes and wait for the task.
     async fn swap(&self, a: &str, b: &str) -> Result<(), SinkError>;
 
+    /// Remove every document of an index, keeping its settings, and wait
+    /// for the task. Missing index is `Ok`.
+    async fn delete_all_documents(&self, uid: &str) -> Result<(), SinkError>;
+
     /// Delete an index and wait for the task. Missing index is `Ok`.
     async fn delete_index(&self, uid: &str) -> Result<(), SinkError>;
 
     /// Copy the settings of `from` onto `to` and wait for the task, so a
-    /// shadow index is built with the live index's configuration.
+    /// shadow index is built with the live index's configuration. `to` may
+    /// not exist yet (it is created). When `from` does not exist this is a
+    /// no-op. Settings that Meilisearch returns redacted (embedder API
+    /// keys) cannot be copied: fail with `SinkError::Config` naming the
+    /// embedder instead of installing a broken key.
     async fn copy_settings(&self, from: &str, to: &str) -> Result<(), SinkError>;
 
     /// Number of documents in the index, `None` when it does not exist.

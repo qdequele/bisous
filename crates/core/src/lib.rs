@@ -24,5 +24,8 @@ pub use source::{
     AckReceiver, AckSender, Capabilities, CheckItem, CheckReport, CheckStatus, CollectionInfo,
     EventSender, FieldInfo, Opened, Source, SourceFactory, ack_channel,
 };
-pub use spec::{FieldSelection, MeiliDestination, SourceKind, SourceSpec, StreamMapping, SyncSpec};
+pub use spec::{
+    FieldSelection, MeiliDestination, SourceKind, SourceSpec, StreamMapping, SyncSpec,
+    VectorMapping,
+};
 pub use store::{DeadLetter, StateStore, SyncPhase, SyncState};
