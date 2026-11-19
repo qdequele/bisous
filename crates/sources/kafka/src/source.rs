@@ -22,7 +22,7 @@ use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
 
 use crate::checkpoint::{self, Positions};
-use crate::client::{self, Ctx, KafkaConsumer};
+use crate::client::{self, Ctx, KafkaConsumer, Phase};
 use crate::config::{KafkaConfig, StartFrom, group_id};
 use crate::decode::{DecodeError, Decoded, Decoder};
 
@@ -130,7 +130,8 @@ impl Source for KafkaSource {
             }
             for topic in &topics {
                 let name = "topic";
-                match client::partitions_of(&consumer, &config, topic, config.request_timeout()) {
+                let timeout = config.request_timeout();
+                match client::partitions_of(&consumer, &config, topic, timeout, Phase::Open) {
                     Ok(p) => items.push((
                         name,
                         CheckStatus::Ok,
@@ -594,10 +595,11 @@ impl Run {
             tracing::warn!(sync_id = %self.source_id, "kafka consumer: {code} (retrying)");
             return Ok(());
         }
-        // Authorization, unknown topic → Config; offset out of range →
-        // PositionLost; all brokers down and anything else → Transient.
+        // Authorization → Config; offset out of range → PositionLost;
+        // unknown topic (leader election, restart), all brokers down and
+        // anything else → Transient.
         let last = self.consumer.context().last_error();
-        Err(client::map_error(&self.config, "consume", e, last))
+        Err(client::map_stream_error(&self.config, "consume", e, last))
     }
 
     /// The assignment for every known partition, or only for `only`.
@@ -632,10 +634,13 @@ impl Run {
         let lookup = client::blocking(move || {
             let mut added = Vec::new();
             for topic in &topics {
-                for p in client::partitions_of(&consumer, &config, topic, config.request_timeout())?
+                let timeout = config.request_timeout();
+                for p in
+                    client::partitions_of(&consumer, &config, topic, timeout, Phase::Streaming)?
                 {
                     if !known.iter().any(|(t, kp)| t == topic && *kp == p) {
-                        let wm = client::watermarks(&consumer, &config, topic, p)?;
+                        let wm =
+                            client::watermarks(&consumer, &config, topic, p, Phase::Streaming)?;
                         added.push((topic.clone(), p, wm.low));
                     }
                 }
@@ -843,6 +848,23 @@ mod tests {
         assert_eq!(skipped_positions(&events).len(), 5);
         assert_eq!(r.positions["t"][&0], 6);
         assert_eq!(r.positions["t"][&1], 0, "held, not checkpointed past");
+    }
+
+    #[tokio::test]
+    async fn unknown_topic_while_consuming_is_transient() {
+        // Leader election or a rolling restart: the engine reopens, and
+        // `open` confirms with a metadata lookup whether the topic is gone.
+        let r = run(json!({}));
+        let e = KafkaError::MessageConsumption(RDKafkaErrorCode::UnknownTopicOrPartition);
+        assert!(matches!(
+            r.on_consumer_error(&e),
+            Err(SourceError::Transient(_))
+        ));
+        let e = KafkaError::MessageConsumption(RDKafkaErrorCode::TopicAuthorizationFailed);
+        assert!(matches!(
+            r.on_consumer_error(&e),
+            Err(SourceError::Config(_))
+        ));
     }
 
     #[tokio::test]
