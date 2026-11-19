@@ -18,7 +18,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.94"
 license = "MIT"
-repository = "https://github.com/qdequele/meili-connect"
+repository = "https://github.com/qdequele/bisous"
 
 [workspace.dependencies]
 meili-connect-core = { path = "crates/core", version = "0.1.0" }
