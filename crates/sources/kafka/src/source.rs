@@ -851,6 +851,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn snapshot_and_stream_return_ok_promptly_on_cancel() {
+        let mut s = KafkaSource::new("t", config(json!({})), vec!["t".into()]);
+        let (tx, _rx) = mpsc::channel(4);
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        assert!(s.snapshot(tx.clone(), cancel.clone()).await.is_ok());
+
+        // Positions as `open` would set them; the broker is unreachable, so
+        // the stream only waits.
+        s.positions = Some(Positions::from([("t".to_owned(), [(0, 0)].into())]));
+        let (ack_tx, ack_rx) = meili_connect_core::ack_channel();
+        drop(ack_tx); // the engine may drop its side
+        let r = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            s.stream(tx.clone(), ack_rx, cancel),
+        )
+        .await
+        .expect("stream ignored an already-cancelled token");
+        assert!(r.is_ok(), "{r:?}");
+
+        let (_ack_tx, ack_rx) = meili_connect_core::ack_channel();
+        let cancel = CancellationToken::new();
+        let c = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            c.cancel();
+        });
+        let r = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            s.stream(tx, ack_rx, cancel),
+        )
+        .await
+        .expect("stream did not stop on cancel");
+        assert!(r.is_ok(), "{r:?}");
+    }
+
+    #[tokio::test]
     async fn unknown_topic_while_consuming_is_transient() {
         // Leader election or a rolling restart: the engine reopens, and
         // `open` confirms with a metadata lookup whether the topic is gone.
