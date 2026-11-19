@@ -318,6 +318,7 @@ fn app_tweaked(
         metrics_token: Some(METRICS.into()),
         lag_guard: Default::default(),
         tinybird: None,
+        hosted: false,
         limits,
     };
     tweak(&mut wiring);
@@ -1048,6 +1049,7 @@ async fn a_loopback_destination_is_host_not_allowed_with_the_real_sinks() {
             metrics_token: Some(METRICS.into()),
             lag_guard: Default::default(),
             tinybird: None,
+            hosted: false,
             limits: Limits::default(),
         },
         CancellationToken::new(),
@@ -2635,4 +2637,156 @@ async fn usage_comes_from_tinybird_when_configured_with_the_same_shape() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["source"], "state");
     assert!(body["totals"].is_object());
+}
+
+// ------------------------------------------------------------- ambient identity
+
+fn dynamo_body(name: &str, credentials: Value) -> Value {
+    json!({
+        "name": name,
+        "source": {"kind": "dynamodb", "config": {"region": "eu-west-1", "credentials": credentials}},
+        "destination": {"url": "http://meili:7700", "api_key": "k"},
+        "streams": [{"collection": "orders", "index": "orders"}],
+    })
+}
+
+fn hosted_app(store: Arc<MemStore>) -> App {
+    app_tweaked(
+        locked(),
+        store,
+        HostPolicy::any(),
+        Limits::default(),
+        Duration::from_millis(200),
+        |w| w.hosted = true,
+    )
+}
+
+#[tokio::test]
+async fn a_tenant_never_borrows_the_servers_own_identity_on_a_hosted_server() {
+    let a = hosted_app(Arc::new(MemStore::new()));
+    let default = json!({"type": "default"});
+    let (status, body) = call(
+        &a.router,
+        "POST",
+        "/syncs",
+        &lab("team-a"),
+        Some(dynamo_body("d", default.clone())),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["code"], "ambient_credentials");
+    assert!(body["message"].as_str().unwrap().contains("assume_role"));
+    // Neither may it probe with them (listing the server's own tables).
+    for route in ["/sources/check", "/sources/discover"] {
+        let (status, body) = call(
+            &a.router,
+            "POST",
+            route,
+            &lab("team-a"),
+            Some(json!({"source": {"kind": "dynamodb", "config": {"region": "eu-west-1"}}})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{route}: {body}");
+        assert_eq!(body["code"], "ambient_credentials");
+    }
+    // A MongoDB URI reading a local file, for the admin acting for a tenant.
+    let mut tenant_admin = admin();
+    tenant_admin.push((H_TENANT_ID, "team-a".to_owned()));
+    let (status, body) = call(
+        &a.router,
+        "POST",
+        "/syncs",
+        &tenant_admin,
+        Some(json!({
+            "name": "m",
+            "source": {"kind": "mongodb", "config": {"uri": "mongodb://h/?tlsCAFile=/etc/passwd"}},
+            "destination": {"url": "http://meili:7700", "api_key": "k"},
+            "streams": [{"collection": "db.c", "index": "c"}],
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    // A role to assume is fine, and the standalone admin keeps `default`.
+    let (status, _) = call(
+        &a.router,
+        "POST",
+        "/syncs",
+        &lab("team-a"),
+        Some(dynamo_body(
+            "r",
+            json!({"type": "assume_role", "role_arn": "arn:aws:iam::123456789012:role/r"}),
+        )),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = call(
+        &a.router,
+        "POST",
+        "/syncs",
+        &admin(),
+        Some(dynamo_body("g", default.clone())),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // Standalone (not hosted): allowed for tenants too.
+    let standalone = app(locked());
+    let (status, _) = call(
+        &standalone.router,
+        "POST",
+        "/syncs",
+        &lab("team-a"),
+        Some(dynamo_body("d", default)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn a_stored_tenant_sync_with_the_servers_identity_is_held_on_a_hosted_server() {
+    let store = Arc::new(MemStore::new());
+    let before = app(locked());
+    let id = {
+        let (status, body) = call(
+            &before.router,
+            "POST",
+            "/syncs",
+            &lab("team-a"),
+            Some(dynamo_body("d", json!({"type": "default"}))),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        body["id"].as_str().unwrap().to_owned()
+    };
+    // Same row, now on a hosted server.
+    let row = before
+        .store
+        .get_sync(Some("team-a"), &id)
+        .await
+        .unwrap()
+        .unwrap()
+        .readable()
+        .unwrap();
+    before.state.manager.shutdown(Duration::from_secs(5)).await;
+    store.create_sync(Some("team-a"), &row.spec).await.unwrap();
+    let a = hosted_app(Arc::clone(&store));
+    boot_syncs(&a.state).await.unwrap();
+    wait_for(async || {
+        call(
+            &a.router,
+            "GET",
+            &format!("/syncs/{id}/status"),
+            &lab("team-a"),
+            None,
+        )
+        .await
+        .1["phase"]
+            == "held"
+    })
+    .await;
+    assert_eq!(
+        a.probe.last_opened.lock().unwrap().as_ref(),
+        None,
+        "never opened"
+    );
 }

@@ -69,8 +69,10 @@ fn probe_request(input: Result<Json<Value>, JsonRejection>) -> ApiResult<ProbeRe
 async fn probe_source(
     state: &AppState,
     req: &ProbeRequest,
-    coarse: bool,
+    scope: &Scope,
 ) -> ApiResult<Box<dyn Source>> {
+    let coarse = coarse(scope);
+    refuse_ambient(state, scope.tenant.is_some(), &req.source)?;
     let sources = state.sources(coarse);
     state
         .registry
@@ -90,6 +92,18 @@ async fn vet(state: &AppState, source: &SourceSpec, coarse: bool) -> ApiResult<(
         Err(VetError::Source(e)) if coarse => Err(source_error(&coarse_source_error(e))),
         Err(VetError::Source(e)) => Err(source_error(&e)),
     }
+}
+
+/// On a hosted server, a tenant's source may not use the server's own
+/// identity, files or environment (`crate::ambient`).
+fn refuse_ambient(state: &AppState, tenant_owned: bool, source: &SourceSpec) -> ApiResult<()> {
+    if state.hosted
+        && tenant_owned
+        && let Some(why) = crate::ambient::ambient_identity(source)
+    {
+        return Err(ApiError::ambient_credentials(why));
+    }
+    Ok(())
 }
 
 /// Lab callers get coarse source and sink errors.
@@ -127,7 +141,7 @@ pub async fn check_source(
     let req = probe_request(input)?;
     let _slot = state.probes.try_acquire(scope.tenant())?;
     let report = tokio::time::timeout(state.probe_timeout, async {
-        let mut source = probe_source(&state, &req, coarse(&scope)).await?;
+        let mut source = probe_source(&state, &req, &scope).await?;
         source.check().await.map_err(|e| source_error(&e))
     })
     .await
@@ -146,7 +160,7 @@ pub async fn discover_source(
     let req = probe_request(input)?;
     let _slot = state.probes.try_acquire(scope.tenant())?;
     let collections = tokio::time::timeout(state.probe_timeout, async {
-        let mut source = probe_source(&state, &req, coarse(&scope)).await?;
+        let mut source = probe_source(&state, &req, &scope).await?;
         source.discover().await.map_err(|e| source_error(&e))
     })
     .await
@@ -217,6 +231,7 @@ async fn validate(state: &AppState, spec: &SyncSpec, coarse: bool) -> ApiResult<
         .await
         .map_err(ApiError::host_not_allowed)?;
     validate_shape(state, spec)?;
+    refuse_ambient(state, spec.tenant.is_some(), &spec.source)?;
     vet(state, &spec.source, coarse).await
 }
 

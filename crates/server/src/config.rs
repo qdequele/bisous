@@ -140,6 +140,13 @@ impl LagGuard {
 }
 
 impl Config {
+    /// Lab mode (`LAB_SERVICE_TOKEN`) or `CONNECT_HOST_POLICY=public`: the
+    /// server runs other people's syncs, which may never use its own
+    /// identity, files or environment (`crate::ambient`).
+    pub fn hosted(&self) -> bool {
+        self.lab_service_token.is_some() || self.host_policy.mode_name() == "public"
+    }
+
     pub fn from_env() -> Result<Self, ConfigError> {
         Self::from_lookup(|k| std::env::var(k).ok())
     }
@@ -503,6 +510,17 @@ mod tests {
                 ("LAB_INSTANCE_SECRET", "s"),
             ])
             .is_err()
+        );
+    }
+
+    #[test]
+    fn a_lab_token_or_the_public_policy_means_hosted() {
+        assert!(!cfg(&[("ADMIN_API_KEY", "k")]).unwrap().hosted());
+        assert!(cfg(&[("LAB_SERVICE_TOKEN", "t")]).unwrap().hosted());
+        assert!(
+            cfg(&[("ADMIN_API_KEY", "k"), ("CONNECT_HOST_POLICY", "public")])
+                .unwrap()
+                .hosted()
         );
     }
 

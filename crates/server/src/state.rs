@@ -35,6 +35,9 @@ pub struct AppState {
     pub metrics: Arc<Metrics>,
     /// When a stuck sync's lag deserves a warning in its status.
     pub lag_guard: crate::config::LagGuard,
+    /// Lab mode or a public host policy: a tenant's source may not use the
+    /// server's own identity or files (`crate::ambient`).
+    pub hosted: bool,
     /// `GET /usage` reads Tinybird when configured.
     pub usage_reader: Option<Arc<crate::tinybird::TinybirdReader>>,
     /// The only credential `GET /metrics` accepts.

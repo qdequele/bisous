@@ -124,6 +124,7 @@ pub struct GuardedSources {
     policy: Arc<HostPolicy>,
     coarse: bool,
     metrics: Option<Arc<Metrics>>,
+    refuse_ambient: bool,
 }
 
 impl GuardedSources {
@@ -133,7 +134,16 @@ impl GuardedSources {
             policy,
             coarse,
             metrics: None,
+            refuse_ambient: false,
         }
+    }
+
+    /// Refuse, before any connection, a source that would use the
+    /// server's own identity or files (`crate::ambient`): a tenant's sync
+    /// on a hosted server, even one stored before the API refused it.
+    pub fn refusing_ambient_identity(mut self, refuse: bool) -> Self {
+        self.refuse_ambient = refuse;
+        self
     }
 
     /// Count the errors of the sources it builds (`connect_source_errors_total`).
@@ -151,6 +161,7 @@ impl GuardedSources {
             coarse: self.coarse,
             vetted,
             metrics: self.metrics.clone(),
+            refuse_ambient: self.refuse_ambient,
         })
     }
 
@@ -193,6 +204,7 @@ struct GuardedSource {
     coarse: bool,
     vetted: bool,
     metrics: Option<Arc<Metrics>>,
+    refuse_ambient: bool,
 }
 
 impl GuardedSource {
@@ -208,6 +220,12 @@ impl GuardedSource {
     }
 
     async fn ensure_vetted(&mut self) -> Result<(), SourceError> {
+        if self.refuse_ambient
+            && let Some(why) = crate::ambient::ambient_identity(&self.spec)
+        {
+            // Held: the user must change the credentials.
+            return Err(SourceError::Config(why));
+        }
         if self.vetted {
             return Ok(());
         }

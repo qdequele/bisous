@@ -3,6 +3,7 @@
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+pub mod ambient;
 pub mod api;
 pub mod auth;
 pub mod config;
@@ -94,6 +95,8 @@ pub struct Wiring {
     pub lag_guard: crate::config::LagGuard,
     /// Usage analytics: its own outbox lane, `GET /usage` from its pipe.
     pub tinybird: Option<TinybirdConfig>,
+    /// Lab mode or `CONNECT_HOST_POLICY=public`.
+    pub hosted: bool,
 }
 
 /// Assemble the shared state around a backend. The engine gets the
@@ -130,6 +133,7 @@ pub fn build_state(
         stop_grace: wiring.limits.stop_grace,
         credits: wiring.credits,
         metrics: Arc::clone(&metrics),
+        hosted: wiring.hosted,
         cancel,
     }));
     AppState {
@@ -144,6 +148,7 @@ pub fn build_state(
         metrics,
         metrics_token: wiring.metrics_token,
         lag_guard: wiring.lag_guard,
+        hosted: wiring.hosted,
         usage_reader: match &wiring.tinybird {
             Some(tb) => match TinybirdReader::new(tb.clone()) {
                 Ok(reader) => Some(Arc::new(reader)),
@@ -315,6 +320,7 @@ pub async fn run() -> Result<(), String> {
             metrics_token: config.metrics_token.clone(),
             lag_guard: config.lag_guard,
             tinybird: config.tinybird.clone(),
+            hosted: config.hosted(),
         },
         cancel.child_token(),
     );
