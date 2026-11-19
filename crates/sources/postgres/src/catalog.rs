@@ -390,6 +390,22 @@ impl SlotInfo {
     }
 }
 
+/// The end of the WAL this server has: flushed on a primary, received or
+/// replayed (whichever is further) on a standby.
+pub async fn wal_end(sql: &Sql) -> Result<String, SourceError> {
+    let rows = sql
+        .query(
+            "SELECT (CASE WHEN pg_is_in_recovery()
+                      THEN GREATEST(pg_last_wal_receive_lsn(), pg_last_wal_replay_lsn())
+                      ELSE pg_current_wal_flush_lsn() END)::text",
+            &[],
+        )
+        .await?;
+    rows.first()
+        .and_then(|r| r.try_get::<_, Option<String>>(0).ok().flatten())
+        .ok_or_else(|| SourceError::Transient("the server reports no WAL position".into()))
+}
+
 /// Whether backend `pid` is a session of ours: this connector's
 /// application name, logged in as the current role.
 pub async fn is_own_backend(sql: &Sql, pid: i32) -> Result<bool, SourceError> {

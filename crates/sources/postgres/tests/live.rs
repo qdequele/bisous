@@ -635,6 +635,14 @@ async fn dropped_slot_is_position_lost_and_teardown_is_idempotent() {
     };
     drop(src);
 
+    // A checkpoint ahead of the server's WAL (restored from a backup, a
+    // failover to a server that is behind): the changes in between are
+    // not there to stream.
+    let mut src = source(&url, &sync_id, &[&collection]);
+    let future = Checkpoint(json!({"lsn": "FFFF/0"}));
+    let err = src.open(Some(future)).await.unwrap_err();
+    assert!(matches!(err, SourceError::PositionLost(_)), "{err:?}");
+
     // A slot that confirmed past the checkpoint cannot honour it either.
     let mut src = source(&url, &sync_id, &[&collection]);
     let ahead = Checkpoint(json!({"lsn": "0/1"}));

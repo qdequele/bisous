@@ -265,6 +265,14 @@ impl PostgresSource {
                 )));
             }
         }
+        let server = lsn::parse(&catalog::wal_end(sql).await?)?;
+        if resume > server {
+            return Err(SourceError::PositionLost(format!(
+                "the saved checkpoint {resume} is ahead of the server's WAL ({server}): the \
+                 server was restored or failed over to one that is behind, and the changes in \
+                 between are not there to stream"
+            )));
+        }
         match catalog::publication_tables(sql, &publication).await? {
             None => {
                 return Err(SourceError::PositionLost(format!(
