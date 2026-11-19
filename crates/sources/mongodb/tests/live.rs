@@ -95,7 +95,7 @@ impl Mirror {
                 self.docs.retain(|(c, _), _| *c != collection);
                 self.truncated.push(collection);
             }
-            SourceEvent::SchemaChanged { .. } => {}
+            SourceEvent::SchemaChanged { .. } | SourceEvent::Skipped { .. } => {}
         }
     }
 }
