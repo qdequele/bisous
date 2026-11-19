@@ -11,11 +11,13 @@ pub const SUPABASE_REALTIME: &str = "supabase_realtime";
 
 const PREFIX: &str = "meili_connect_";
 
-/// `meili_connect_<sync_id>`, lowercased, every byte outside `[a-z0-9_]`
-/// replaced by `_`. Slot names only allow that alphabet, and using the same
-/// name for the publication keeps them easy to match. When the result is
-/// longer than 63 bytes it is cut and suffixed with a hash of the full
-/// sync id, so two long ids never collide.
+/// `meili_connect_<sync_id>`, lowercased, every character outside
+/// `[a-z0-9_]` replaced by `_`. Slot names only allow that alphabet, and
+/// using the same name for the publication keeps them easy to match. When
+/// sanitising changed the id (so `a-b`, `a_b` and `A-B` never share a
+/// name) or the result is longer than 63 bytes, it is cut as needed and
+/// suffixed with a hash of the exact sync id. The prefix makes every name
+/// start with a letter, as unquoted replication commands require.
 pub fn default_name(sync_id: &str) -> String {
     let body: String = sync_id
         .chars()
@@ -29,26 +31,29 @@ pub fn default_name(sync_id: &str) -> String {
         })
         .collect();
     let full = format!("{PREFIX}{body}");
-    if full.len() <= MAX_IDENT {
+    if body == sync_id && full.len() <= MAX_IDENT {
         return full;
     }
     let hash = hex::encode(Sha256::digest(sync_id.as_bytes()));
     let suffix = &hash[..12];
     // All bytes are ASCII, so any cut is a char boundary.
-    let keep = MAX_IDENT - suffix.len() - 1;
+    let keep = full.len().min(MAX_IDENT - suffix.len() - 1);
     format!("{}_{suffix}", &full[..keep])
 }
 
-/// Slot names: `[a-z0-9_]{1,63}`.
+/// Slot names: `[a-z0-9_]{1,63}`, not starting with a digit (the
+/// replication protocol takes them as unquoted identifiers).
 pub fn validate_slot_name(name: &str) -> Result<String, SourceError> {
     if name.is_empty()
         || name.len() > MAX_IDENT
+        || name.starts_with(|c: char| c.is_ascii_digit())
         || !name
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
     {
         return Err(SourceError::Config(format!(
-            "invalid slot name '{name}': use 1 to 63 characters among a-z, 0-9 and _"
+            "invalid slot name '{name}': use 1 to 63 characters among a-z, 0-9 and _, \
+             not starting with a digit"
         )));
     }
     Ok(name.to_owned())
@@ -112,14 +117,38 @@ mod tests {
     #[test]
     fn default_name_sanitises() {
         assert_eq!(default_name("abc"), "meili_connect_abc");
-        assert_eq!(
-            default_name("0190F3A2-7B1C-7DEF-8000-0123456789AB"),
-            "meili_connect_0190f3a2_7b1c_7def_8000_0123456789ab"
+        // A UUID keeps all its characters, plus the hash: exactly 63 bytes.
+        let uuid = default_name("0190F3A2-7B1C-7DEF-8000-0123456789AB");
+        assert!(
+            uuid.starts_with("meili_connect_0190f3a2_7b1c_7def_8000_0123456789ab_"),
+            "{uuid}"
         );
-        assert_eq!(default_name("a b.c/é"), "meili_connect_a_b_c__");
+        assert_eq!(uuid.len(), MAX_IDENT);
+        assert!(default_name("a b.c/é").starts_with("meili_connect_a_b_c___"));
         for name in [default_name("x"), default_name(&"y".repeat(200))] {
             assert!(validate_slot_name(&name).is_ok(), "{name}");
         }
+    }
+
+    #[test]
+    fn ids_that_sanitise_alike_never_share_a_name() {
+        let names: Vec<String> = ["a-b", "a_b", "A-B", "a.b", "A_B"]
+            .iter()
+            .map(|id| default_name(id))
+            .collect();
+        for (i, a) in names.iter().enumerate() {
+            assert!(validate_slot_name(a).is_ok(), "{a}");
+            for b in &names[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
+        // An id that needs no sanitising keeps its readable name.
+        assert_eq!(default_name("a_b"), "meili_connect_a_b");
+        assert!(default_name("a-b").starts_with("meili_connect_a_b_"));
+        // Names start with a letter: valid unquoted in replication commands.
+        assert!(default_name("0abc").starts_with('m'));
+        assert!(validate_slot_name("0abc").is_err());
+        assert!(validate_slot_name("_0abc").is_ok());
     }
 
     #[test]
