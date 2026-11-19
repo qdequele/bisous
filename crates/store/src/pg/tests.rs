@@ -9,7 +9,7 @@ use std::sync::Arc;
 use sqlx::Connection;
 
 use super::*;
-use crate::test_support::{invalid_specs, letter, skipped_letter, spec, state};
+use crate::test_support::{invalid_specs, letter, pr, skipped_letter, spec, state};
 
 async fn store_with_key(key: SecretKey) -> Option<PgStore> {
     store_with(key, &[]).await
@@ -76,7 +76,117 @@ async fn state_round_trip() {
     st.checkpoint = None;
     st.resyncing = true;
     store.save(&st).await.unwrap();
-    assert_eq!(store.load("s1").await.unwrap(), Some(st));
+    assert_eq!(store.load("s1").await.unwrap(), Some(st.clone()));
+    // The resync's reason survives a restart.
+    for reason in [ResyncReason::System, ResyncReason::User] {
+        st.resync_reason = Some(reason);
+        store.save(&st).await.unwrap();
+        assert_eq!(store.load("s1").await.unwrap(), Some(st.clone()));
+    }
+    // A row written before the column existed reads as no reason.
+    sqlx::query("UPDATE sync_state SET resync_reason = NULL")
+        .execute(store.pool())
+        .await
+        .unwrap();
+    assert_eq!(store.load("s1").await.unwrap().unwrap().resync_reason, None);
+}
+
+#[tokio::test]
+async fn phases_and_dead_letters_are_counted() {
+    let Some(store) = store().await else { return };
+    crate::test_support::phases_and_letters_contract(&store).await;
+}
+
+#[tokio::test]
+async fn usage_is_durable_per_lane() {
+    let Some(store) = store().await else { return };
+    crate::test_support::ledger_contract(&store).await;
+}
+
+/// Progress recorded while drains run: every unit ends up in exactly one
+/// event.
+#[tokio::test]
+async fn concurrent_progress_and_drains_lose_and_double_nothing() {
+    let Some(store) = store().await else { return };
+    let store = Arc::new(store);
+    store.set_usage_lanes(&[Lane::Lab]);
+    store
+        .create_sync(Some("t"), &spec("s", Some("t"), "a"))
+        .await
+        .unwrap();
+    let writers: Vec<_> = (0..8)
+        .map(|_| {
+            let store = Arc::clone(&store);
+            tokio::spawn(async move {
+                for _ in 0..25 {
+                    store
+                        .record_progress("s", &crate::test_support::units(1, 0, 0, 3, 0))
+                        .await
+                        .unwrap();
+                }
+            })
+        })
+        .collect();
+    let build = |p: &PendingUsage| serde_json::json!({ "n": p.usage.documents_streamed, "b": p.usage.bytes });
+    let drainer = {
+        let store = Arc::clone(&store);
+        tokio::spawn(async move {
+            for _ in 0..40 {
+                store.drain_usage(Lane::Lab, None, 0, &build).await.unwrap();
+                tokio::task::yield_now().await;
+            }
+        })
+    };
+    for w in writers {
+        w.await.unwrap();
+    }
+    drainer.await.unwrap();
+    store.drain_usage(Lane::Lab, None, 0, &build).await.unwrap();
+    let lease = store
+        .lease_events(10_000, Duration::from_secs(30))
+        .await
+        .unwrap();
+    let docs: u64 = lease
+        .events
+        .iter()
+        .map(|e| e.payload["n"].as_u64().unwrap())
+        .sum();
+    let bytes: u64 = lease
+        .events
+        .iter()
+        .map(|e| e.payload["b"].as_u64().unwrap())
+        .sum();
+    assert_eq!((docs, bytes), (200, 600));
+}
+
+#[tokio::test]
+async fn units_add_up_per_day() {
+    let Some(store) = store().await else { return };
+    store
+        .create_sync(None, &spec("s", None, "a"))
+        .await
+        .unwrap();
+    store
+        .record_progress("s", &crate::test_support::units(2, 3, 4, 100, 7))
+        .await
+        .unwrap();
+    store
+        .record_progress("s", &crate::test_support::units(1, 0, 0, 10, 1))
+        .await
+        .unwrap();
+    let today = Utc::now().date_naive();
+    let p = store.progress(None, "s", today, today).await.unwrap();
+    assert_eq!(
+        p[0].usage,
+        Usage {
+            documents_streamed: 3,
+            documents_snapshot: 3,
+            documents_resync: 4,
+            bytes: 110,
+            sync_seconds: 8,
+        }
+    );
+    assert_eq!(p[0].written, 10);
 }
 
 #[tokio::test]
@@ -103,6 +213,7 @@ async fn specs_are_sealed_at_rest() {
         pool: store.pool().clone(),
         key: SecretKey::generate(),
         limits: DeadLetterLimits::default(),
+        lanes: AtomicU8::new(0),
     };
     let row = other.get_sync(Some("t"), "s1").await.unwrap().unwrap();
     assert!(
@@ -226,7 +337,7 @@ async fn tenant_isolation_on_every_method() {
 
     // dead letters, progress, delete
     store.push_dead_letters(&[letter("a1", "1")]).await.unwrap();
-    store.record_progress("a1", 1, 0, 1).await.unwrap();
+    store.record_progress("a1", &pr(1, 0, 1)).await.unwrap();
     let today = Utc::now().date_naive();
     let page = DeadLetterPage::default();
     for t in [Some("tb"), None] {
@@ -291,8 +402,8 @@ async fn delete_cascades() {
         .push_dead_letters(&[letter("s", "1"), letter("s", "2"), letter("o", "3")])
         .await
         .unwrap();
-    store.record_progress("s", 1, 1, 1).await.unwrap();
-    store.record_progress("o", 1, 1, 1).await.unwrap();
+    store.record_progress("s", &pr(1, 1, 1)).await.unwrap();
+    store.record_progress("o", &pr(1, 1, 1)).await.unwrap();
 
     store.delete_sync(None, "s").await.unwrap();
     for table in ["sync_state", "dead_letters", "sync_progress"] {
@@ -400,7 +511,7 @@ async fn progress_is_additive() {
     for _ in 0..20 {
         let store = store.clone();
         tasks.push(tokio::spawn(async move {
-            store.record_progress("s", 3, 2, 1).await.unwrap();
+            store.record_progress("s", &pr(3, 2, 1)).await.unwrap();
         }));
     }
     for t in tasks {
@@ -426,6 +537,7 @@ async fn progress_is_additive() {
                 deleted: 0,
                 rejected: 0,
                 dead_letters_dropped: 0,
+                usage: Default::default(),
             },
             DailyProgress {
                 day: today,
@@ -433,6 +545,7 @@ async fn progress_is_additive() {
                 deleted: 40,
                 rejected: 20,
                 dead_letters_dropped: 0,
+                usage: Default::default(),
             }
         ]
     );
@@ -674,6 +787,7 @@ async fn outbox_lease_picks_once() {
     .bind(5_i64)
     .bind(60.0_f64)
     .bind(Uuid::new_v4())
+    .bind("lab")
     .fetch_one(store.pool())
     .await
     .unwrap();
@@ -828,7 +942,7 @@ async fn invalid_specs_are_refused() {
 async fn unknown_syncs_are_not_found() {
     let Some(store) = store().await else { return };
     assert!(matches!(
-        store.record_progress("ghost", 1, 0, 0).await,
+        store.record_progress("ghost", &pr(1, 0, 0)).await,
         Err(StoreError::NotFound(_))
     ));
 }

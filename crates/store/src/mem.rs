@@ -8,18 +8,22 @@
 //! engine tests that never create a spec.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{DateTime, NaiveDate, Utc};
-use meili_connect_core::{DeadLetter, StateStore, StoreError, SyncSpec, SyncState};
+use meili_connect_core::{
+    DeadLetter, Progress, StateStore, StoreError, SyncPhase, SyncSpec, SyncState, Usage,
+};
 use uuid::Uuid;
 
 use crate::{
-    BootSync, DailyProgress, DeadLetterLimits, DeadLetterPage, LabOutbox, OutboxEvent, OutboxLease,
-    RepoError, RetryBackoff, StoredDeadLetter, StoredSync, SyncRepository, SyncRow, UnreadableSync,
-    bound_letter, validate_spec,
+    BootSync, DailyProgress, DeadLetterLimits, DeadLetterPage, DrainOutcome, EventBuilder,
+    LabOutbox, Lane, OutboxEvent, OutboxLease, PendingUsage, RepoError, RetryBackoff,
+    StoredDeadLetter, StoredSync, SyncRepository, SyncRow, UnreadableSync, UsageLedger, UsageRow,
+    bound_letter, lane_mask, lanes_of, validate_spec,
 };
 
 #[derive(Default)]
@@ -28,15 +32,18 @@ struct Inner {
     states: HashMap<String, SyncState>,
     dead_letters: BTreeMap<i64, DeadLetter>,
     next_dead_letter: i64,
-    /// written, deleted, rejected, dead letters dropped.
-    progress: BTreeMap<(String, NaiveDate), [u64; 4]>,
+    /// written, deleted, rejected, dead letters dropped; the units.
+    progress: BTreeMap<(String, NaiveDate), ([u64; 4], Usage)>,
     outbox: Vec<OutboxRow>,
+    /// Usage recorded and not yet enqueued, per lane and sync.
+    pending: BTreeMap<(Lane, String), PendingUsage>,
     /// Test hook: rows reported as unreadable, like a Postgres row sealed
     /// with another key.
     unreadable: std::collections::HashSet<String>,
 }
 
 struct OutboxRow {
+    lane: Lane,
     event: OutboxEvent,
     leased_until: Option<DateTime<Utc>>,
     lease_token: Option<Uuid>,
@@ -78,9 +85,47 @@ impl Inner {
 
 #[derive(Default)]
 pub struct MemStore {
-    inner: Mutex<Inner>,
+    inner: Arc<Mutex<Inner>>,
     permissive: bool,
     limits: DeadLetterLimits,
+    /// [`UsageLedger::set_usage_lanes`], as a bit mask.
+    lanes: AtomicU8,
+}
+
+/// One lane of the outbox of a [`MemStore`].
+pub struct MemLane {
+    inner: Arc<Mutex<Inner>>,
+    lane: Lane,
+}
+
+fn lock_inner(inner: &Mutex<Inner>) -> Result<MutexGuard<'_, Inner>, RepoError> {
+    inner
+        .lock()
+        .map_err(|_| RepoError::Fatal("memory store lock poisoned".into()))
+}
+
+fn enqueue(
+    inner: &mut Inner,
+    lane: Lane,
+    tenant: Option<&str>,
+    payload: &serde_json::Value,
+) -> Uuid {
+    let id = Uuid::now_v7();
+    inner.outbox.push(OutboxRow {
+        lane,
+        event: OutboxEvent {
+            id,
+            tenant: tenant.map(str::to_owned),
+            payload: payload.clone(),
+            created_at: Utc::now(),
+        },
+        leased_until: None,
+        lease_token: None,
+        sent_at: None,
+        attempts: 0,
+        next_attempt_at: None,
+    });
+    id
 }
 
 impl MemStore {
@@ -160,7 +205,7 @@ impl StateStore for MemStore {
                 .filter(|d| d.sync_id == letter.sync_id)
                 .count() as u64;
             if stored >= self.limits.max_per_sync {
-                let c = inner
+                let (c, _) = inner
                     .progress
                     .entry((letter.sync_id.clone(), day))
                     .or_default();
@@ -176,20 +221,45 @@ impl StateStore for MemStore {
         Ok(())
     }
 
-    async fn record_progress(
-        &self,
-        sync_id: &str,
-        written: u64,
-        deleted: u64,
-        rejected: u64,
-    ) -> Result<(), StoreError> {
+    async fn record_progress(&self, sync_id: &str, p: &Progress) -> Result<(), StoreError> {
         let day = Utc::now().date_naive();
         let mut inner = self.lock()?;
         self.check_sync(&inner, sync_id)?;
-        let c = inner.progress.entry((sync_id.to_owned(), day)).or_default();
-        c[0] = c[0].saturating_add(written);
-        c[1] = c[1].saturating_add(deleted);
-        c[2] = c[2].saturating_add(rejected);
+        let (c, usage) = inner.progress.entry((sync_id.to_owned(), day)).or_default();
+        c[0] = c[0].saturating_add(p.written);
+        c[1] = c[1].saturating_add(p.deleted);
+        c[2] = c[2].saturating_add(p.rejected);
+        usage.add(&p.usage);
+        if p.usage.is_zero() {
+            return Ok(());
+        }
+        // Under the same lock as the counters: the pending usage is exactly
+        // what progress recorded.
+        let (tenant, kind, name) = match inner.syncs.get(sync_id) {
+            Some(s) => (
+                s.spec.tenant.clone(),
+                s.spec.source.kind.as_str().to_owned(),
+                s.spec.name.clone(),
+            ),
+            None => (None, String::new(), String::new()),
+        };
+        for lane in lanes_of(self.lanes.load(Ordering::Relaxed)) {
+            // The Lab bills tenants only: global syncs are never sent.
+            if lane == Lane::Lab && tenant.is_none() {
+                continue;
+            }
+            let entry = inner
+                .pending
+                .entry((lane, sync_id.to_owned()))
+                .or_insert_with(|| PendingUsage {
+                    sync_id: sync_id.to_owned(),
+                    tenant: tenant.clone(),
+                    source_kind: kind.clone(),
+                    sync_name: name.clone(),
+                    usage: Default::default(),
+                });
+            entry.usage.add(&p.usage);
+        }
         Ok(())
     }
 }
@@ -348,6 +418,33 @@ impl SyncRepository for MemStore {
         Ok((before - inner.dead_letters.len()) as u64)
     }
 
+    async fn count_dead_letters(
+        &self,
+        tenant: Option<&str>,
+        sync_id: &str,
+    ) -> Result<u64, RepoError> {
+        let inner = self.lock()?;
+        inner.owned(tenant, sync_id)?;
+        Ok(inner
+            .dead_letters
+            .values()
+            .filter(|d| d.sync_id == sync_id)
+            .count() as u64)
+    }
+
+    async fn phase_counts(&self) -> Result<Vec<(SyncPhase, u64)>, RepoError> {
+        let inner = self.lock()?;
+        let mut counts: Vec<(SyncPhase, u64)> = Vec::new();
+        for id in inner.syncs.keys() {
+            let phase = inner.states.get(id).map_or(SyncPhase::Pending, |s| s.phase);
+            match counts.iter_mut().find(|(p, _)| *p == phase) {
+                Some((_, n)) => *n += 1,
+                None => counts.push((phase, 1)),
+            }
+        }
+        Ok(counts)
+    }
+
     async fn progress(
         &self,
         tenant: Option<&str>,
@@ -363,12 +460,110 @@ impl SyncRepository for MemStore {
         Ok(inner
             .progress
             .range((sync_id.to_owned(), from)..=(sync_id.to_owned(), to))
-            .map(|((_, day), c)| DailyProgress {
+            .map(|((_, day), (c, usage))| DailyProgress {
                 day: *day,
                 written: c[0],
                 deleted: c[1],
                 rejected: c[2],
                 dead_letters_dropped: c[3],
+                usage: *usage,
+            })
+            .collect())
+    }
+}
+
+impl MemStore {
+    /// The outbox of one lane.
+    pub fn lane(&self, lane: Lane) -> MemLane {
+        MemLane {
+            inner: Arc::clone(&self.inner),
+            lane,
+        }
+    }
+}
+
+#[async_trait]
+impl UsageLedger for MemStore {
+    fn set_usage_lanes(&self, lanes: &[Lane]) {
+        self.lanes.store(lane_mask(lanes), Ordering::Relaxed);
+    }
+
+    fn outbox(&self, lane: Lane) -> Arc<dyn LabOutbox> {
+        Arc::new(self.lane(lane))
+    }
+
+    async fn pending_usage(&self, lane: Lane) -> Result<Vec<PendingUsage>, RepoError> {
+        Ok(lock_inner(&self.inner)?
+            .pending
+            .iter()
+            .filter(|((l, _), _)| *l == lane)
+            .map(|(_, p)| p.clone())
+            .collect())
+    }
+
+    async fn drain_usage(
+        &self,
+        lane: Lane,
+        sync_id: Option<&str>,
+        backlog_cap: u64,
+        event: &EventBuilder<'_>,
+    ) -> Result<DrainOutcome, RepoError> {
+        let mut inner = lock_inner(&self.inner)?;
+        if backlog_cap > 0 {
+            let backlog = inner
+                .outbox
+                .iter()
+                .filter(|r| r.lane == lane && r.sent_at.is_none())
+                .count() as u64;
+            if backlog >= backlog_cap {
+                return Ok(DrainOutcome::Backlogged(backlog));
+            }
+        }
+        let keys: Vec<(Lane, String)> = inner
+            .pending
+            .keys()
+            .filter(|(l, id)| *l == lane && sync_id.is_none_or(|s| s == id))
+            .cloned()
+            .collect();
+        let mut enqueued = 0;
+        for key in keys {
+            let Some(p) = inner.pending.remove(&key) else {
+                continue;
+            };
+            if p.usage.is_zero() {
+                continue;
+            }
+            enqueue(&mut inner, lane, p.tenant.as_deref(), &event(&p));
+            enqueued += 1;
+        }
+        Ok(DrainOutcome::Enqueued(enqueued))
+    }
+
+    async fn usage(
+        &self,
+        tenant: Option<&str>,
+        from: NaiveDate,
+        to: NaiveDate,
+    ) -> Result<Vec<UsageRow>, RepoError> {
+        let inner = lock_inner(&self.inner)?;
+        if from > to {
+            return Ok(Vec::new());
+        }
+        Ok(inner
+            .progress
+            .iter()
+            .filter(|((id, day), _)| {
+                *day >= from
+                    && *day <= to
+                    && inner
+                        .syncs
+                        .get(id)
+                        .is_some_and(|s| s.spec.tenant.as_deref() == tenant)
+            })
+            .map(|((id, day), (_, usage))| UsageRow {
+                sync_id: id.clone(),
+                day: *day,
+                usage: *usage,
             })
             .collect())
     }
@@ -381,21 +576,48 @@ impl LabOutbox for MemStore {
         tenant: Option<&str>,
         payload: &serde_json::Value,
     ) -> Result<Uuid, RepoError> {
-        let id = Uuid::now_v7();
-        self.lock()?.outbox.push(OutboxRow {
-            event: OutboxEvent {
-                id,
-                tenant: tenant.map(str::to_owned),
-                payload: payload.clone(),
-                created_at: Utc::now(),
-            },
-            leased_until: None,
-            lease_token: None,
-            sent_at: None,
-            attempts: 0,
-            next_attempt_at: None,
-        });
-        Ok(id)
+        self.lane(Lane::Lab).enqueue_event(tenant, payload).await
+    }
+
+    async fn lease_events(&self, limit: u32, lease: Duration) -> Result<OutboxLease, RepoError> {
+        self.lane(Lane::Lab).lease_events(limit, lease).await
+    }
+
+    async fn mark_events_sent(&self, lease: Uuid, ids: &[Uuid]) -> Result<u64, RepoError> {
+        self.lane(Lane::Lab).mark_events_sent(lease, ids).await
+    }
+
+    async fn prune_sent_events(&self, older_than: Duration) -> Result<u64, RepoError> {
+        self.lane(Lane::Lab).prune_sent_events(older_than).await
+    }
+
+    async fn defer_events(
+        &self,
+        lease: Uuid,
+        ids: &[Uuid],
+        backoff: RetryBackoff,
+    ) -> Result<u64, RepoError> {
+        self.lane(Lane::Lab).defer_events(lease, ids, backoff).await
+    }
+
+    async fn count_unsent(&self) -> Result<u64, RepoError> {
+        self.lane(Lane::Lab).count_unsent().await
+    }
+}
+
+#[async_trait]
+impl LabOutbox for MemLane {
+    async fn enqueue_event(
+        &self,
+        tenant: Option<&str>,
+        payload: &serde_json::Value,
+    ) -> Result<Uuid, RepoError> {
+        Ok(enqueue(
+            &mut *lock_inner(&self.inner)?,
+            self.lane,
+            tenant,
+            payload,
+        ))
     }
 
     async fn lease_events(&self, limit: u32, lease: Duration) -> Result<OutboxLease, RepoError> {
@@ -405,14 +627,15 @@ impl LabOutbox for MemStore {
             .ok()
             .and_then(|d| now.checked_add_signed(d))
             .unwrap_or(DateTime::<Utc>::MAX_UTC);
-        let mut inner = self.lock()?;
+        let mut inner = lock_inner(&self.inner)?;
         let mut events = Vec::new();
         // Rows are kept in insertion (= creation) order.
         for row in inner.outbox.iter_mut() {
             if events.len() >= limit as usize {
                 break;
             }
-            if row.sent_at.is_none()
+            if row.lane == self.lane
+                && row.sent_at.is_none()
                 && row.leased_until.is_none_or(|t| t <= now)
                 && row.next_attempt_at.is_none_or(|t| t <= now)
             {
@@ -426,10 +649,11 @@ impl LabOutbox for MemStore {
 
     async fn mark_events_sent(&self, lease: Uuid, ids: &[Uuid]) -> Result<u64, RepoError> {
         let now = Utc::now();
-        let mut inner = self.lock()?;
+        let mut inner = lock_inner(&self.inner)?;
         let mut n = 0;
         for row in inner.outbox.iter_mut() {
-            if row.sent_at.is_none()
+            if row.lane == self.lane
+                && row.sent_at.is_none()
                 && row.lease_token == Some(lease)
                 && ids.contains(&row.event.id)
             {
@@ -446,11 +670,12 @@ impl LabOutbox for MemStore {
             .ok()
             .and_then(|d| Utc::now().checked_sub_signed(d))
             .unwrap_or(DateTime::<Utc>::MIN_UTC);
-        let mut inner = self.lock()?;
+        let mut inner = lock_inner(&self.inner)?;
         let before = inner.outbox.len();
+        let lane = self.lane;
         inner
             .outbox
-            .retain(|row| row.sent_at.is_none_or(|t| t >= cutoff));
+            .retain(|row| row.lane != lane || row.sent_at.is_none_or(|t| t >= cutoff));
         Ok((before - inner.outbox.len()) as u64)
     }
 
@@ -461,10 +686,11 @@ impl LabOutbox for MemStore {
         backoff: RetryBackoff,
     ) -> Result<u64, RepoError> {
         let now = Utc::now();
-        let mut inner = self.lock()?;
+        let mut inner = lock_inner(&self.inner)?;
         let mut n = 0;
         for row in inner.outbox.iter_mut() {
-            if row.sent_at.is_none()
+            if row.lane == self.lane
+                && row.sent_at.is_none()
                 && row.lease_token == Some(lease)
                 && ids.contains(&row.event.id)
             {
@@ -483,11 +709,10 @@ impl LabOutbox for MemStore {
     }
 
     async fn count_unsent(&self) -> Result<u64, RepoError> {
-        Ok(self
-            .lock()?
+        Ok(lock_inner(&self.inner)?
             .outbox
             .iter()
-            .filter(|r| r.sent_at.is_none())
+            .filter(|r| r.lane == self.lane && r.sent_at.is_none())
             .count() as u64)
     }
 }
@@ -496,7 +721,7 @@ impl LabOutbox for MemStore {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::test_support::{invalid_specs, letter, skipped_letter, spec, state};
+    use crate::test_support::{invalid_specs, letter, pr, skipped_letter, spec, state};
 
     #[tokio::test]
     async fn state_round_trip() {
@@ -524,7 +749,7 @@ mod tests {
             Err(StoreError::NotFound(_))
         ));
         assert!(matches!(
-            store.record_progress("ghost", 1, 0, 0).await,
+            store.record_progress("ghost", &pr(1, 0, 0)).await,
             Err(StoreError::NotFound(_))
         ));
         store
@@ -546,7 +771,7 @@ mod tests {
                 .is_empty()
         );
         store.push_dead_letters(&[letter("s", "1")]).await.unwrap();
-        store.record_progress("s", 1, 0, 0).await.unwrap();
+        store.record_progress("s", &pr(1, 0, 0)).await.unwrap();
         store.save(&state("s")).await.unwrap();
 
         // The test helper accepts anything.
@@ -556,7 +781,7 @@ mod tests {
             .push_dead_letters(&[letter("ghost", "1")])
             .await
             .unwrap();
-        loose.record_progress("ghost", 1, 0, 0).await.unwrap();
+        loose.record_progress("ghost", &pr(1, 0, 0)).await.unwrap();
         assert!(loose.load("ghost").await.unwrap().is_some());
     }
 
@@ -685,7 +910,7 @@ mod tests {
         let letters: Vec<_> = (0..5).map(|i| letter("s", &i.to_string())).collect();
         store.push_dead_letters(&letters).await.unwrap();
         store.push_dead_letters(&[letter("o", "x")]).await.unwrap();
-        store.record_progress("s", 3, 1, 0).await.unwrap();
+        store.record_progress("s", &pr(3, 1, 0)).await.unwrap();
 
         let p1 = store
             .list_dead_letters(
@@ -744,8 +969,8 @@ mod tests {
             .create_sync(None, &spec("s", None, "n"))
             .await
             .unwrap();
-        store.record_progress("s", 3, 1, 0).await.unwrap();
-        store.record_progress("s", 2, 0, 4).await.unwrap();
+        store.record_progress("s", &pr(3, 1, 0)).await.unwrap();
+        store.record_progress("s", &pr(2, 0, 4)).await.unwrap();
         let today = Utc::now().date_naive();
         let p = store.progress(None, "s", today, today).await.unwrap();
         assert_eq!(
@@ -756,12 +981,56 @@ mod tests {
                 deleted: 1,
                 rejected: 4,
                 dead_letters_dropped: 0,
+                usage: Default::default(),
             }]
         );
         assert!(matches!(
             store.progress(Some("x"), "s", today, today).await,
             Err(RepoError::NotFound(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn phases_and_dead_letters_are_counted() {
+        crate::test_support::phases_and_letters_contract(&MemStore::new()).await;
+    }
+
+    #[tokio::test]
+    async fn usage_is_durable_per_lane() {
+        crate::test_support::ledger_contract(&MemStore::new()).await;
+    }
+
+    #[tokio::test]
+    async fn units_add_up_per_day() {
+        let store = MemStore::new();
+        store
+            .create_sync(None, &spec("s", None, "n"))
+            .await
+            .unwrap();
+        store
+            .record_progress("s", &crate::test_support::units(2, 3, 4, 100, 7))
+            .await
+            .unwrap();
+        store
+            .record_progress("s", &crate::test_support::units(1, 0, 0, 10, 1))
+            .await
+            .unwrap();
+        let today = Utc::now().date_naive();
+        let p = store.progress(None, "s", today, today).await.unwrap();
+        assert_eq!(
+            p[0].usage,
+            Usage {
+                documents_streamed: 3,
+                documents_snapshot: 3,
+                documents_resync: 4,
+                bytes: 110,
+                sync_seconds: 8,
+            }
+        );
+        // The API shape: units flattened next to the counters.
+        let json = serde_json::to_value(&p[0]).unwrap();
+        assert_eq!(json["documents_streamed"], 3);
+        assert_eq!(json["sync_seconds"], 8);
     }
 
     #[tokio::test]

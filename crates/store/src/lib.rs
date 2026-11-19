@@ -5,7 +5,9 @@
 //!
 //! Both implement [`meili_connect_core::StateStore`] (what the engine needs),
 //! [`SyncRepository`] (sync specs, dead letters, progress, all
-//! tenant-scoped) and [`LabOutbox`] (Lab usage events).
+//! tenant-scoped), [`LabOutbox`] (Lab usage events) and [`UsageLedger`]
+//! (usage recorded with progress, drained into one outbox lane per
+//! consumer: the Lab, Tinybird).
 //!
 //! Tenancy: every [`SyncRepository`] method takes `tenant: Option<&str>`.
 //! `None` is the global (standalone) scope and only sees global rows;
@@ -18,17 +20,18 @@ mod mem;
 mod pg;
 mod seal;
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{DateTime, NaiveDate, Utc};
-use meili_connect_core::{DeadLetter, SyncSpec};
+use meili_connect_core::{DeadLetter, SyncPhase, SyncSpec, Usage};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 pub use error::RepoError;
-pub use mem::MemStore;
-pub use pg::PgStore;
+pub use mem::{MemLane, MemStore};
+pub use pg::{PgLane, PgStore};
 pub use seal::{SECRET_KEY_ENV, SecretKey};
 
 /// A sync spec as stored.
@@ -132,6 +135,9 @@ pub struct DailyProgress {
     /// [`DeadLetterLimits::max_per_sync`] (they are counted in `rejected`).
     #[serde(default)]
     pub dead_letters_dropped: u64,
+    /// The metered units of the day (`documents_streamed`, …).
+    #[serde(flatten)]
+    pub usage: Usage,
 }
 
 /// What one sync may keep in the dead-letter table.
@@ -220,6 +226,122 @@ pub struct OutboxLease {
     pub events: Vec<OutboxEvent>,
 }
 
+/// A consumer of usage events, with its own outbox lane: one failing never
+/// holds the other back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Lane {
+    /// `usage.recorded` events for the Lab (tenant-owned syncs only).
+    Lab,
+    /// Rows for the Tinybird `connect_usage` data source (every sync; the
+    /// global scope as tenant `""`).
+    Tinybird,
+}
+
+impl Lane {
+    pub const ALL: [Lane; 2] = [Lane::Lab, Lane::Tinybird];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Lane::Lab => "lab",
+            Lane::Tinybird => "tinybird",
+        }
+    }
+
+    fn bit(self) -> u8 {
+        match self {
+            Lane::Lab => 1,
+            Lane::Tinybird => 2,
+        }
+    }
+}
+
+pub(crate) fn lane_mask(lanes: &[Lane]) -> u8 {
+    lanes.iter().fold(0, |m, l| m | l.bit())
+}
+
+pub(crate) fn lanes_of(mask: u8) -> Vec<Lane> {
+    Lane::ALL
+        .into_iter()
+        .filter(|l| mask & l.bit() != 0)
+        .collect()
+}
+
+/// Usage recorded for one sync and one lane, not enqueued yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingUsage {
+    pub sync_id: String,
+    /// `None`: the global scope.
+    pub tenant: Option<String>,
+    /// The sync's source kind (`postgres`, …) when it was recorded.
+    pub source_kind: String,
+    /// The sync's name when it was recorded.
+    pub sync_name: String,
+    pub usage: Usage,
+}
+
+/// Turns pending usage into the payload of an outbox event.
+pub type EventBuilder<'a> = dyn Fn(&PendingUsage) -> serde_json::Value + Send + Sync + 'a;
+
+/// What [`UsageLedger::drain_usage`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DrainOutcome {
+    /// This many events were enqueued (one per sync with usage).
+    Enqueued(usize),
+    /// The lane holds this many unsent events, at or over the cap: nothing
+    /// was taken, the usage stays pending.
+    Backlogged(u64),
+}
+
+/// The units of one sync on one UTC day, from the progress table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsageRow {
+    pub sync_id: String,
+    pub day: NaiveDate,
+    pub usage: Usage,
+}
+
+/// Usage metering, durable end to end.
+///
+/// `record_progress` adds a batch's units to a pending row per enabled
+/// lane in the same transaction as the progress counters, and
+/// [`UsageLedger::drain_usage`] moves pending rows into the lane's outbox in
+/// one transaction: what is sent is exactly what progress recorded, and a
+/// crash at any point loses nothing.
+#[async_trait]
+pub trait UsageLedger: Send + Sync {
+    /// The lanes `record_progress` accumulates usage for (none by default).
+    /// The Lab lane skips global-scope syncs.
+    fn set_usage_lanes(&self, lanes: &[Lane]);
+
+    /// The outbox of one lane.
+    fn outbox(&self, lane: Lane) -> Arc<dyn LabOutbox>;
+
+    /// Usage recorded for a lane and not enqueued yet.
+    async fn pending_usage(&self, lane: Lane) -> Result<Vec<PendingUsage>, RepoError>;
+
+    /// Atomically take the lane's pending usage (of one sync, or of all),
+    /// enqueue one event per sync with non-zero units (built by `event`),
+    /// and clear what was taken. Takes nothing while the lane holds
+    /// `backlog_cap` unsent events or more (`0`: no cap): the usage keeps
+    /// accumulating in its pending row (one per sync, bounded).
+    async fn drain_usage(
+        &self,
+        lane: Lane,
+        sync_id: Option<&str>,
+        backlog_cap: u64,
+        event: &EventBuilder<'_>,
+    ) -> Result<DrainOutcome, RepoError>;
+
+    /// The units of the scope's syncs per sync and day, `from..=to`.
+    /// Deleted syncs are gone with their progress.
+    async fn usage(
+        &self,
+        tenant: Option<&str>,
+        from: NaiveDate,
+        to: NaiveDate,
+    ) -> Result<Vec<UsageRow>, RepoError>;
+}
+
 /// Sync specs and their per-sync data, scoped by tenant.
 #[async_trait]
 pub trait SyncRepository: Send + Sync {
@@ -287,6 +409,17 @@ pub trait SyncRepository: Send + Sync {
         from: NaiveDate,
         to: NaiveDate,
     ) -> Result<Vec<DailyProgress>, RepoError>;
+
+    /// Dead letters stored for one sync.
+    async fn count_dead_letters(
+        &self,
+        tenant: Option<&str>,
+        sync_id: &str,
+    ) -> Result<u64, RepoError>;
+
+    /// How many syncs of every scope are in each phase (a sync that never
+    /// ran is `Pending`). Phases without a sync are absent. For metrics.
+    async fn phase_counts(&self) -> Result<Vec<(SyncPhase, u64)>, RepoError>;
 }
 
 /// Transactional outbox of Lab events (`usage.recorded`).
@@ -358,11 +491,12 @@ pub(crate) fn to_i64(v: u64) -> i64 {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 pub(crate) mod test_support {
     use chrono::{DateTime, Utc};
     use meili_connect_core::{
-        Checkpoint, DeadLetter, MeiliDestination, Secret, SourceKind, SourceSpec, StreamMapping,
-        SyncPhase, SyncSpec, SyncState,
+        Checkpoint, DeadLetter, MeiliDestination, Progress, Secret, SourceKind, SourceSpec,
+        StreamMapping, SyncPhase, SyncSpec, SyncState, Usage,
     };
     use serde_json::json;
 
@@ -396,6 +530,230 @@ pub(crate) mod test_support {
         }
     }
 
+    /// What both stores must do with usage: accumulate it per lane with the
+    /// progress, drain it atomically into the lane's outbox, keep lanes
+    /// apart, keep it through a deletion, and hold it back on a backlog.
+    pub async fn ledger_contract<S>(store: &S)
+    where
+        S: meili_connect_core::StateStore + crate::SyncRepository + crate::UsageLedger,
+    {
+        use crate::{DrainOutcome, Lane, PendingUsage};
+        use std::time::Duration;
+        store.set_usage_lanes(&[Lane::Lab, Lane::Tinybird]);
+        store
+            .create_sync(Some("t"), &spec("ts", Some("t"), "products"))
+            .await
+            .unwrap();
+        store
+            .create_sync(None, &spec("gs", None, "global"))
+            .await
+            .unwrap();
+        store
+            .record_progress("ts", &units(2, 3, 0, 50, 4))
+            .await
+            .unwrap();
+        store
+            .record_progress("ts", &units(1, 0, 1, 10, 0))
+            .await
+            .unwrap();
+        store
+            .record_progress("gs", &units(5, 0, 0, 5, 0))
+            .await
+            .unwrap();
+        // Counters without units add nothing to the pending usage.
+        store.record_progress("ts", &pr(0, 0, 9)).await.unwrap();
+
+        let lab = store.pending_usage(Lane::Lab).await.unwrap();
+        assert_eq!(lab.len(), 1, "global syncs never reach the Lab lane");
+        assert_eq!(lab[0].tenant.as_deref(), Some("t"));
+        assert_eq!(lab[0].source_kind, "postgres");
+        assert_eq!(lab[0].sync_name, "products");
+        assert_eq!(
+            lab[0].usage,
+            Usage {
+                documents_streamed: 3,
+                documents_snapshot: 3,
+                documents_resync: 1,
+                bytes: 60,
+                sync_seconds: 4,
+            }
+        );
+        assert_eq!(store.pending_usage(Lane::Tinybird).await.unwrap().len(), 2);
+
+        let build = |p: &PendingUsage| {
+            json!({
+                "sync": p.sync_id,
+                "tenant": p.tenant,
+                "streamed": p.usage.documents_streamed,
+            })
+        };
+        // A full lane takes nothing and keeps the usage pending.
+        let lab_outbox = store.outbox(Lane::Lab);
+        lab_outbox
+            .enqueue_event(Some("t"), &json!({}))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.drain_usage(Lane::Lab, None, 1, &build).await.unwrap(),
+            DrainOutcome::Backlogged(1)
+        );
+        assert_eq!(store.pending_usage(Lane::Lab).await.unwrap().len(), 1);
+        let lease = lab_outbox
+            .lease_events(10, Duration::from_secs(30))
+            .await
+            .unwrap();
+        lab_outbox
+            .mark_events_sent(lease.token, &[lease.events[0].id])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.drain_usage(Lane::Lab, None, 1, &build).await.unwrap(),
+            DrainOutcome::Enqueued(1)
+        );
+        assert!(store.pending_usage(Lane::Lab).await.unwrap().is_empty());
+        assert_eq!(
+            store.drain_usage(Lane::Lab, None, 0, &build).await.unwrap(),
+            DrainOutcome::Enqueued(0),
+            "nothing new"
+        );
+        let lease = lab_outbox
+            .lease_events(10, Duration::from_secs(30))
+            .await
+            .unwrap();
+        assert_eq!(lease.events.len(), 1);
+        assert_eq!(lease.events[0].payload["streamed"], 3);
+        assert_eq!(lease.events[0].tenant.as_deref(), Some("t"));
+        // The Tinybird lane is untouched by the Lab's drain and lease.
+        assert_eq!(store.pending_usage(Lane::Tinybird).await.unwrap().len(), 2);
+        let tb_outbox = store.outbox(Lane::Tinybird);
+        assert!(
+            tb_outbox
+                .lease_events(10, Duration::from_secs(30))
+                .await
+                .unwrap()
+                .events
+                .is_empty()
+        );
+
+        // Drain one sync, then delete the other: its usage is still sent.
+        assert_eq!(
+            store
+                .drain_usage(Lane::Tinybird, Some("gs"), 0, &build)
+                .await
+                .unwrap(),
+            DrainOutcome::Enqueued(1)
+        );
+        store
+            .record_progress("ts", &units(7, 0, 0, 0, 0))
+            .await
+            .unwrap();
+        store.delete_sync(Some("t"), "ts").await.unwrap();
+        assert_eq!(
+            store
+                .drain_usage(Lane::Tinybird, None, 0, &build)
+                .await
+                .unwrap(),
+            DrainOutcome::Enqueued(1)
+        );
+        let lease = tb_outbox
+            .lease_events(10, Duration::from_secs(30))
+            .await
+            .unwrap();
+        let mut streamed: Vec<(String, u64)> = lease
+            .events
+            .iter()
+            .map(|e| {
+                (
+                    e.payload["sync"].as_str().unwrap().to_owned(),
+                    e.payload["streamed"].as_u64().unwrap(),
+                )
+            })
+            .collect();
+        streamed.sort();
+        assert_eq!(streamed, vec![("gs".into(), 5), ("ts".into(), 10)]);
+        assert_eq!(tb_outbox.count_unsent().await.unwrap(), 2);
+        assert_eq!(lab_outbox.count_unsent().await.unwrap(), 1);
+
+        // No lanes: nothing accumulates.
+        store.set_usage_lanes(&[]);
+        store
+            .record_progress("gs", &units(1, 0, 0, 0, 0))
+            .await
+            .unwrap();
+        assert!(
+            store
+                .pending_usage(Lane::Tinybird)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// Phase counts span every scope; a sync that never ran is pending.
+    pub async fn phases_and_letters_contract<S>(store: &S)
+    where
+        S: meili_connect_core::StateStore + crate::SyncRepository,
+    {
+        store
+            .create_sync(None, &spec("a", None, "a"))
+            .await
+            .unwrap();
+        store
+            .create_sync(Some("t"), &spec("b", Some("t"), "b"))
+            .await
+            .unwrap();
+        store
+            .create_sync(Some("u"), &spec("c", Some("u"), "c"))
+            .await
+            .unwrap();
+        store.save(&state("b")).await.unwrap();
+        let mut held = state("c");
+        held.phase = SyncPhase::Held;
+        store.save(&held).await.unwrap();
+        let mut counts = store.phase_counts().await.unwrap();
+        counts.sort_by_key(|(p, _)| format!("{p:?}"));
+        assert_eq!(
+            counts,
+            vec![
+                (SyncPhase::Held, 1),
+                (SyncPhase::Pending, 1),
+                (SyncPhase::Streaming, 1)
+            ]
+        );
+        store
+            .push_dead_letters(&[letter("b", "1"), letter("b", "2"), letter("c", "3")])
+            .await
+            .unwrap();
+        assert_eq!(store.count_dead_letters(Some("t"), "b").await.unwrap(), 2);
+        assert!(store.count_dead_letters(None, "b").await.is_err(), "scoped");
+    }
+
+    /// Progress of a batch: counters only, no units.
+    pub fn pr(written: u64, deleted: u64, rejected: u64) -> Progress {
+        Progress {
+            written,
+            deleted,
+            rejected,
+            ..Progress::default()
+        }
+    }
+
+    /// Progress carrying units.
+    pub fn units(streamed: u64, snapshot: u64, resync: u64, bytes: u64, seconds: u64) -> Progress {
+        Progress {
+            written: streamed + snapshot + resync,
+            usage: Usage {
+                documents_streamed: streamed,
+                documents_snapshot: snapshot,
+                documents_resync: resync,
+                bytes,
+                sync_seconds: seconds,
+            },
+            ..Progress::default()
+        }
+    }
+
     pub fn state(sync_id: &str) -> SyncState {
         SyncState {
             sync_id: sync_id.into(),
@@ -403,6 +761,7 @@ pub(crate) mod test_support {
             checkpoint: Some(Checkpoint(json!({ "lsn": "0/16B3748" }))),
             message: None,
             resyncing: false,
+            resync_reason: None,
             updated_at: now(),
         }
     }

@@ -1,0 +1,43 @@
+#
+# connect_usage — one row per sync per usage flush (the same usage the Lab is
+# billed from: docs/LAB_INTEGRATION.md, "Usage event").
+#
+# Written by meili-connect (crates/server/src/tinybird.rs) through the Events
+# API, from its own outbox lane:
+#   POST {TINYBIRD_URL}/v0/events?name=connect_usage&wait=true
+# body = NDJSON, one row per line. Column names are a CONTRACT: they are the
+# keys `usage::tinybird_row` writes and the unit names of the Lab event. A
+# column is never renamed or retyped: a change means a new data source and a
+# backfill (tinybird/README.md).
+#
+# ── Deduplication ──────────────────────────────────────────────────────────
+# Delivery is at least once: a row whose acknowledgement was lost is sent
+# again, byte for byte (same event_id = the outbox row id, same occurred_at,
+# set when the row was enqueued). Producers only ever append; the engine is a
+# ReplacingMergeTree sorted on (tenant_id, occurred_at, event_id), so a
+# redelivered row collapses into the stored one on merge. Exact reads use
+# FINAL (the connect_tenant_usage pipe does).
+#
+# tenant_id is the Lab account id; "" for the global scope (standalone).
+#
+# Kept indefinitely (no TTL): it is what billing is reconciled against.
+#
+
+TOKEN "connect_engine" APPEND
+
+SCHEMA >
+    `event_id` String `json:$.event_id`,
+    `occurred_at` DateTime64(3) `json:$.occurred_at`,
+    `tenant_id` String `json:$.tenant_id`,
+    `sync_id` String `json:$.sync_id`,
+    `source_kind` LowCardinality(String) `json:$.source_kind`,
+    `operation` LowCardinality(String) `json:$.operation`,
+    `documents_streamed` UInt64 `json:$.documents_streamed`,
+    `documents_snapshot` UInt64 `json:$.documents_snapshot`,
+    `documents_resync` UInt64 `json:$.documents_resync`,
+    `bytes` UInt64 `json:$.bytes`,
+    `sync_seconds` UInt64 `json:$.sync_seconds`
+
+ENGINE "ReplacingMergeTree"
+ENGINE_SORTING_KEY "tenant_id, occurred_at, event_id"
+ENGINE_PARTITION_KEY "toYYYYMM(occurred_at)"

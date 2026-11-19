@@ -10,6 +10,7 @@ use axum::Router;
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use http_body_util::BodyExt;
+use meili_connect_core::StateStore;
 use meili_connect_core::{
     AckReceiver, ApplyReport, Capabilities, Change, CheckReport, CheckStatus, Checkpoint,
     CollectionInfo, DocOp, Endpoint, EventSender, HostPolicy, IndexTarget, MeiliDestination, Op,
@@ -17,7 +18,7 @@ use meili_connect_core::{
     StreamMapping, SyncPhase,
 };
 use meili_connect_engine::SupervisorConfig;
-use meili_connect_store::{LabOutbox, MemStore, SyncRepository};
+use meili_connect_store::{LabOutbox, Lane, MemStore, SyncRepository, UsageLedger};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 use tower::ServiceExt;
@@ -31,7 +32,10 @@ use crate::{Wiring, boot_syncs, build_state, router};
 
 const LAB: &str = "lab-token";
 const ADMIN: &str = "admin-key";
+const METRICS: &str = "metrics-token";
 const SECRET_MARK: &str = "hunter2";
+/// Bytes the fake sink reports per accepted document.
+const FAKE_BYTES_PER_DOC: u64 = 100;
 
 // ------------------------------------------------------------- fakes
 
@@ -57,6 +61,7 @@ struct FakeSource {
     probe: Arc<Probe>,
     config: Value,
     collection: String,
+    lag: Option<meili_connect_core::LagReporter>,
 }
 
 #[async_trait]
@@ -91,6 +96,7 @@ impl SourceFactory for FakeSources {
                 .first()
                 .map(|s| s.collection.clone())
                 .unwrap_or_default(),
+            lag: None,
         }))
     }
 }
@@ -173,8 +179,19 @@ impl Source for FakeSource {
             // Ignores cancellation: only an abort stops it.
             std::future::pending::<()>().await;
         }
+        if let Some(lag) = &self.lag {
+            lag.report(meili_connect_core::Lag {
+                seconds: Some(1.5),
+                bytes: Some(2048),
+                records: None,
+            });
+        }
         cancel.cancelled().await;
         Ok(())
+    }
+
+    fn report_lag(&mut self, reporter: meili_connect_core::LagReporter) {
+        self.lag = Some(reporter);
     }
 
     async fn teardown(&mut self) -> Result<(), SourceError> {
@@ -211,6 +228,7 @@ impl Sink for FakeSink {
         Ok(ApplyReport {
             written: ops.len() as u64 - deleted,
             deleted,
+            bytes: ops.len() as u64 * FAKE_BYTES_PER_DOC,
             rejected: vec![],
         })
     }
@@ -275,19 +293,38 @@ fn app_build(
     limits: Limits,
     probe_timeout: Duration,
 ) -> App {
+    app_tweaked(auth, store, policy, limits, probe_timeout, |_| {})
+}
+
+/// [`app_build`], with a last say on the wiring.
+fn app_tweaked(
+    auth: AuthConfig,
+    store: Arc<MemStore>,
+    policy: HostPolicy,
+    limits: Limits,
+    probe_timeout: Duration,
+    tweak: impl FnOnce(&mut Wiring),
+) -> App {
     let probe = Arc::new(Probe::default());
+    let mut wiring = Wiring {
+        sources: Arc::new(FakeSources(Arc::clone(&probe))),
+        sinks: fake_sinks(),
+        policy: Arc::new(policy),
+        supervisor: SupervisorConfig::default(),
+        auth,
+        probe_timeout,
+        lab_events: true,
+        credits: None,
+        metrics_token: Some(METRICS.into()),
+        lag_guard: Default::default(),
+        tinybird: None,
+        hosted: false,
+        limits,
+    };
+    tweak(&mut wiring);
     let state = build_state(
         Arc::clone(&store) as Arc<dyn Backend>,
-        Wiring {
-            sources: Arc::new(FakeSources(Arc::clone(&probe))),
-            sinks: fake_sinks(),
-            policy: Arc::new(policy),
-            supervisor: SupervisorConfig::default(),
-            auth,
-            probe_timeout,
-            lab_events: true,
-            limits,
-        },
+        wiring,
         CancellationToken::new(),
     );
     App {
@@ -1008,6 +1045,11 @@ async fn a_loopback_destination_is_host_not_allowed_with_the_real_sinks() {
             auth: AuthConfig::open(),
             probe_timeout: Duration::from_millis(200),
             lab_events: false,
+            credits: None,
+            metrics_token: Some(METRICS.into()),
+            lag_guard: Default::default(),
+            tinybird: None,
+            hosted: false,
             limits: Limits::default(),
         },
         CancellationToken::new(),
@@ -1749,6 +1791,15 @@ async fn pause_resume_status_and_release() {
     assert_eq!(st["running"], true);
     assert_eq!(st["has_checkpoint"], true);
     assert_eq!(st["progress"]["written"], 3);
+    // The metered units: a first sync is a snapshot.
+    assert_eq!(st["documents"]["documents_snapshot"], 3);
+    assert_eq!(st["documents"]["documents_streamed"], 0);
+    assert_eq!(st["documents"]["documents_resync"], 0);
+    assert_eq!(st["bytes"], 3 * FAKE_BYTES_PER_DOC);
+    assert_eq!(st["dead_letters"], 0);
+    // The fake source reports its lag while streaming.
+    assert_eq!(st["lag"], json!({"seconds": 1.5, "bytes": 2048}));
+    assert!(st["lag_warning"].is_null(), "the guard is off");
 
     let (_, st) = call(&a.router, "POST", &format!("/syncs/{id}/pause"), &[], None).await;
     assert_eq!(
@@ -1899,6 +1950,42 @@ async fn boot_starts_every_sync_but_the_paused_ones() {
     assert_eq!(st["phase"], "paused");
 }
 
+#[tokio::test]
+async fn boot_keeps_a_sync_held_for_credits_until_they_are_back() {
+    let store = Arc::new(MemStore::new());
+    let first = app_with(locked(), Arc::clone(&store));
+    let id = create(&first, &lab(TEAM), "s").await;
+    first.state.manager.shutdown(Duration::from_secs(5)).await;
+    let mut state = store.load(&id).await.unwrap().unwrap();
+    state.phase = SyncPhase::Held;
+    state.message = Some("out_of_credits".into());
+    store.save(&state).await.unwrap();
+
+    let lab_server = wiremock::MockServer::start().await;
+    lab_answers(&lab_server, true).await;
+    let second = app_tweaked(
+        locked(),
+        store,
+        HostPolicy::any(),
+        Limits::default(),
+        Duration::from_millis(200),
+        |w| {
+            w.credits = Some(Arc::new(
+                crate::credits::CreditCache::new(crate::config::LabEventsConfig {
+                    url: lab_server.uri(),
+                    instance_id: "inst".into(),
+                    instance_secret: "secret".into(),
+                })
+                .unwrap(),
+            ))
+        },
+    );
+    assert_eq!(boot_syncs(&second.state).await.unwrap(), 0);
+    assert!(second.state.manager.is_credit_held(&id));
+    second.state.manager.enforce_credits().await;
+    wait_for(async || status_of(&second, &id).await["phase"] == "streaming").await;
+}
+
 // ------------------------------------------------------------- usage
 
 #[tokio::test]
@@ -1906,10 +1993,37 @@ async fn engine_progress_becomes_usage_events_for_tenant_syncs() {
     let a = app(locked());
     let id = create(&a, &lab("team-a"), "s").await;
     let global = create(&a, &admin(), "g").await;
-    let meter = Arc::clone(a.state.manager.meter());
-    wait_for(async || meter.pending(&id) == 3 && meter.pending(&global) == 3).await;
+    let usage = Arc::clone(a.state.manager.usage());
+    let snapshot = async |id: &str| -> u64 {
+        a.store
+            .progress(None, id, chrono::NaiveDate::MIN, chrono::NaiveDate::MAX)
+            .await
+            .map_or(0, |d| d.iter().map(|d| d.usage.documents_snapshot).sum())
+    };
+    // Both ran their snapshot: the tenant's is pending for the Lab, the
+    // global one never is.
+    wait_for(async || {
+        a.store
+            .pending_usage(Lane::Lab)
+            .await
+            .unwrap()
+            .iter()
+            .any(|p| p.sync_id == id && p.usage.documents_snapshot == 3)
+            && a.store
+                .progress(
+                    Some("team-a"),
+                    &id,
+                    chrono::NaiveDate::MIN,
+                    chrono::NaiveDate::MAX,
+                )
+                .await
+                .is_ok()
+    })
+    .await;
+    wait_for(async || snapshot(&global).await == 3).await;
+    assert_eq!(a.store.pending_usage(Lane::Lab).await.unwrap().len(), 1);
     assert_eq!(
-        meter.flush(&*a.store).await.unwrap(),
+        usage.flush(&*a.store).await.unwrap(),
         1,
         "global syncs are not billed"
     );
@@ -1922,10 +2036,26 @@ async fn engine_progress_becomes_usage_events_for_tenant_syncs() {
     let e = &lease.events[0].payload;
     assert_eq!(e["account_id"], "team-a");
     assert_eq!(e["data"]["job_id"], id.as_str());
-    assert_eq!(e["data"]["units"]["documents"], 3);
+    assert_eq!(e["data"]["units"]["documents_snapshot"], 3);
+    assert_eq!(e["data"]["units"]["documents_streamed"], 0);
+    assert_eq!(e["data"]["units"]["bytes"], 3 * FAKE_BYTES_PER_DOC);
+    assert_eq!(e["data"]["description"], "postgres → items");
 
     // Deleting a sync enqueues what it had not reported yet.
-    meter.add(&id, 2);
+    a.store
+        .record_progress(
+            &id,
+            &meili_connect_core::Progress {
+                written: 2,
+                usage: meili_connect_core::Usage {
+                    documents_streamed: 2,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
     let (status, _) = call(
         &a.router,
         "DELETE",
@@ -1941,7 +2071,10 @@ async fn engine_progress_becomes_usage_events_for_tenant_syncs() {
         .await
         .unwrap();
     assert_eq!(lease.events.len(), 1);
-    assert_eq!(lease.events[0].payload["data"]["units"]["documents"], 2);
+    assert_eq!(
+        lease.events[0].payload["data"]["units"]["documents_streamed"],
+        2
+    );
 }
 
 // ------------------------------------------------------------- routes
@@ -2067,4 +2200,593 @@ async fn phase_names_match_the_spec() {
         })
         .collect();
     assert_eq!(documented, actual);
+}
+
+// ------------------------------------------------------------- credits
+
+const TEAM: &str = "11111111-2222-3333-4444-555555555555";
+
+/// The fake Lab answers the account lookup with `can_spend`.
+async fn lab_answers(server: &wiremock::MockServer, can_spend: bool) {
+    use wiremock::matchers::{method, path};
+    server.reset().await;
+    wiremock::Mock::given(method("GET"))
+        .and(path(format!("/internal/accounts/{TEAM}")))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(json!({"active": true, "can_spend": can_spend})),
+        )
+        .mount(server)
+        .await;
+}
+
+fn app_with_credits(server: &wiremock::MockServer) -> App {
+    let credits = crate::credits::CreditCache::new(crate::config::LabEventsConfig {
+        url: server.uri(),
+        instance_id: "inst".into(),
+        instance_secret: "secret".into(),
+    })
+    .unwrap()
+    // Always ask: the test flips the answer.
+    .with_windows(Duration::ZERO, Duration::from_secs(300));
+    app_tweaked(
+        locked(),
+        Arc::new(MemStore::new()),
+        HostPolicy::any(),
+        Limits::default(),
+        Duration::from_millis(200),
+        |w| w.credits = Some(Arc::new(credits)),
+    )
+}
+
+async fn status_of(a: &App, id: &str) -> Value {
+    call(
+        &a.router,
+        "GET",
+        &format!("/syncs/{id}/status"),
+        &lab(TEAM),
+        None,
+    )
+    .await
+    .1
+}
+
+#[tokio::test]
+async fn a_team_out_of_credits_is_held_and_resumes_with_its_credits() {
+    let lab_server = wiremock::MockServer::start().await;
+    lab_answers(&lab_server, true).await;
+    let a = app_with_credits(&lab_server);
+    let id = create(&a, &lab(TEAM), "s").await;
+    wait_for(async || status_of(&a, &id).await["phase"] == "streaming").await;
+    let other_team = create(&a, &lab("team-b"), "other").await;
+
+    // The Lab says the team cannot spend: its running syncs are held,
+    // nothing torn down; another team is untouched.
+    lab_answers(&lab_server, false).await;
+    a.state.manager.enforce_credits().await;
+    let st = status_of(&a, &id).await;
+    assert_eq!(
+        (
+            st["phase"].as_str(),
+            st["message"].as_str(),
+            st["running"].as_bool()
+        ),
+        (Some("held"), Some("out_of_credits"), Some(false)),
+        "{st}"
+    );
+    assert_eq!(a.probe.teardowns.load(Ordering::SeqCst), 0);
+    let (_, other) = call(
+        &a.router,
+        "GET",
+        &format!("/syncs/{other_team}/status"),
+        &lab("team-b"),
+        None,
+    )
+    .await;
+    assert_eq!(other["running"], true);
+
+    // Releasing, resuming or resyncing it is refused with a clear code.
+    for action in ["release", "resume", "resync"] {
+        let (status, body) = call(
+            &a.router,
+            "POST",
+            &format!("/syncs/{id}/{action}"),
+            &lab(TEAM),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::PAYMENT_REQUIRED, "{action}: {body}");
+        assert_eq!(body["code"], "out_of_credits");
+    }
+    // A new sync can be created; it starts held.
+    let new = create(&a, &lab(TEAM), "new").await;
+    let st = status_of(&a, &new).await;
+    assert_eq!(
+        (st["phase"].as_str(), st["message"].as_str()),
+        (Some("held"), Some("out_of_credits"))
+    );
+
+    // Credits are back: both resume by themselves.
+    lab_answers(&lab_server, true).await;
+    a.state.manager.enforce_credits().await;
+    for sync in [&id, &new] {
+        wait_for(async || status_of(&a, sync).await["phase"] == "streaming").await;
+        let st = status_of(&a, sync).await;
+        assert_eq!(st["running"], true);
+        assert!(st["message"].is_null(), "{st}");
+    }
+}
+
+#[tokio::test]
+async fn a_paused_sync_stays_paused_through_a_credit_hold() {
+    let lab_server = wiremock::MockServer::start().await;
+    lab_answers(&lab_server, true).await;
+    let a = app_with_credits(&lab_server);
+    let id = create(&a, &lab(TEAM), "s").await;
+    wait_for(async || status_of(&a, &id).await["phase"] == "streaming").await;
+    lab_answers(&lab_server, false).await;
+    a.state.manager.enforce_credits().await;
+    assert!(a.state.manager.is_credit_held(&id));
+    let (status, _) = call(
+        &a.router,
+        "POST",
+        &format!("/syncs/{id}/pause"),
+        &lab(TEAM),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    lab_answers(&lab_server, true).await;
+    a.state.manager.enforce_credits().await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(status_of(&a, &id).await["phase"], "paused");
+}
+
+#[tokio::test]
+async fn without_the_lab_credits_are_never_checked() {
+    let a = app(locked());
+    let id = create(&a, &lab(TEAM), "s").await;
+    a.state.manager.enforce_credits().await;
+    wait_for(async || status_of(&a, &id).await["phase"] == "streaming").await;
+}
+
+// ------------------------------------------------------------- metrics
+
+#[tokio::test]
+async fn metrics_take_only_the_metrics_token() {
+    let a = app(locked());
+    let id = create(&a, &lab("team-a"), "s").await;
+    wait_for(async || {
+        call(
+            &a.router,
+            "GET",
+            &format!("/syncs/{id}/status"),
+            &lab("team-a"),
+            None,
+        )
+        .await
+        .1["phase"]
+            == "streaming"
+    })
+    .await;
+    let bearer = |t: &str| vec![("authorization", format!("Bearer {t}"))];
+    for headers in [vec![], bearer("wrong"), bearer(ADMIN), lab("team-a")] {
+        let (status, body) = call(&a.router, "GET", "/metrics", &headers, None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{headers:?}");
+        assert_eq!(body["code"], "unauthorized");
+    }
+    let req = Request::builder()
+        .uri("/metrics")
+        .header("authorization", format!("Bearer {METRICS}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = a.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(
+        resp.headers()["content-type"]
+            .to_str()
+            .unwrap()
+            .starts_with("text/plain")
+    );
+    let text = String::from_utf8(
+        resp.into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    for name in [
+        "connect_syncs",
+        "connect_documents_total",
+        "connect_bytes_total",
+        "connect_batch_seconds",
+        "connect_sink_errors_total",
+        "connect_source_errors_total",
+        "connect_lag_seconds",
+        "connect_dead_letters_total",
+        "connect_outbox_backlog",
+        "connect_lab_events_sent_total",
+    ] {
+        assert!(
+            text.contains(&format!("# TYPE {name} ")),
+            "{name} not declared in\n{text}"
+        );
+    }
+    assert!(
+        text.contains("connect_syncs{phase=\"streaming\"} 1"),
+        "{text}"
+    );
+    assert!(
+        text.contains("connect_documents_total{kind=\"snapshot\"} 3"),
+        "{text}"
+    );
+    assert!(text.contains(&format!("connect_bytes_total {}", 3 * FAKE_BYTES_PER_DOC)));
+    assert!(text.contains("connect_batch_seconds_count 1"), "{text}");
+    // One running sync reporting 1.5 s of lag.
+    assert!(text.contains("connect_lag_seconds_count 1"), "{text}");
+    assert!(
+        text.contains("connect_lag_seconds_bucket{le=\"5\"} 1"),
+        "{text}"
+    );
+    // Never a tenant or a sync id.
+    assert!(!text.contains("team-a") && !text.contains(&id));
+
+    // Without METRICS_TOKEN the route does not exist for anyone.
+    let off = app_tweaked(
+        locked(),
+        Arc::new(MemStore::new()),
+        HostPolicy::any(),
+        Limits::default(),
+        Duration::from_millis(200),
+        |w| w.metrics_token = None,
+    );
+    for headers in [vec![], bearer(METRICS), bearer(ADMIN)] {
+        let (status, _) = call(&off.router, "GET", "/metrics", &headers, None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+}
+
+// ------------------------------------------------------------- GET /usage
+
+async fn snapshot_done(a: &App, headers: &[(&'static str, String)], id: &str) {
+    wait_for(async || {
+        call(
+            &a.router,
+            "GET",
+            &format!("/syncs/{id}/status"),
+            headers,
+            None,
+        )
+        .await
+        .1["documents"]["documents_snapshot"]
+            == 3
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn usage_is_per_day_or_per_sync_and_scoped_to_the_tenant() {
+    let a = app(locked());
+    let s1 = create(&a, &lab("team-a"), "first").await;
+    let s2 = create(&a, &lab("team-a"), "second").await;
+    let other = create(&a, &lab("team-b"), "theirs").await;
+    for id in [&s1, &s2] {
+        snapshot_done(&a, &lab("team-a"), id).await;
+    }
+    snapshot_done(&a, &lab("team-b"), &other).await;
+    let today = chrono::Utc::now().date_naive();
+
+    let (status, body) = call(&a.router, "GET", "/usage", &lab("team-a"), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["source"], "state");
+    assert_eq!(body["group_by"], "day");
+    let units = json!({
+        "documents_streamed": 0,
+        "documents_snapshot": 6,
+        "documents_resync": 0,
+        "bytes": 6 * FAKE_BYTES_PER_DOC,
+        "sync_seconds": body["totals"]["sync_seconds"],
+    });
+    assert_eq!(body["totals"], units);
+    assert_eq!(
+        body["rows"],
+        json!([{ "day": today.to_string(), "units": units }])
+    );
+
+    let (_, by_sync) = call(
+        &a.router,
+        "GET",
+        &format!("/usage?group_by=sync&from={today}&to={today}"),
+        &lab("team-a"),
+        None,
+    )
+    .await;
+    let rows = by_sync["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 2, "{by_sync}");
+    let mut seen: Vec<(String, String, u64)> = rows
+        .iter()
+        .map(|r| {
+            (
+                r["sync_id"].as_str().unwrap().to_owned(),
+                r["name"].as_str().unwrap().to_owned(),
+                r["units"]["documents_snapshot"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    seen.sort();
+    let mut expected = vec![(s1, "first".to_owned(), 3), (s2, "second".to_owned(), 3)];
+    expected.sort();
+    assert_eq!(seen, expected);
+    assert_eq!(by_sync["totals"]["documents_snapshot"], 6);
+
+    // Another tenant sees its own only.
+    let (_, theirs) = call(&a.router, "GET", "/usage", &lab("team-b"), None).await;
+    assert_eq!(theirs["totals"]["documents_snapshot"], 3);
+    // A range without activity is empty, with zero totals.
+    let (_, empty) = call(
+        &a.router,
+        "GET",
+        "/usage?from=2020-01-01&to=2020-01-31",
+        &lab("team-a"),
+        None,
+    )
+    .await;
+    assert_eq!(empty["rows"], json!([]));
+    assert_eq!(empty["totals"]["documents_snapshot"], 0);
+}
+
+#[tokio::test]
+async fn usage_validates_its_range() {
+    let a = app(locked());
+    for query in [
+        "from=2026-02-01&to=2026-01-01",
+        "from=2025-01-01&to=2026-01-02",
+        "group_by=week",
+        "from=yesterday",
+    ] {
+        let (status, body) = call(
+            &a.router,
+            "GET",
+            &format!("/usage?{query}"),
+            &lab("team-a"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{query}: {body}");
+        assert_eq!(body["code"], "invalid_request");
+    }
+    // Exactly 366 days is allowed.
+    let (status, _) = call(
+        &a.router,
+        "GET",
+        "/usage?from=2025-01-01&to=2026-01-01",
+        &lab("team-a"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn usage_comes_from_tinybird_when_configured_with_the_same_shape() {
+    use wiremock::matchers::{method, path, query_param};
+    let tb = wiremock::MockServer::start().await;
+    wiremock::Mock::given(method("GET"))
+        .and(path("/v0/pipes/connect_tenant_usage.json"))
+        .and(query_param("tenant_id", "team-a"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+            "data": [
+                {"day": "2026-11-17", "sync_id": "s1", "documents_streamed": 10,
+                 "documents_snapshot": 0, "documents_resync": 0, "bytes": 1000, "sync_seconds": 60},
+                {"day": "2026-11-18", "sync_id": "s1", "documents_streamed": 5,
+                 "documents_snapshot": 2, "documents_resync": 0, "bytes": 700, "sync_seconds": 60},
+                {"day": "2026-11-18", "sync_id": "s2", "documents_streamed": 0,
+                 "documents_snapshot": 0, "documents_resync": 4, "bytes": 400, "sync_seconds": 30}
+            ]
+        })))
+        .mount(&tb)
+        .await;
+    let a = app_tweaked(
+        locked(),
+        Arc::new(MemStore::new()),
+        HostPolicy::any(),
+        Limits::default(),
+        Duration::from_millis(200),
+        |w| {
+            w.tinybird = Some(crate::tinybird::TinybirdConfig {
+                url: tb.uri(),
+                token: "tb".into(),
+            })
+        },
+    );
+    let (_, body) = call(
+        &a.router,
+        "GET",
+        "/usage?from=2026-11-01&to=2026-11-30",
+        &lab("team-a"),
+        None,
+    )
+    .await;
+    assert_eq!(body["source"], "tinybird");
+    assert_eq!(body["rows"].as_array().unwrap().len(), 2);
+    assert_eq!(body["rows"][1]["day"], "2026-11-18");
+    assert_eq!(body["rows"][1]["units"]["documents_streamed"], 5);
+    assert_eq!(body["rows"][1]["units"]["documents_resync"], 4);
+    assert_eq!(
+        body["totals"],
+        json!({"documents_streamed": 15, "documents_snapshot": 2, "documents_resync": 4,
+               "bytes": 2100, "sync_seconds": 150})
+    );
+    let (_, by_sync) = call(
+        &a.router,
+        "GET",
+        "/usage?from=2026-11-01&to=2026-11-30&group_by=sync",
+        &lab("team-a"),
+        None,
+    )
+    .await;
+    assert_eq!(by_sync["rows"][0]["sync_id"], "s1");
+    assert_eq!(by_sync["rows"][0]["units"]["documents_streamed"], 15);
+    assert!(by_sync["rows"][0]["name"].is_null(), "unknown here");
+
+    // Tinybird down: the state database answers, same shape.
+    tb.reset().await;
+    let (status, body) = call(&a.router, "GET", "/usage", &lab("team-a"), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["source"], "state");
+    assert!(body["totals"].is_object());
+}
+
+// ------------------------------------------------------------- ambient identity
+
+fn dynamo_body(name: &str, credentials: Value) -> Value {
+    json!({
+        "name": name,
+        "source": {"kind": "dynamodb", "config": {"region": "eu-west-1", "credentials": credentials}},
+        "destination": {"url": "http://meili:7700", "api_key": "k"},
+        "streams": [{"collection": "orders", "index": "orders"}],
+    })
+}
+
+fn hosted_app(store: Arc<MemStore>) -> App {
+    app_tweaked(
+        locked(),
+        store,
+        HostPolicy::any(),
+        Limits::default(),
+        Duration::from_millis(200),
+        |w| w.hosted = true,
+    )
+}
+
+#[tokio::test]
+async fn a_tenant_never_borrows_the_servers_own_identity_on_a_hosted_server() {
+    let a = hosted_app(Arc::new(MemStore::new()));
+    let default = json!({"type": "default"});
+    let (status, body) = call(
+        &a.router,
+        "POST",
+        "/syncs",
+        &lab("team-a"),
+        Some(dynamo_body("d", default.clone())),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["code"], "ambient_credentials");
+    assert!(body["message"].as_str().unwrap().contains("assume_role"));
+    // Neither may it probe with them (listing the server's own tables).
+    for route in ["/sources/check", "/sources/discover"] {
+        let (status, body) = call(
+            &a.router,
+            "POST",
+            route,
+            &lab("team-a"),
+            Some(json!({"source": {"kind": "dynamodb", "config": {"region": "eu-west-1"}}})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{route}: {body}");
+        assert_eq!(body["code"], "ambient_credentials");
+    }
+    // A MongoDB URI reading a local file, for the admin acting for a tenant.
+    let mut tenant_admin = admin();
+    tenant_admin.push((H_TENANT_ID, "team-a".to_owned()));
+    let (status, body) = call(
+        &a.router,
+        "POST",
+        "/syncs",
+        &tenant_admin,
+        Some(json!({
+            "name": "m",
+            "source": {"kind": "mongodb", "config": {"uri": "mongodb://h/?tlsCAFile=/etc/passwd"}},
+            "destination": {"url": "http://meili:7700", "api_key": "k"},
+            "streams": [{"collection": "db.c", "index": "c"}],
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    // A role to assume is fine, and the standalone admin keeps `default`.
+    let (status, _) = call(
+        &a.router,
+        "POST",
+        "/syncs",
+        &lab("team-a"),
+        Some(dynamo_body(
+            "r",
+            json!({"type": "assume_role", "role_arn": "arn:aws:iam::123456789012:role/r"}),
+        )),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = call(
+        &a.router,
+        "POST",
+        "/syncs",
+        &admin(),
+        Some(dynamo_body("g", default.clone())),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // Standalone (not hosted): allowed for tenants too.
+    let standalone = app(locked());
+    let (status, _) = call(
+        &standalone.router,
+        "POST",
+        "/syncs",
+        &lab("team-a"),
+        Some(dynamo_body("d", default)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn a_stored_tenant_sync_with_the_servers_identity_is_held_on_a_hosted_server() {
+    let store = Arc::new(MemStore::new());
+    let before = app(locked());
+    let id = {
+        let (status, body) = call(
+            &before.router,
+            "POST",
+            "/syncs",
+            &lab("team-a"),
+            Some(dynamo_body("d", json!({"type": "default"}))),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        body["id"].as_str().unwrap().to_owned()
+    };
+    // Same row, now on a hosted server.
+    let row = before
+        .store
+        .get_sync(Some("team-a"), &id)
+        .await
+        .unwrap()
+        .unwrap()
+        .readable()
+        .unwrap();
+    before.state.manager.shutdown(Duration::from_secs(5)).await;
+    store.create_sync(Some("team-a"), &row.spec).await.unwrap();
+    let a = hosted_app(Arc::clone(&store));
+    boot_syncs(&a.state).await.unwrap();
+    wait_for(async || {
+        call(
+            &a.router,
+            "GET",
+            &format!("/syncs/{id}/status"),
+            &lab("team-a"),
+            None,
+        )
+        .await
+        .1["phase"]
+            == "held"
+    })
+    .await;
+    assert_eq!(
+        a.probe.last_opened.lock().unwrap().as_ref(),
+        None,
+        "never opened"
+    );
 }

@@ -3,20 +3,21 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use meili_connect_core::{HostPolicy, SourceFactory, StateStore};
-use meili_connect_store::{LabOutbox, SyncRepository};
+use meili_connect_core::{HostPolicy, Secret, SourceFactory, StateStore};
+use meili_connect_store::{LabOutbox, Lane, SyncRepository, UsageLedger};
 
 use crate::auth::AuthConfig;
 use crate::guard::GuardedSources;
 use crate::limits::{Limits, ProbeSlots};
 use crate::manager::{SinkFactory, SyncManager};
+use crate::metrics::{Metrics, Scrape};
 
 /// Everything a store must be for the server: the engine's state, the
-/// tenant-scoped repository and the Lab outbox. `PgStore` and `MemStore`
-/// both are.
-pub trait Backend: StateStore + SyncRepository + LabOutbox {}
+/// tenant-scoped repository, the Lab outbox and the usage ledger.
+/// `PgStore` and `MemStore` both are.
+pub trait Backend: StateStore + SyncRepository + LabOutbox + UsageLedger {}
 
-impl<T: StateStore + SyncRepository + LabOutbox> Backend for T {}
+impl<T: StateStore + SyncRepository + LabOutbox + UsageLedger> Backend for T {}
 
 #[derive(Clone)]
 pub struct AppState {
@@ -31,6 +32,16 @@ pub struct AppState {
     pub probe_timeout: Duration,
     /// Usage events go to the Lab (all three `LAB_*` event variables set).
     pub lab_events: bool,
+    pub metrics: Arc<Metrics>,
+    /// When a stuck sync's lag deserves a warning in its status.
+    pub lag_guard: crate::config::LagGuard,
+    /// Lab mode or a public host policy: a tenant's source may not use the
+    /// server's own identity or files (`crate::ambient`).
+    pub hosted: bool,
+    /// `GET /usage` reads Tinybird when configured.
+    pub usage_reader: Option<Arc<crate::tinybird::TinybirdReader>>,
+    /// The only credential `GET /metrics` accepts.
+    pub metrics_token: Option<Secret>,
     pub limits: Limits,
     /// Slots for `check` and `discover`.
     pub probes: Arc<ProbeSlots>,
@@ -52,5 +63,23 @@ impl AppState {
 
     pub fn outbox(&self) -> &dyn LabOutbox {
         &*self.backend
+    }
+
+    /// The live values `/metrics` computes when scraped.
+    pub async fn scrape(&self) -> Scrape {
+        let lanes = self.manager.usage().lanes();
+        let backlog = async |lane: Lane| {
+            if lanes.contains(&lane) {
+                self.backend.outbox(lane).count_unsent().await.ok()
+            } else {
+                None
+            }
+        };
+        Scrape {
+            phases: self.repo().phase_counts().await.unwrap_or_default(),
+            lab_backlog: backlog(Lane::Lab).await,
+            tinybird_backlog: backlog(Lane::Tinybird).await,
+            lags: self.manager.lag_seconds().await,
+        }
     }
 }

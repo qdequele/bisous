@@ -59,6 +59,25 @@ impl ApiError {
         )
     }
 
+    /// A tenant's source would use the server's own identity or files.
+    pub fn ambient_credentials(message: impl Into<String>) -> Self {
+        Self::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "ambient_credentials",
+            message,
+        )
+    }
+
+    /// The sync's team has no credits left (Lab mode).
+    pub fn out_of_credits() -> Self {
+        Self::new(
+            StatusCode::PAYMENT_REQUIRED,
+            crate::credits::OUT_OF_CREDITS,
+            "this team has no credits left: its syncs are held and resume by themselves once \
+             credits are added in the Lab console",
+        )
+    }
+
     pub fn sync_not_found(id: &str) -> Self {
         Self::not_found(format!("sync {id} not found"))
     }

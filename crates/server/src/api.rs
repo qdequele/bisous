@@ -69,8 +69,10 @@ fn probe_request(input: Result<Json<Value>, JsonRejection>) -> ApiResult<ProbeRe
 async fn probe_source(
     state: &AppState,
     req: &ProbeRequest,
-    coarse: bool,
+    scope: &Scope,
 ) -> ApiResult<Box<dyn Source>> {
+    let coarse = coarse(scope);
+    refuse_ambient(state, scope.tenant.is_some(), &req.source)?;
     let sources = state.sources(coarse);
     state
         .registry
@@ -90,6 +92,18 @@ async fn vet(state: &AppState, source: &SourceSpec, coarse: bool) -> ApiResult<(
         Err(VetError::Source(e)) if coarse => Err(source_error(&coarse_source_error(e))),
         Err(VetError::Source(e)) => Err(source_error(&e)),
     }
+}
+
+/// On a hosted server, a tenant's source may not use the server's own
+/// identity, files or environment (`crate::ambient`).
+fn refuse_ambient(state: &AppState, tenant_owned: bool, source: &SourceSpec) -> ApiResult<()> {
+    if state.hosted
+        && tenant_owned
+        && let Some(why) = crate::ambient::ambient_identity(source)
+    {
+        return Err(ApiError::ambient_credentials(why));
+    }
+    Ok(())
 }
 
 /// Lab callers get coarse source and sink errors.
@@ -127,7 +141,7 @@ pub async fn check_source(
     let req = probe_request(input)?;
     let _slot = state.probes.try_acquire(scope.tenant())?;
     let report = tokio::time::timeout(state.probe_timeout, async {
-        let mut source = probe_source(&state, &req, coarse(&scope)).await?;
+        let mut source = probe_source(&state, &req, &scope).await?;
         source.check().await.map_err(|e| source_error(&e))
     })
     .await
@@ -146,7 +160,7 @@ pub async fn discover_source(
     let req = probe_request(input)?;
     let _slot = state.probes.try_acquire(scope.tenant())?;
     let collections = tokio::time::timeout(state.probe_timeout, async {
-        let mut source = probe_source(&state, &req, coarse(&scope)).await?;
+        let mut source = probe_source(&state, &req, &scope).await?;
         source.discover().await.map_err(|e| source_error(&e))
     })
     .await
@@ -217,6 +231,7 @@ async fn validate(state: &AppState, spec: &SyncSpec, coarse: bool) -> ApiResult<
         .await
         .map_err(ApiError::host_not_allowed)?;
     validate_shape(state, spec)?;
+    refuse_ambient(state, spec.tenant.is_some(), &spec.source)?;
     vet(state, &spec.source, coarse).await
 }
 
@@ -428,11 +443,18 @@ async fn status_json(state: &AppState, scope: &Scope, id: &str) -> ApiResult<Val
         .progress(scope.tenant(), id, first_day, today)
         .await?;
     let (mut written, mut deleted, mut rejected, mut dropped) = (0u64, 0u64, 0u64, 0u64);
+    let mut units = meili_connect_core::Usage::default();
+    let dead_letters = state.repo().count_dead_letters(scope.tenant(), id).await?;
+    let lag = live.as_ref().and_then(|s| s.lag);
+    let lag_warning = state
+        .lag_guard
+        .warning(lag.as_ref(), live.as_ref().and_then(|s| s.since_checkpoint));
     for d in &days {
         written = written.saturating_add(d.written);
         deleted = deleted.saturating_add(d.deleted);
         rejected = rejected.saturating_add(d.rejected);
         dropped = dropped.saturating_add(d.dead_letters_dropped);
+        units.add(&d.usage);
     }
     let phase = saved.as_ref().map_or(SyncPhase::Pending, |s| s.phase);
     Ok(json!({
@@ -446,6 +468,19 @@ async fn status_json(state: &AppState, scope: &Scope, id: &str) -> ApiResult<Val
         "consecutive_failures": live.as_ref().map_or(0, |s| s.consecutive_failures),
         "last_error": live.as_ref().and_then(|s| s.last_error.clone()),
         "progress": { "written": written, "deleted": deleted, "rejected": rejected },
+        // The metered units since the sync was created.
+        "documents": {
+            "documents_streamed": units.documents_streamed,
+            "documents_snapshot": units.documents_snapshot,
+            "documents_resync": units.documents_resync,
+        },
+        "bytes": units.bytes,
+        "sync_seconds": units.sync_seconds,
+        // How far behind the origin, while streaming and when the source
+        // can tell.
+        "lag": lag,
+        "lag_warning": lag_warning,
+        "dead_letters": dead_letters,
         // Rejected documents not kept as dead letters: the sync reached
         // DEAD_LETTERS_MAX_PER_SYNC. Clear the dead letters to keep more.
         "dead_letters_overflow": dropped,
@@ -545,6 +580,141 @@ pub async fn clear_dead_letters(
     owned(&state, &scope, &id).await?;
     let deleted = state.repo().clear_dead_letters(scope.tenant(), &id).await?;
     Ok(Json(json!({ "deleted": deleted })))
+}
+
+// ---------------------------------------------------------------- usage
+
+#[derive(Debug, Deserialize)]
+pub struct UsageQuery {
+    from: Option<NaiveDate>,
+    to: Option<NaiveDate>,
+    group_by: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GroupBy {
+    Day,
+    Sync,
+}
+
+fn units_json(u: &meili_connect_core::Usage) -> Value {
+    json!({
+        "documents_streamed": u.documents_streamed,
+        "documents_snapshot": u.documents_snapshot,
+        "documents_resync": u.documents_resync,
+        "bytes": u.bytes,
+        "sync_seconds": u.sync_seconds,
+    })
+}
+
+/// `GET /usage?from=&to=&group_by=day|sync`: the caller's usage per UTC day
+/// or per sync, with totals. From the Tinybird pipe when configured (the
+/// state database when it cannot answer), else from the state database's
+/// progress table; the same shape either way. Days and syncs without usage
+/// are absent.
+pub async fn usage(
+    State(state): State<AppState>,
+    scope: Scope,
+    query: Result<Query<UsageQuery>, QueryRejection>,
+) -> ApiResult<Json<Value>> {
+    let Query(q) = query?;
+    let group_by = match q.group_by.as_deref() {
+        None | Some("day") => GroupBy::Day,
+        Some("sync") => GroupBy::Sync,
+        Some(_) => return Err(ApiError::invalid("`group_by` must be `day` or `sync`")),
+    };
+    let to = q.to.unwrap_or_else(|| Utc::now().date_naive());
+    let from = match q.from {
+        Some(f) => f,
+        None => to.checked_sub_days(Days::new(29)).unwrap_or(to),
+    };
+    if from > to {
+        return Err(ApiError::invalid("`from` is after `to`"));
+    }
+    if (to - from).num_days() >= MAX_PROGRESS_DAYS as i64 {
+        return Err(ApiError::invalid(format!(
+            "the range spans more than {MAX_PROGRESS_DAYS} days"
+        )));
+    }
+
+    // (day, sync, units) rows from Tinybird or the state database.
+    let mut source = "state";
+    let mut rows: Option<Vec<(NaiveDate, String, meili_connect_core::Usage)>> = None;
+    if let Some(reader) = &state.usage_reader {
+        match reader.usage(scope.tenant().unwrap_or(""), from, to).await {
+            Ok(found) => {
+                source = "tinybird";
+                rows = Some(
+                    found
+                        .into_iter()
+                        .map(|r| (r.day, r.sync_id, r.usage))
+                        .collect(),
+                );
+            }
+            Err(reason) => {
+                tracing::warn!(
+                    reason,
+                    "Tinybird cannot answer GET /usage; reading the state database"
+                );
+            }
+        }
+    }
+    let rows = match rows {
+        Some(rows) => rows,
+        None => state
+            .backend
+            .usage(scope.tenant(), from, to)
+            .await?
+            .into_iter()
+            .map(|r| (r.day, r.sync_id, r.usage))
+            .collect(),
+    };
+
+    let mut totals = meili_connect_core::Usage::default();
+    let mut grouped: std::collections::BTreeMap<String, meili_connect_core::Usage> =
+        std::collections::BTreeMap::new();
+    for (day, sync_id, units) in &rows {
+        totals.add(units);
+        let key = match group_by {
+            GroupBy::Day => day.to_string(),
+            GroupBy::Sync => sync_id.clone(),
+        };
+        grouped.entry(key).or_default().add(units);
+    }
+    let names: std::collections::HashMap<String, String> = match group_by {
+        GroupBy::Sync => state
+            .repo()
+            .list_syncs(scope.tenant())
+            .await?
+            .into_iter()
+            .map(|row| match row {
+                SyncRow::Readable(s) => (s.spec.id, s.spec.name),
+                SyncRow::Unreadable(u) => (u.id, u.name),
+            })
+            .collect(),
+        GroupBy::Day => Default::default(),
+    };
+    let out: Vec<Value> = grouped
+        .iter()
+        .filter(|(_, u)| !u.is_zero())
+        .map(|(key, u)| match group_by {
+            GroupBy::Day => json!({ "day": key, "units": units_json(u) }),
+            GroupBy::Sync => json!({
+                "sync_id": key,
+                // Absent for a sync deleted since.
+                "name": names.get(key),
+                "units": units_json(u),
+            }),
+        })
+        .collect();
+    Ok(Json(json!({
+        "from": from,
+        "to": to,
+        "group_by": match group_by { GroupBy::Day => "day", GroupBy::Sync => "sync" },
+        "source": source,
+        "rows": out,
+        "totals": units_json(&totals),
+    })))
 }
 
 /// Unknown routes answer with the standard error body.

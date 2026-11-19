@@ -458,3 +458,55 @@ async fn a_resync_survives_a_run_that_failed_before_starting_it() {
     );
     s.shutdown().await;
 }
+
+#[tokio::test]
+async fn time_in_streaming_is_metered_and_a_held_sync_costs_nothing() {
+    let h = Harness::new();
+    seed_rows_sup(&h);
+    let config = SupervisorConfig {
+        sync: options(),
+        seconds_interval: Duration::from_millis(50),
+        ..SupervisorConfig::default()
+    };
+    let s = Supervisor::new(h.deps(), config, CancellationToken::new());
+    s.start(spec()).await.expect("start");
+    wait_status(&s, "streaming", streaming).await;
+    let seconds = || {
+        h.store
+            .inner()
+            .usage
+            .get(SYNC_ID)
+            .map_or(0, |u| u.sync_seconds)
+    };
+    wait_for("a second metered", 5, || seconds() >= 1).await;
+    s.stop(SYNC_ID).await.expect("stop");
+    let at_stop = seconds();
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    assert_eq!(seconds(), at_stop, "a stopped sync accrues nothing");
+}
+
+fn seed_rows_sup(h: &Harness) {
+    h.origin.seed(vec![upsert(1, json!({}))]);
+}
+
+#[tokio::test]
+async fn the_status_carries_the_streaming_lag_only_while_running() {
+    let h = Harness::new();
+    h.origin.seed(vec![upsert(1, json!({}))]);
+    let s = supervisor(&h);
+    s.start(spec()).await.expect("start");
+    wait_status(&s, "streaming", streaming).await;
+    wait_status(&s, "caught up", |st| {
+        st.lag
+            .is_some_and(|l| l.seconds == Some(0.0) && l.bytes == Some(0))
+    })
+    .await;
+    let st = status(&s).await;
+    assert!(
+        st.since_checkpoint
+            .is_some_and(|d| d < Duration::from_secs(5)),
+        "{st:?}"
+    );
+    s.stop(SYNC_ID).await.expect("stop");
+    assert_eq!(status(&s).await.lag, None, "a stopped sync has no lag");
+}

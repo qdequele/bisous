@@ -363,6 +363,13 @@ async fn apply_preserves_order_across_kinds() {
         ]
     );
     assert_eq!(calls[0].items[0], json!({"id": "1", "t": 1}));
+    // Every accepted document's wire form plus one separator, once.
+    let wire: u64 = calls
+        .iter()
+        .flat_map(|c| c.items.iter())
+        .map(|v| v.to_string().len() as u64 + 1)
+        .sum();
+    assert_eq!(report.bytes, wire);
     assert_eq!(calls[1].items, vec![json!("3")]);
     assert_eq!(calls[2].items[0], json!({"id": "4", "t": 4, "x": null}));
     assert_eq!(calls[4].items[0], json!({"id": "1", "t": 9}));
@@ -476,6 +483,11 @@ async fn bisection_isolates_bad_documents() {
     assert_eq!(report.written, 14);
     let rejected: Vec<&str> = report.rejected.iter().map(|r| r.op.id()).collect();
     assert_eq!(rejected, vec!["3", "12"]);
+    // Only the accepted documents' bytes count, each once although the
+    // bisection sent most of them several times.
+    let line = |i: usize| json!({"id": i.to_string(), "bad": false}).to_string().len() as u64 + 1;
+    let expected: u64 = (0..16).filter(|i| *i != 3 && *i != 12).map(line).sum();
+    assert_eq!(report.bytes, expected);
     assert_eq!(report.rejected[0].reason, "bad document \"3\"");
     let ids = fake.succeeded_ids();
     let expected: Vec<String> = (0..16)

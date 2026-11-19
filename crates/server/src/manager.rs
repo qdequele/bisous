@@ -14,7 +14,7 @@
 //! a `DELETE` finds the sync gone, a `resume` racing a `PUT` runs the new
 //! spec.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -32,11 +32,13 @@ use meili_connect_store::{StoredSync, SyncRow};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
+use crate::credits::{CreditCache, OUT_OF_CREDITS};
 use crate::error::ApiError;
 use crate::guard::{CoarseSink, GuardedSources};
+use crate::metrics::{InstrumentedSink, Metrics};
 use crate::redact::same_origin;
 use crate::state::Backend;
-use crate::usage::UsageMeter;
+use crate::usage::UsageEvents;
 
 type ApiResult<T> = Result<T, ApiError>;
 
@@ -79,13 +81,19 @@ pub struct ManagerDeps {
     pub sinks: SinkFactory,
     pub policy: Arc<HostPolicy>,
     pub config: SupervisorConfig,
-    pub meter: Arc<UsageMeter>,
-    /// Usage events go to the Lab: a deleted sync's count is enqueued.
-    pub lab_events: bool,
+    /// Describes and drains the syncs' usage (a deleted sync's usage is
+    /// enqueued before it goes).
+    pub usage: Arc<UsageEvents>,
     /// Syncs one tenant may own.
     pub max_syncs_per_tenant: u64,
     /// Longest wait for one sync to stop.
     pub stop_grace: Duration,
+    /// Lab mode: whether a tenant may still spend.
+    pub credits: Option<Arc<CreditCache>>,
+    pub metrics: Arc<Metrics>,
+    /// Lab mode or a public host policy: tenants may not use the server's
+    /// own identity or files.
+    pub hosted: bool,
     pub cancel: CancellationToken,
 }
 
@@ -97,14 +105,21 @@ pub struct SyncManager {
     policy: Arc<HostPolicy>,
     config: SupervisorConfig,
     cancel: CancellationToken,
-    meter: Arc<UsageMeter>,
-    lab_events: bool,
+    usage: Arc<UsageEvents>,
     max_syncs_per_tenant: u64,
     stop_grace: Duration,
     /// Time limit of a teardown run outside a supervisor.
     teardown_timeout: Duration,
     supervisors: Mutex<HashMap<String, Arc<Supervisor>>>,
     ops: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    credits: Option<Arc<CreditCache>>,
+    metrics: Arc<Metrics>,
+    hosted: bool,
+    /// The tenant of every known tenant-owned sync (for the credit checks).
+    tenants: Mutex<HashMap<String, String>>,
+    /// Syncs held because their team is out of credits; they resume by
+    /// themselves.
+    credit_held: Mutex<HashSet<String>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -121,18 +136,22 @@ impl SyncManager {
             policy: deps.policy,
             config: deps.config,
             cancel: deps.cancel,
-            meter: deps.meter,
-            lab_events: deps.lab_events,
+            usage: deps.usage,
             max_syncs_per_tenant: deps.max_syncs_per_tenant,
             stop_grace: deps.stop_grace,
             teardown_timeout: Duration::from_secs(60),
             supervisors: Mutex::new(HashMap::new()),
             ops: Mutex::new(HashMap::new()),
+            credits: deps.credits,
+            metrics: deps.metrics,
+            hosted: deps.hosted,
+            tenants: Mutex::new(HashMap::new()),
+            credit_held: Mutex::new(HashSet::new()),
         }
     }
 
-    pub fn meter(&self) -> &Arc<UsageMeter> {
-        &self.meter
+    pub fn usage(&self) -> &Arc<UsageEvents> {
+        &self.usage
     }
 
     async fn serialize(&self, sync_id: &str) -> tokio::sync::OwnedMutexGuard<()> {
@@ -171,11 +190,15 @@ impl SyncManager {
             Arc::clone(&self.policy),
             spec.tenant.is_some(),
         )
+        .refusing_ambient_identity(self.hosted && spec.tenant.is_some())
     }
 
     /// The sink of one sync; coarse errors for a tenant's sync.
     fn sink(&self, spec: &SyncSpec) -> Result<Arc<dyn Sink>, SinkError> {
-        let sink = (self.sinks)(&spec.destination)?;
+        let sink: Arc<dyn Sink> = Arc::new(InstrumentedSink::new(
+            (self.sinks)(&spec.destination)?,
+            Arc::clone(&self.metrics),
+        ));
         Ok(if spec.tenant.is_some() {
             Arc::new(CoarseSink(sink))
         } else {
@@ -186,7 +209,10 @@ impl SyncManager {
     fn new_supervisor(&self, spec: &SyncSpec) -> Result<Arc<Supervisor>, SupervisorError> {
         let sink = self.sink(spec).map_err(EngineError::from)?;
         let deps = SyncDeps {
-            sources: Arc::new(self.guarded_sources(spec)),
+            sources: Arc::new(
+                self.guarded_sources(spec)
+                    .with_metrics(Arc::clone(&self.metrics)),
+            ),
             sink,
             store: Arc::clone(&self.store),
         };
@@ -229,16 +255,146 @@ impl SyncManager {
     async fn run_locked(&self, spec: SyncSpec) -> Result<Arc<Supervisor>, SupervisorError> {
         spec.validate().map_err(EngineError::Spec)?;
         self.retire(&spec.id).await;
-        self.meter.register(&spec.id, spec.tenant.as_deref());
+        self.register(&spec);
+        lock(&self.credit_held).remove(&spec.id);
         let sup = self.new_supervisor(&spec)?;
         sup.start(spec.clone()).await?;
         lock(&self.supervisors).insert(spec.id.clone(), Arc::clone(&sup));
         Ok(sup)
     }
 
-    /// Register a sync without running it (a paused sync at boot).
-    pub fn register_idle(&self, spec: &SyncSpec) {
-        self.meter.register(&spec.id, spec.tenant.as_deref());
+    fn register(&self, spec: &SyncSpec) {
+        self.usage.register(spec);
+        if let Some(tenant) = &spec.tenant {
+            lock(&self.tenants).insert(spec.id.clone(), tenant.clone());
+        }
+    }
+
+    fn unregister(&self, sync_id: &str) {
+        self.usage.forget(sync_id);
+        lock(&self.tenants).remove(sync_id);
+        lock(&self.credit_held).remove(sync_id);
+    }
+
+    /// Register a sync without running it (a paused sync at boot). A sync
+    /// held for credits resumes by itself once its team can spend again.
+    pub fn register_idle(&self, spec: &SyncSpec, state: Option<&SyncState>) {
+        self.register(spec);
+        if state.is_some_and(is_credit_hold) {
+            lock(&self.credit_held).insert(spec.id.clone());
+        }
+    }
+
+    // ------------------------------------------------------------ credits
+
+    /// Whether the sync's team may spend (always outside Lab mode and for
+    /// the global scope).
+    async fn can_spend(&self, tenant: Option<&str>) -> bool {
+        match (&self.credits, tenant) {
+            (Some(credits), Some(tenant)) => credits.can_spend(tenant).await,
+            _ => true,
+        }
+    }
+
+    pub fn is_credit_held(&self, sync_id: &str) -> bool {
+        lock(&self.credit_held).contains(sync_id)
+    }
+
+    /// Stop the sync, nothing torn down, and mark it held for credits.
+    async fn hold_for_credits(&self, sync_id: &str) -> Result<(), StoreError> {
+        self.retire(sync_id).await;
+        persist_phase(
+            &*self.store,
+            sync_id,
+            SyncPhase::Held,
+            Some(OUT_OF_CREDITS.to_owned()),
+        )
+        .await?;
+        lock(&self.credit_held).insert(sync_id.to_owned());
+        Ok(())
+    }
+
+    /// A start refused because the team is out of credits.
+    async fn refuse_without_credits(&self, spec: &SyncSpec) -> ApiResult<()> {
+        if self.can_spend(spec.tenant.as_deref()).await {
+            return Ok(());
+        }
+        // Keep it (or put it) on hold: it resumes by itself.
+        if !self.is_credit_held(&spec.id) && self.supervisor(&spec.id).is_none() {
+            let phase = self.store.load(&spec.id).await?.map(|s| s.phase);
+            if phase != Some(SyncPhase::Paused) {
+                self.hold_for_credits(&spec.id).await?;
+            }
+        }
+        Err(ApiError::out_of_credits())
+    }
+
+    /// Hold the running syncs of every team that cannot spend, and resume
+    /// the syncs held for credits of every team that can again. Called
+    /// every `CREDITS_CHECK_INTERVAL_SECS` in Lab mode.
+    pub async fn enforce_credits(&self) {
+        if self.credits.is_none() {
+            return;
+        }
+        let mut by_tenant: HashMap<String, Vec<String>> = HashMap::new();
+        for (id, tenant) in lock(&self.tenants).iter() {
+            by_tenant
+                .entry(tenant.clone())
+                .or_default()
+                .push(id.clone());
+        }
+        for (tenant, ids) in by_tenant {
+            let can_spend = self.can_spend(Some(&tenant)).await;
+            for id in ids {
+                if let Err(e) = self.enforce_one(&tenant, &id, can_spend).await {
+                    warn!(sync_id = %id, error = %e.message, "credit check could not be applied");
+                }
+            }
+        }
+    }
+
+    async fn enforce_one(&self, tenant: &str, id: &str, can_spend: bool) -> ApiResult<()> {
+        let _op = self.serialize(id).await;
+        if !can_spend {
+            if self.is_credit_held(id) {
+                return Ok(());
+            }
+            let running = match self.supervisor(id) {
+                Some(sup) => sup.status(id).await?.is_some_and(|s| s.running),
+                None => false,
+            };
+            if running {
+                self.hold_for_credits(id).await?;
+                info!(sync_id = %id, tenant, "team out of credits: sync held");
+            }
+            return Ok(());
+        }
+        if !self.is_credit_held(id) {
+            return Ok(());
+        }
+        lock(&self.credit_held).remove(id);
+        // Resume only what is still held for credits (the user may have
+        // paused or deleted it since).
+        let state = self.store.load(id).await?;
+        if !state.as_ref().is_some_and(is_credit_hold) {
+            return Ok(());
+        }
+        if let Some(SyncRow::Readable(stored)) = self.backend.get_sync(Some(tenant), id).await? {
+            self.run_locked(stored.spec).await?;
+            info!(sync_id = %id, tenant, "credits are back: sync resumed");
+        }
+        Ok(())
+    }
+
+    /// Run [`SyncManager::enforce_credits`] every `interval` until `cancel`.
+    pub async fn run_credit_checks(self: Arc<Self>, interval: Duration, cancel: CancellationToken) {
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => return,
+                _ = tokio::time::sleep(interval) => {}
+            }
+            self.enforce_credits().await;
+        }
     }
 
     // ------------------------------------------------------------ entry points
@@ -269,13 +425,20 @@ impl SyncManager {
             .backend
             .create_sync(spec.tenant.as_deref(), &spec)
             .await?;
+        // A team out of credits may create syncs; they start held.
+        if !self.can_spend(spec.tenant.as_deref()).await {
+            self.register(&spec);
+            self.hold_for_credits(&spec.id).await?;
+            info!(sync_id = %spec.id, "team out of credits: the new sync starts held");
+            return Ok(stored);
+        }
         // All or nothing: a sync that cannot start is not kept (it would
         // start unannounced at the next boot).
         let (id, tenant) = (spec.id.clone(), spec.tenant.clone());
         if let Err(e) = self.run_locked(spec).await {
             warn!(sync_id = %id, error = %e, "the new sync could not start; it is not kept");
             self.retire(&id).await;
-            self.meter.forget(&id);
+            self.unregister(&id);
             if let Err(e) = self.backend.delete_sync(tenant.as_deref(), &id).await {
                 warn!(sync_id = %id, error = %e, "could not roll the new sync back");
             }
@@ -316,6 +479,7 @@ impl SyncManager {
         let change = SpecChange::between(old, &spec);
         let saved = self.store.load(id).await?;
         let paused = saved.as_ref().is_some_and(|s| s.phase == SyncPhase::Paused);
+        let starved = !paused && !self.can_spend(tenant).await;
 
         match change {
             SpecChange::Origin => match self.remove_locked(old, force).await {
@@ -356,14 +520,19 @@ impl SyncManager {
                     checkpoint: None,
                     message: None,
                     resyncing: false,
+                    resync_reason: None,
                     updated_at: Utc::now(),
                 })
                 .await?;
         }
         if paused {
             self.retire(id).await;
-            self.meter.register(id, spec.tenant.as_deref());
+            self.register(&spec);
             info!(sync_id = %id, ?change, "paused sync updated; it stays paused");
+        } else if starved {
+            self.register(&spec);
+            self.hold_for_credits(id).await?;
+            info!(sync_id = %id, ?change, "sync updated; held, its team is out of credits");
         } else {
             self.run_locked(spec).await?;
             info!(sync_id = %id, ?change, "sync updated and restarted");
@@ -382,7 +551,8 @@ impl SyncManager {
             Some(SyncRow::Unreadable(_)) => {
                 warn!(sync_id = %id, "deleting an unreadable sync; its origin is not cleaned up");
                 self.retire(id).await;
-                self.meter.forget(id);
+                self.usage.flush_sync(&*self.backend, id).await;
+                self.unregister(id);
                 self.backend.delete_sync(tenant, id).await?;
                 drop(op);
                 self.forget_lock(id);
@@ -411,13 +581,10 @@ impl SyncManager {
             }
             Err(RemoveError::Supervisor(e)) => return Err(e.into()),
         }
-        if self.lab_events {
-            if let Err(e) = self.meter.flush_one(&*self.backend, id).await {
-                warn!(sync_id = %id, error = %e, "usage of a deleted sync could not be enqueued");
-            }
-        } else {
-            self.meter.forget(id);
-        }
+        // Its pending usage goes now (or with the next flush: it is not
+        // deleted with the sync).
+        self.usage.flush_sync(&*self.backend, id).await;
+        self.unregister(id);
         self.backend.delete_sync(tenant, id).await?;
         drop(op);
         self.forget_lock(id);
@@ -438,6 +605,8 @@ impl SyncManager {
             }
         }
         persist_phase(&*self.store, id, SyncPhase::Paused, None).await?;
+        // The user's pause wins over a credit hold: it stays paused.
+        lock(&self.credit_held).remove(id);
         Ok(())
     }
 
@@ -445,6 +614,7 @@ impl SyncManager {
     pub async fn resume(&self, tenant: Option<&str>, id: &str) -> ApiResult<()> {
         let _op = self.serialize(id).await;
         let current = self.row(tenant, id).await?;
+        self.refuse_without_credits(&current.spec).await?;
         let running = match self.supervisor(id) {
             Some(sup) => sup.status(id).await?.is_some_and(|s| s.running),
             None => false,
@@ -460,6 +630,7 @@ impl SyncManager {
     pub async fn resync(&self, tenant: Option<&str>, id: &str) -> ApiResult<()> {
         let _op = self.serialize(id).await;
         let spec = self.row(tenant, id).await?.spec;
+        self.refuse_without_credits(&spec).await?;
         let sup = match self.supervisor(id) {
             Some(sup) => sup,
             None => self.run_locked(spec.clone()).await?,
@@ -478,11 +649,18 @@ impl SyncManager {
     pub async fn release(&self, tenant: Option<&str>, id: &str) -> ApiResult<()> {
         let _op = self.serialize(id).await;
         let spec = self.row(tenant, id).await?.spec;
-        let phase = self.store.load(id).await?.map(|s| s.phase);
-        if phase != Some(SyncPhase::Held) {
+        let state = self.store.load(id).await?;
+        if state.as_ref().map(|s| s.phase) != Some(SyncPhase::Held) {
             return Err(ApiError::conflict(format!(
                 "sync {id} is not held; only a held sync can be released"
             )));
+        }
+        self.refuse_without_credits(&spec).await?;
+        if state.as_ref().is_some_and(is_credit_hold) {
+            // Credits are back: what held it is gone, nothing to let
+            // through.
+            self.run_locked(spec).await?;
+            return Ok(());
         }
         let sup = match self.supervisor(id) {
             Some(sup) => sup,
@@ -588,9 +766,31 @@ impl SyncManager {
         }
     }
 
+    /// The lag in seconds of every running sync whose source can tell.
+    pub async fn lag_seconds(&self) -> Vec<f64> {
+        let all: Vec<(String, Arc<Supervisor>)> = lock(&self.supervisors)
+            .iter()
+            .map(|(id, s)| (id.clone(), Arc::clone(s)))
+            .collect();
+        let mut out = Vec::with_capacity(all.len());
+        for (id, sup) in all {
+            if let Ok(Some(st)) = sup.status(&id).await
+                && let Some(seconds) = st.lag.and_then(|l| l.seconds)
+            {
+                out.push(seconds);
+            }
+        }
+        out
+    }
+
     pub fn running_ids(&self) -> Vec<String> {
         lock(&self.supervisors).keys().cloned().collect()
     }
+}
+
+/// The state of a sync held because its team is out of credits.
+fn is_credit_hold(state: &SyncState) -> bool {
+    state.phase == SyncPhase::Held && state.message.as_deref() == Some(OUT_OF_CREDITS)
 }
 
 fn unreadable() -> ApiError {
@@ -639,6 +839,7 @@ async fn persist_phase(
         checkpoint: None,
         message: None,
         resyncing: false,
+        resync_reason: None,
         updated_at: Utc::now(),
     });
     state.phase = phase;

@@ -2,11 +2,13 @@
 # End-to-end check of meili-connect against real containers, through the
 # HTTP API only.
 #
-#   scripts/e2e.sh            # Postgres scenarios, then MongoDB, then the host policy
+#   scripts/e2e.sh            # Postgres scenarios, metering and credits, MongoDB, the host policy
 #   E2E_SKIP_MONGO=1 scripts/e2e.sh
 #
-# The main server runs standalone (host policy `any`); a second one runs with
-# CONNECT_HOST_POLICY=public to check what it refuses.
+# The main server runs standalone (host policy `any`) with a fake Lab
+# (scripts/fake_lab.py: signed usage events, account lookups) and
+# METRICS_TOKEN; a second one runs with CONNECT_HOST_POLICY=public to check
+# what it refuses.
 #
 # Needs: docker, curl, jq, python3, cargo. Starts containers named `mc-e2e-<pid>-*`
 # on random host ports and removes them (and the server) on exit, whatever
@@ -25,9 +27,15 @@ MEILI_KEY="e2e-master-key-0123456789"
 ADMIN_KEY="e2e-admin-$$"
 ROWS="${E2E_ROWS:-5000}"
 TIMEOUT="${E2E_TIMEOUT:-120}"
+METRICS_TOKEN="e2e-metrics-$$"
+LAB_INSTANCE="e2e-instance"
+LAB_SECRET="e2e-lab-secret-$$"
+# A Lab account id (a UUID): its syncs are metered and credit-checked.
+TEAM="0b9f6c1e-5d1a-4c3e-9a7b-2f4e6d8c0a11"
 
 SERVER_PID=""
 PUBLIC_PID=""
+LAB_PID=""
 RESULTS=()
 FAILED=0
 
@@ -36,7 +44,7 @@ pass() { RESULTS+=("PASS  $1"); log "PASS: $1"; }
 fail() { RESULTS+=("FAIL  $1: $2"); FAILED=1; printf '\033[1;31m[e2e] FAIL: %s: %s\033[0m\n' "$1" "$2"; }
 
 cleanup() {
-  for pid in "$SERVER_PID" "$PUBLIC_PID"; do
+  for pid in "$SERVER_PID" "$PUBLIC_PID" "$LAB_PID"; do
     if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
       kill -9 "$pid" 2>/dev/null || true
     fi
@@ -128,6 +136,15 @@ start_server() {
   CONNECT_SECRET_KEY="$SECRET_KEY" \
   ADMIN_API_KEY="$ADMIN_KEY" \
   LISTEN_ADDR="127.0.0.1:$API_PORT" \
+  METRICS_TOKEN="$METRICS_TOKEN" \
+  LAB_URL="http://127.0.0.1:$LAB_PORT" \
+  LAB_INSTANCE_ID="$LAB_INSTANCE" \
+  LAB_INSTANCE_SECRET="$LAB_SECRET" \
+  USAGE_FLUSH_INTERVAL_SECS=2 \
+  LAB_SEND_INTERVAL_SECS=1 \
+  CREDITS_CHECK_INTERVAL_SECS=2 \
+  CREDITS_CACHE_FRESH_SECS=1 \
+  CREDITS_CACHE_STALE_SECS=5 \
   RUST_LOG="${E2E_RUST_LOG:-info}" \
     "$BIN" >>"$WORK/server.log" 2>&1 &
   SERVER_PID=$!
@@ -166,6 +183,14 @@ SECRET_KEY=$(head -c 32 /dev/urandom | base64)
 wait_until "meilisearch" 60 curl -sf "http://127.0.0.1:$MEILI_PORT/health" || exit 2
 wait_until "state postgres" 60 docker exec "$PREFIX-state" pg_isready -U postgres -d connect || exit 2
 wait_until "origin postgres" 60 origin_sql "SELECT 1" || exit 2
+
+LAB_PORT=$(free_port)
+log "starting the fake Lab on :$LAB_PORT"
+python3 "$ROOT/scripts/fake_lab.py" "$LAB_PORT" "$LAB_INSTANCE" "$LAB_SECRET" "$WORK" \
+  >>"$WORK/fake_lab.log" 2>&1 &
+LAB_PID=$!
+disown "$LAB_PID" 2>/dev/null || true
+wait_until "fake Lab" 30 curl -s -o /dev/null "http://127.0.0.1:$LAB_PORT/" || exit 2
 
 log "seeding $ROWS rows into the origin"
 origin_sql "CREATE TABLE items (id int PRIMARY KEY, title text NOT NULL, price int NOT NULL)"
@@ -351,6 +376,214 @@ if [[ -n "$SYNC_ID" ]]; then
   scenario_delete
 fi
 
+# ------------------------------------------------------------------ metering, Lab, credits, metrics
+#
+# A tenant's sync (the admin key acting for the Lab account $TEAM) on its own
+# table: its units must be exactly what was synced, the same in /usage, in
+# the status and in the signed usage.recorded events the fake Lab received;
+# then the fake Lab says the team cannot spend, and the sync is held and
+# resumes with the credits.
+
+tapi() { # <method> <path> [json body], as the admin acting for $TEAM
+  local method="$1" path="$2" body="${3:-}"
+  local args=(-sS -X "$method" "http://127.0.0.1:$API_PORT$path"
+    -H "Authorization: Bearer $ADMIN_KEY" -H "X-Connect-Tenant-Id: $TEAM" -w '\n%{http_code}')
+  if [[ -n "$body" ]]; then
+    args+=(-H 'Content-Type: application/json' --data-binary "$body")
+  fi
+  curl "${args[@]}"
+}
+tapi_body() { tapi "$@" | sed '$d'; }
+tapi_code() { tapi "$@" | tail -n1; }
+tstatus() { tapi_body GET "/syncs/$1/status" | jq -r "$2"; }
+tphase_is() { [[ "$(tstatus "$1" .phase)" == "$2" ]]; }
+twait() { # <sync id> <jq filter> <expected> <seconds>
+  local deadline=$((SECONDS + $4))
+  while (( SECONDS < deadline )); do
+    [[ "$(tstatus "$1" "$2")" == "$3" ]] && return 0
+    sleep 1
+  done
+  return 1
+}
+
+metered_lines() { origin_sql "SELECT id || '|' || title FROM metered" | LC_ALL=C sort; }
+
+# Bytes of the NDJSON lines the sink sends for the matching rows: each
+# document as compact JSON with its id as a string and sorted keys (what
+# serde_json writes), plus one newline.
+line_bytes() {
+  origin_sql "SELECT coalesce(json_agg(json_build_object('id', id, 'title', title, 'price', price)), '[]') FROM metered WHERE $1" \
+    | python3 -c 'import json, sys
+rows = json.load(sys.stdin)
+print(sum(len(json.dumps({"id": str(r["id"]), "price": r["price"], "title": r["title"]},
+                         separators=(",", ":"), sort_keys=True, ensure_ascii=False).encode()) + 1
+          for r in rows))'
+}
+# Bytes of a delete-batch for ids <from>..<to>: each id as a JSON string
+# plus one separator.
+delete_bytes() { python3 -c "print(sum(len('\"%d\"' % i) + 1 for i in range($1, $2 + 1)))"; }
+
+# Sum of one unit over the Lab events of a sync.
+lab_units() { # <sync id> <unit>
+  [[ -f "$WORK/lab_events.jsonl" ]] || { echo 0; return; }
+  jq -s --arg id "$1" --arg u "$2" \
+    '[.[] | select(.data.job_id == $id) | .data.units[$u]] | add // 0' "$WORK/lab_events.jsonl"
+}
+
+METERED_ID=""
+scenario_metering() {
+  local name="metering: /usage, status and Lab events equal what was synced, by kind"
+  origin_sql "CREATE TABLE metered (id int PRIMARY KEY, title text NOT NULL, price int NOT NULL)"
+  origin_sql "INSERT INTO metered SELECT g, 'metered ' || g, g % 7 FROM generate_series(1, 300) g"
+  local snap_bytes; snap_bytes=$(line_bytes true)
+
+  local body resp code
+  body=$(jq -nc --argjson s "$SOURCE" --arg mu "http://127.0.0.1:$MEILI_PORT" --arg mk "$MEILI_KEY" \
+    '{name: "metered", source: $s, destination: {url: $mu, api_key: $mk},
+      streams: [{collection: "public.metered", index: "metered", fields: {include: ["id", "title", "price"]}}]}')
+  resp=$(tapi POST /syncs "$body"); code=$(tail -n1 <<<"$resp")
+  [[ "$code" == 201 ]] || { fail "$name" "create returned $code: $(sed '$d' <<<"$resp")"; return; }
+  METERED_ID=$(sed '$d' <<<"$resp" | jq -r .id)
+  wait_until "metered streaming" "$TIMEOUT" tphase_is "$METERED_ID" streaming \
+    || { fail "$name" "phase $(tstatus "$METERED_ID" .phase): $(tstatus "$METERED_ID" .message)"; return; }
+  converge "metered snapshot" metered_lines metered || { fail "$name" "snapshot did not converge"; return; }
+  local got
+  got=$(tstatus "$METERED_ID" '[.documents.documents_snapshot, .bytes] | map(tostring) | join("/")')
+  [[ "$got" == "300/$snap_bytes" ]] || { fail "$name" "after the first sync: snapshot, bytes = $got, expected 300, $snap_bytes"; return; }
+
+  # 50 inserts, 20 updates, 10 deletes, on distinct rows: 80 streamed.
+  origin_sql "INSERT INTO metered SELECT g, 'metered ' || g, 1 FROM generate_series(301, 350) g"
+  origin_sql "UPDATE metered SET title = title || ' v2' WHERE id BETWEEN 1 AND 20"
+  origin_sql "DELETE FROM metered WHERE id BETWEEN 21 AND 30"
+  local stream_bytes
+  stream_bytes=$(( $(line_bytes "id BETWEEN 301 AND 350") + $(line_bytes "id BETWEEN 1 AND 20") + $(delete_bytes 21 30) ))
+  converge "metered stream" metered_lines metered || { fail "$name" "stream did not converge"; return; }
+  twait "$METERED_ID" .documents.documents_streamed 80 30 \
+    || { fail "$name" "streamed = $(tstatus "$METERED_ID" .documents.documents_streamed), expected 80"; return; }
+
+  # A resync the user asks for is a snapshot (340 rows now).
+  local resync_bytes; resync_bytes=$(line_bytes true)
+  [[ "$(tapi_code POST "/syncs/$METERED_ID/resync")" == 200 ]] || { fail "$name" "resync refused"; return; }
+  twait "$METERED_ID" '[.documents.documents_snapshot, .resyncing, .phase] | map(tostring) | join("/")' 640/false/streaming "$TIMEOUT" \
+    || { fail "$name" "after the resync: $(tapi_body GET "/syncs/$METERED_ID/status" | jq -c '{documents, resyncing, phase}')"; return; }
+
+  # Paused: no more sync seconds accrue, so every unit can be compared.
+  [[ "$(tapi_code POST "/syncs/$METERED_ID/pause")" == 200 ]] || { fail "$name" "pause refused"; return; }
+  local expected_bytes=$((snap_bytes + stream_bytes + resync_bytes))
+  local usage totals
+  usage=$(tapi_body GET "/usage")
+  totals=$(jq -c .totals <<<"$usage")
+  if [[ "$(jq -r '[.documents_snapshot, .documents_streamed, .documents_resync, .bytes] | map(tostring) | join("/")' <<<"$totals")" \
+        != "640/80/0/$expected_bytes" ]]; then
+    fail "$name" "/usage totals $totals, expected snapshot 640 (300 + a user resync of 340), streamed 80, resync 0, bytes $expected_bytes"; return
+  fi
+  [[ "$(jq -r .source <<<"$usage")" == state ]] || { fail "$name" "/usage source $(jq -r .source <<<"$usage")"; return; }
+  [[ "$(jq -r '.sync_seconds > 0' <<<"$totals")" == true ]] || { fail "$name" "no sync seconds: $totals"; return; }
+  [[ "$(tstatus "$METERED_ID" .bytes)" == "$expected_bytes" ]] || { fail "$name" "status bytes $(tstatus "$METERED_ID" .bytes)"; return; }
+  local by_sync; by_sync=$(tapi_body GET "/usage?group_by=sync")
+  [[ "$(jq -c --arg id "$METERED_ID" '.rows | map(select(.sync_id == $id)) | .[0].units' <<<"$by_sync")" == "$totals" ]] \
+    || { fail "$name" "/usage?group_by=sync differs: $by_sync"; return; }
+  # The global scope's syncs are its own.
+  [[ "$(api_body GET /usage | jq -r .totals.documents_snapshot)" != 640 ]] || { fail "$name" "tenant usage leaked into the global scope"; return; }
+
+  # The signed events the fake Lab accepted add up to the same units.
+  local unit want deadline=$((SECONDS + 30)) ok=0
+  while (( SECONDS < deadline )); do
+    ok=1
+    for unit in documents_streamed documents_snapshot documents_resync bytes sync_seconds; do
+      want=$(jq -r --arg u "$unit" '.[$u]' <<<"$totals")
+      [[ "$(lab_units "$METERED_ID" "$unit")" == "$want" ]] || { ok=0; break; }
+    done
+    (( ok )) && break
+    sleep 1
+  done
+  if (( ! ok )); then
+    fail "$name" "Lab events sum to $(jq -s --arg id "$METERED_ID" '[.[] | select(.data.job_id == $id) | .data.units] | reduce .[] as $u ({}; . as $acc | $u | to_entries | reduce .[] as $e ($acc; .[$e.key] += $e.value))' "$WORK/lab_events.jsonl" 2>/dev/null), /usage says $totals"
+    return
+  fi
+  local shape
+  shape=$(jq -s -c --arg id "$METERED_ID" --arg team "$TEAM" \
+    '[.[] | select(.data.job_id == $id)] | all(.type == "usage.recorded" and .product == "connect"
+      and .account_id == $team and .api_key_id == null and .data.operation == "sync"
+      and .data.description == "postgres → metered" and (.data.units | keys | length) == 5)' \
+    "$WORK/lab_events.jsonl")
+  [[ "$shape" == true ]] || { fail "$name" "an event does not have the contract's shape: $(head -n1 "$WORK/lab_events.jsonl")"; return; }
+  # Global syncs are never sent to the Lab.
+  [[ "$(jq -s --arg team "$TEAM" '[.[] | select(.account_id != $team)] | length' "$WORK/lab_events.jsonl")" == 0 ]] \
+    || { fail "$name" "the Lab received usage of another scope"; return; }
+  [[ "$(tapi_code POST "/syncs/$METERED_ID/resume")" == 200 ]] || { fail "$name" "resume refused"; return; }
+  pass "$name ($expected_bytes bytes, $(jq -r .sync_seconds <<<"$totals") s, $(wc -l <"$WORK/lab_events.jsonl" | tr -d ' ') Lab events)"
+}
+
+scenario_credits() {
+  local name="out of credits: the team's syncs are held, then resume with the credits"
+  [[ -n "$METERED_ID" ]] || { fail "$name" "no metered sync"; return; }
+  wait_until "metered streaming" 30 tphase_is "$METERED_ID" streaming || { fail "$name" "not streaming"; return; }
+  echo false >"$WORK/can_spend"
+  twait "$METERED_ID" '[.phase, .message, .running] | map(tostring) | join("/")' held/out_of_credits/false 30 \
+    || { fail "$name" "status: $(tapi_body GET "/syncs/$METERED_ID/status" | jq -c '{phase, message, running}')"; return; }
+  # Nothing was torn down: the slot is still there.
+  [[ "$(origin_sql "SELECT count(*) FROM pg_replication_slots WHERE slot_name LIKE 'meili_connect%'")" -ge 1 ]] \
+    || { fail "$name" "the replication slot was dropped"; return; }
+  local resp; resp=$(tapi POST "/syncs/$METERED_ID/release")
+  if [[ "$(tail -n1 <<<"$resp")" != 402 ]] || [[ "$(sed '$d' <<<"$resp" | jq -r .code)" != out_of_credits ]]; then
+    fail "$name" "release answered $(tail -n1 <<<"$resp"): $(sed '$d' <<<"$resp")"; return
+  fi
+  # A new sync may be created; it starts held.
+  local body second
+  body=$(jq -nc --argjson s "$SOURCE" --arg mu "http://127.0.0.1:$MEILI_PORT" --arg mk "$MEILI_KEY" \
+    '{name: "metered2", source: $s, destination: {url: $mu, api_key: $mk},
+      streams: [{collection: "public.metered", index: "metered2", fields: {include: ["id", "title", "price"]}}]}')
+  resp=$(tapi POST /syncs "$body")
+  [[ "$(tail -n1 <<<"$resp")" == 201 ]] || { fail "$name" "create while out of credits: $(sed '$d' <<<"$resp")"; return; }
+  second=$(sed '$d' <<<"$resp" | jq -r .id)
+  [[ "$(tstatus "$second" '[.phase, .message] | map(tostring) | join("/")')" == "held/out_of_credits" ]] \
+    || { fail "$name" "the new sync is $(tstatus "$second" '[.phase, .message] | map(tostring) | join("/")')"; tapi DELETE "/syncs/$second?force=true" >/dev/null; return; }
+  # Changes made while held arrive once credits are back.
+  origin_sql "INSERT INTO metered VALUES (1000, 'while held', 1)"
+  echo true >"$WORK/can_spend"
+  local ok=1
+  for id in "$METERED_ID" "$second"; do
+    wait_until "resumed" 30 tphase_is "$id" streaming || { ok=0; fail "$name" "sync $id is $(tstatus "$id" .phase): $(tstatus "$id" .message)"; }
+  done
+  if (( ok )); then
+    converge "after the credits" metered_lines metered || { ok=0; fail "$name" "the resumed sync did not catch up"; }
+    converge "new sync after the credits" metered_lines metered2 || { ok=0; fail "$name" "the new sync did not snapshot"; }
+  fi
+  for id in "$METERED_ID" "$second"; do
+    [[ "$(tapi_code DELETE "/syncs/$id")" == 204 ]] || { ok=0; fail "$name" "delete $id failed"; }
+  done
+  (( ok )) && pass "$name"
+}
+
+scenario_metrics() {
+  local name="/metrics: only METRICS_TOKEN, every contract name declared"
+  local url="http://127.0.0.1:$API_PORT/metrics" code
+  code=$(curl -s -o /dev/null -w '%{http_code}' "$url")
+  [[ "$code" == 401 ]] || { fail "$name" "without a token: $code"; return; }
+  code=$(curl -s -o /dev/null -w '%{http_code}' "$url" -H "Authorization: Bearer $ADMIN_KEY")
+  [[ "$code" == 401 ]] || { fail "$name" "with the admin key: $code"; return; }
+  local text
+  text=$(curl -sS "$url" -H "Authorization: Bearer $METRICS_TOKEN" -w '\n%{http_code}')
+  [[ "$(tail -n1 <<<"$text")" == 200 ]] || { fail "$name" "with the metrics token: $(tail -n1 <<<"$text")"; return; }
+  text=$(sed '$d' <<<"$text")
+  local m absent=""
+  for m in connect_syncs connect_documents_total connect_bytes_total connect_batch_seconds \
+           connect_sink_errors_total connect_source_errors_total connect_lag_seconds \
+           connect_dead_letters_total connect_outbox_backlog connect_lab_events_sent_total; do
+    grep -Eq "^# TYPE $m " <<<"$text" || absent="$absent $m"
+  done
+  [[ -z "$absent" ]] || { fail "$name" "not declared:$absent"; return; }
+  grep -Eq '^connect_documents_total\{kind="snapshot"\} [1-9]' <<<"$text" || { fail "$name" "no snapshot documents counted"; return; }
+  grep -Eq '^connect_lab_events_sent_total\{result="accepted"\} [1-9]' <<<"$text" || { fail "$name" "no accepted Lab event counted"; return; }
+  grep -q "$TEAM" <<<"$text" && { fail "$name" "a tenant id in the metrics"; return; }
+  pass "$name"
+}
+
+scenario_metering
+scenario_credits
+scenario_metrics
+
 # ------------------------------------------------------------------ mongodb
 
 mongo_eval() { docker exec -i "$PREFIX-mongo" mongosh --quiet --eval "$1"; }
@@ -484,7 +717,7 @@ scenario_sigterm
 
 # ------------------------------------------------------------------ report
 
-if grep -q "$MEILI_KEY\|postgres:origin@" "$WORK/server.log" "$WORK/public.log" 2>/dev/null; then
+if grep -q "$MEILI_KEY\|postgres:origin@\|$LAB_SECRET\|$METRICS_TOKEN" "$WORK/server.log" "$WORK/public.log" 2>/dev/null; then
   fail "logs" "the server log contains a secret"
 else
   pass "logs: no secret in the server log"

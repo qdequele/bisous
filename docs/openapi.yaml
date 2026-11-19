@@ -44,6 +44,85 @@ paths:
                 properties:
                   status: { type: string, const: ok }
 
+  /metrics:
+    get:
+      summary: Prometheus metrics (operators)
+      description: |
+        Prometheus text format 0.0.4. Authenticated with
+        `Authorization: Bearer <METRICS_TOKEN>` only: the Lab and admin
+        tokens are refused. `404` when `METRICS_TOKEN` is unset. No label
+        carries a tenant or a sync id.
+
+        Names (a contract with the deploy box's dashboards and alert
+        rules): `connect_syncs{phase}` (gauge), `connect_documents_total{kind}`
+        (`streamed`, `snapshot`, `resync`), `connect_bytes_total`,
+        `connect_batch_seconds` (histogram, one observation per batch),
+        `connect_sink_errors_total{class}`,
+        `connect_source_errors_total{kind,class}`, `connect_lag_seconds`
+        (gauge histogram rebuilt at each scrape from every running sync's
+        lag), `connect_dead_letters_total`, `connect_outbox_backlog` (gauge),
+        `connect_lab_events_sent_total{result}` (`accepted`, `rejected`,
+        `failed`); also `connect_sync_seconds_total`,
+        `connect_tinybird_backlog`, `connect_tinybird_events_sent_total{result}`
+        and, on Linux, `process_*`.
+      security:
+        - metricsToken: []
+      responses:
+        "200":
+          description: The metrics.
+          content:
+            text/plain:
+              schema: { type: string }
+        "401": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+
+  /usage:
+    get:
+      summary: Metered usage of the caller's syncs
+      description: |
+        The units of `docs/LAB_INTEGRATION.md` ("Pricing") per UTC day
+        (`group_by=day`, the default) or per sync (`group_by=sync`) over
+        `from..=to` (default: the last 30 days; at most 366 days), with
+        their totals. Scoped to the caller's tenant (the global scope for
+        the admin key). Days and syncs without usage are absent.
+
+        Served from the Tinybird `connect_tenant_usage` pipe when
+        `TINYBIRD_URL` is set (falling back to the state database when it
+        cannot answer), else from the state database's progress table;
+        `source` says which. The shape is the same either way. The state
+        database counts a batch on the day it was applied; Tinybird on the
+        day it was flushed (at most `USAGE_FLUSH_INTERVAL_SECS` later). The
+        state database forgets a deleted sync's usage; Tinybird keeps it.
+      parameters:
+        - { $ref: "#/components/parameters/TenantId" }
+        - { name: from, in: query, schema: { type: string, format: date } }
+        - { name: to, in: query, schema: { type: string, format: date } }
+        - { name: group_by, in: query, schema: { type: string, enum: [day, sync], default: day } }
+      responses:
+        "200":
+          description: The usage.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  from: { type: string, format: date }
+                  to: { type: string, format: date }
+                  group_by: { type: string, enum: [day, sync] }
+                  source: { type: string, enum: [tinybird, state] }
+                  rows:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        day: { type: string, format: date, description: "With group_by=day." }
+                        sync_id: { type: string, description: "With group_by=sync." }
+                        name: { type: [string, "null"], description: "With group_by=sync: the sync's name, null once deleted." }
+                        units: { $ref: "#/components/schemas/Units" }
+                  totals: { $ref: "#/components/schemas/Units" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+
   /sources/check:
     post:
       summary: Pre-flight checks of a source
@@ -219,10 +298,11 @@ paths:
       - { $ref: "#/components/parameters/TenantId" }
     post:
       summary: Start a stopped sync again (paused, held or failed)
-      description: A no-op when the sync is running.
+      description: A no-op when the sync is running. `402 out_of_credits` while its team cannot spend (Lab mode).
       responses:
         "200": { $ref: "#/components/responses/Status" }
         "401": { $ref: "#/components/responses/Error" }
+        "402": { $ref: "#/components/responses/Error" }
         "404": { $ref: "#/components/responses/Error" }
 
   /syncs/{id}/resync:
@@ -233,10 +313,13 @@ paths:
       summary: Rebuild every index from a fresh snapshot
       description: |
         The snapshot goes into shadow indexes that are swapped in when
-        complete, so search keeps serving the old data meanwhile.
+        complete, so search keeps serving the old data meanwhile. Its
+        documents are metered as `documents_snapshot`. `402 out_of_credits`
+        while its team cannot spend (Lab mode).
       responses:
         "200": { $ref: "#/components/responses/Status" }
         "401": { $ref: "#/components/responses/Error" }
+        "402": { $ref: "#/components/responses/Error" }
         "404": { $ref: "#/components/responses/Error" }
 
   /syncs/{id}/release:
@@ -248,9 +331,13 @@ paths:
       description: |
         A `TRUNCATE` or a mass delete above `mass_delete_guard` holds the sync
         (phase `held`) instead of emptying the index. Releasing applies it.
+        A sync held with `out_of_credits` cannot be released: `402
+        out_of_credits` while its team cannot spend; it resumes by itself
+        once it can.
       responses:
         "200": { $ref: "#/components/responses/Status" }
         "401": { $ref: "#/components/responses/Error" }
+        "402": { $ref: "#/components/responses/Error" }
         "404": { $ref: "#/components/responses/Error" }
         "409": { $ref: "#/components/responses/Error" }
 
@@ -294,6 +381,11 @@ paths:
                         written: { type: integer }
                         deleted: { type: integer }
                         dead_letters_dropped: { type: integer }
+                        documents_streamed: { type: integer }
+                        documents_snapshot: { type: integer }
+                        documents_resync: { type: integer }
+                        bytes: { type: integer }
+                        sync_seconds: { type: integer }
                         rejected: { type: integer }
         "400": { $ref: "#/components/responses/Error" }
         "401": { $ref: "#/components/responses/Error" }
@@ -351,6 +443,10 @@ components:
       type: http
       scheme: bearer
       description: LAB_SERVICE_TOKEN (with X-Connect-Tenant-Id) or ADMIN_API_KEY.
+    metricsToken:
+      type: http
+      scheme: bearer
+      description: METRICS_TOKEN, for `GET /metrics` only.
 
   parameters:
     TenantId:
@@ -412,13 +508,27 @@ components:
             the request took longer than `REQUEST_TIMEOUT_SECS`; a change to
             a sync still completes), `secret_required` (422: a
             `"<redacted>"` placeholder for a secret
-            whose source or destination changed), `host_not_allowed` (422:
+            whose source or destination changed), `ambient_credentials` (422,
+            hosted server: a tenant's source would use the server's own
+            identity or files, e.g. DynamoDB `credentials: default`),
+            `out_of_credits` (402, Lab mode: the team cannot spend; its
+            syncs are held and resume by themselves), `host_not_allowed` (422:
             the host policy refuses the source or
             destination; the message names the host, never what it resolved
             to). For calls with the Lab token, source and Meilisearch errors
             carry a fixed description of their class, not the driver's
             text.
         message: { type: string }
+
+    Units:
+      type: object
+      description: The metered units (`docs/LAB_INTEGRATION.md`, "Pricing").
+      properties:
+        documents_streamed: { type: integer }
+        documents_snapshot: { type: integer }
+        documents_resync: { type: integer }
+        bytes: { type: integer }
+        sync_seconds: { type: integer }
 
     SyncPhase:
       type: string
@@ -449,6 +559,30 @@ components:
             holds `DEAD_LETTERS_MAX_PER_SYNC` of them already (they are
             counted in `progress.rejected`). Clear the dead letters to keep
             new ones.
+        documents:
+          type: object
+          description: The metered document units since the sync was created (`docs/LAB_INTEGRATION.md`, "Pricing"). Only documents Meilisearch accepted.
+          properties:
+            documents_streamed: { type: integer, description: "Writes and deletes applied from the change stream." }
+            documents_snapshot: { type: integer, description: "Written by a first sync or a resync the user asked for." }
+            documents_resync: { type: integer, description: "Rewritten by a resync the engine started (position lost); free." }
+        bytes: { type: integer, description: "Uncompressed payload bytes sent to Meilisearch for accepted documents." }
+        sync_seconds: { type: integer, description: "Seconds spent snapshotting or streaming." }
+        lag:
+          type: [object, "null"]
+          description: How far behind its origin the sync is, while streaming and when the source can tell; `null` otherwise.
+          properties:
+            seconds: { type: [number, "null"], description: "Age of the newest change seen, 0 once caught up (Postgres, MongoDB, Kafka, DynamoDB)." }
+            bytes: { type: [integer, "null"], description: "WAL the replication slot retains past the confirmed position (Postgres)." }
+            records: { type: integer, description: "Records not read yet (Kafka only; absent otherwise)." }
+        lag_warning:
+          type: [string, "null"]
+          description: |
+            Set when the sync is past `MAX_LAG_HOLD_BYTES` or
+            `MAX_LAG_HOLD_SECS` and has saved no checkpoint for 5 minutes.
+            Nothing is dropped automatically: releasing the origin's log
+            (slot, offsets) is an operator decision.
+        dead_letters: { type: integer, description: "Dead letters waiting (GET /syncs/{id}/dead-letters)." }
 
     SourceSpec:
       type: object

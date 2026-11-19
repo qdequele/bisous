@@ -3,18 +3,22 @@
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+pub mod ambient;
 pub mod api;
 pub mod auth;
 pub mod config;
+pub mod credits;
 pub mod error;
 pub mod guard;
 pub mod lab;
 pub mod limits;
 pub mod manager;
+pub mod metrics;
 pub mod redact;
 pub mod registry;
 pub mod routes;
 pub mod state;
+pub mod tinybird;
 pub mod usage;
 
 #[cfg(test)]
@@ -24,26 +28,31 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::routing::{get, post};
-use meili_connect_core::{HostPolicy, SourceFactory, StateStore, SyncPhase};
+use meili_connect_core::{HostPolicy, Secret, SourceFactory, StateStore, SyncPhase};
 use meili_connect_engine::SupervisorConfig;
-use meili_connect_store::{DeadLetterLimits, MemStore, PgStore, SecretKey};
+use meili_connect_store::{DeadLetterLimits, Lane, MemStore, PgStore, SecretKey, UsageLedger};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use crate::auth::AuthConfig;
 use crate::config::{Config, LogFormat};
+use crate::credits::CreditCache;
 use crate::limits::{Limits, ProbeSlots};
 use crate::manager::{ManagerDeps, SinkFactory, SyncManager, meili_sinks};
+use crate::metrics::Metrics;
 use crate::registry::SourceRegistry;
 use crate::state::{AppState, Backend};
-use crate::usage::{MeteredStore, UsageMeter};
+use crate::tinybird::{TinybirdConfig, TinybirdReader, TinybirdSender};
+use crate::usage::{MeteredStore, UsageEvents};
 
 /// The API. Every path is listed in [`routes::ROUTES`].
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(api::health))
+        .route("/metrics", get(metrics::metrics))
         .route("/sources/check", post(api::check_source))
         .route("/sources/discover", post(api::discover_source))
+        .route("/usage", get(api::usage))
         .route("/syncs", post(api::create_sync).get(api::list_syncs))
         .route(
             "/syncs/{id}",
@@ -79,6 +88,15 @@ pub struct Wiring {
     pub probe_timeout: std::time::Duration,
     pub lab_events: bool,
     pub limits: Limits,
+    /// Lab mode: hold the syncs of a team out of credits.
+    pub credits: Option<Arc<CreditCache>>,
+    /// `GET /metrics` answers 404 without it.
+    pub metrics_token: Option<Secret>,
+    pub lag_guard: crate::config::LagGuard,
+    /// Usage analytics: its own outbox lane, `GET /usage` from its pipe.
+    pub tinybird: Option<TinybirdConfig>,
+    /// Lab mode or `CONNECT_HOST_POLICY=public`.
+    pub hosted: bool,
 }
 
 /// Assemble the shared state around a backend. The engine gets the
@@ -88,10 +106,20 @@ pub fn build_state(
     wiring: Wiring,
     cancel: CancellationToken,
 ) -> AppState {
-    let meter = Arc::new(UsageMeter::new().with_backlog_cap(wiring.limits.outbox_max_pending));
+    let mut lanes = Vec::new();
+    if wiring.lab_events {
+        lanes.push(Lane::Lab);
+    }
+    if wiring.tinybird.is_some() {
+        lanes.push(Lane::Tinybird);
+    }
+    let usage =
+        Arc::new(UsageEvents::new(lanes).with_backlog_cap(wiring.limits.outbox_max_pending));
+    backend.set_usage_lanes(usage.lanes());
+    let metrics = Arc::new(Metrics::new());
     let engine_store: Arc<dyn StateStore> = Arc::new(MeteredStore::new(
         Arc::clone(&backend) as Arc<dyn StateStore>,
-        Arc::clone(&meter),
+        Arc::clone(&metrics),
     ));
     let manager = Arc::new(SyncManager::new(ManagerDeps {
         store: engine_store,
@@ -100,10 +128,12 @@ pub fn build_state(
         sinks: Arc::clone(&wiring.sinks),
         policy: Arc::clone(&wiring.policy),
         config: wiring.supervisor,
-        meter,
-        lab_events: wiring.lab_events,
+        usage,
         max_syncs_per_tenant: wiring.limits.max_syncs_per_tenant,
         stop_grace: wiring.limits.stop_grace,
+        credits: wiring.credits,
+        metrics: Arc::clone(&metrics),
+        hosted: wiring.hosted,
         cancel,
     }));
     AppState {
@@ -115,6 +145,20 @@ pub fn build_state(
         auth: wiring.auth,
         probe_timeout: wiring.probe_timeout,
         lab_events: wiring.lab_events,
+        metrics,
+        metrics_token: wiring.metrics_token,
+        lag_guard: wiring.lag_guard,
+        hosted: wiring.hosted,
+        usage_reader: match &wiring.tinybird {
+            Some(tb) => match TinybirdReader::new(tb.clone()) {
+                Ok(reader) => Some(Arc::new(reader)),
+                Err(e) => {
+                    warn!(error = %e, "cannot build the Tinybird client; GET /usage reads the state database");
+                    None
+                }
+            },
+            None => None,
+        },
         probes: Arc::new(ProbeSlots::new(
             wiring.limits.probe_concurrency,
             wiring.limits.probe_concurrency_per_tenant,
@@ -134,15 +178,21 @@ pub async fn boot_syncs(state: &AppState) -> Result<usize, meili_connect_store::
                 continue;
             }
         };
-        let phase = match state.state_store().load(&spec.id).await {
-            Ok(s) => s.map(|s| s.phase),
+        let saved = match state.state_store().load(&spec.id).await {
+            Ok(s) => s,
             Err(e) => {
                 warn!(sync_id = %spec.id, error = %e, "cannot read the sync state; starting it");
                 None
             }
         };
-        if phase == Some(SyncPhase::Paused) {
-            state.manager.register_idle(&spec);
+        let phase = saved.as_ref().map(|s| s.phase);
+        let credit_hold = saved.as_ref().is_some_and(|s| {
+            s.phase == SyncPhase::Held
+                && s.message.as_deref() == Some(crate::credits::OUT_OF_CREDITS)
+        });
+        if phase == Some(SyncPhase::Paused) || credit_hold {
+            // A sync held for credits resumes by itself with them.
+            state.manager.register_idle(&spec, saved.as_ref());
             continue;
         }
         let id = spec.id.clone();
@@ -245,6 +295,15 @@ pub async fn run() -> Result<(), String> {
     }
     info!(host_policy = policy.mode_name(), "host policy");
 
+    // Lab mode: a team out of credits has its syncs held.
+    let credits = match &config.lab_events {
+        Some(lab) => Some(Arc::new(
+            CreditCache::new(lab.clone())
+                .map_err(|e| format!("cannot build the Lab HTTP client: {e}"))?
+                .with_windows(config.credits_fresh, config.credits_stale),
+        )),
+        None => None,
+    };
     let cancel = CancellationToken::new();
     let state = build_state(
         Arc::clone(&backend),
@@ -257,6 +316,11 @@ pub async fn run() -> Result<(), String> {
             probe_timeout: config.source_probe_timeout,
             lab_events: config.lab_events.is_some(),
             limits: config.limits.clone(),
+            credits: credits.clone(),
+            metrics_token: config.metrics_token.clone(),
+            lag_guard: config.lag_guard,
+            tinybird: config.tinybird.clone(),
+            hosted: config.hosted(),
         },
         cancel.child_token(),
     );
@@ -268,17 +332,34 @@ pub async fn run() -> Result<(), String> {
 
     let background = CancellationToken::new();
     let mut tasks = Vec::new();
-    if let Some(lab) = &config.lab_events {
-        info!(lab_url = %lab.url, "usage events go to the Lab");
-        let outbox: Arc<dyn meili_connect_store::LabOutbox> = Arc::clone(&backend) as _;
+    if !state.manager.usage().lanes().is_empty() {
         tasks.push(tokio::spawn(lab::run_usage_flush(
-            Arc::clone(state.manager.meter()),
-            Arc::clone(&outbox),
+            Arc::clone(state.manager.usage()),
+            Arc::clone(&backend) as Arc<dyn UsageLedger>,
             config.usage_flush_interval,
             background.child_token(),
         )));
-        let sender = lab::LabSender::new(outbox, lab.clone())
-            .map_err(|e| format!("cannot build the Lab HTTP client: {e}"))?;
+    }
+    if credits.is_some() {
+        tasks.push(tokio::spawn(Arc::clone(&state.manager).run_credit_checks(
+            config.credits_check_interval,
+            background.child_token(),
+        )));
+    }
+    if let Some(tb) = &config.tinybird {
+        info!(tinybird_url = %tb.url, "usage rows go to Tinybird");
+        let sender = TinybirdSender::new(backend.outbox(Lane::Tinybird), tb.clone())
+            .map_err(|e| format!("cannot build the Tinybird HTTP client: {e}"))?
+            .with_metrics(Arc::clone(&state.metrics));
+        tasks.push(tokio::spawn(
+            sender.run(config.lab_send_interval, background.child_token()),
+        ));
+    }
+    if let Some(lab) = &config.lab_events {
+        info!(lab_url = %lab.url, "usage events go to the Lab");
+        let sender = lab::LabSender::new(backend.outbox(Lane::Lab), lab.clone())
+            .map_err(|e| format!("cannot build the Lab HTTP client: {e}"))?
+            .with_metrics(Arc::clone(&state.metrics));
         tasks.push(tokio::spawn(
             sender.run(config.lab_send_interval, background.child_token()),
         ));
@@ -297,11 +378,9 @@ pub async fn run() -> Result<(), String> {
 
     info!("stopping the syncs");
     state.manager.shutdown(config.shutdown_grace).await;
-    if config.lab_events.is_some() {
-        // Counts not enqueued yet would be lost: enqueue them now.
-        if let Err(e) = state.manager.meter().flush(state.outbox()).await {
-            warn!(error = %e, "cannot enqueue the last usage counts");
-        }
+    // Pending usage is durable; enqueue it now so it goes out sooner.
+    if let Err(e) = state.manager.usage().flush(&*backend).await {
+        warn!(error = %e, "cannot enqueue the last usage; it stays pending");
     }
     background.cancel();
     for t in tasks {

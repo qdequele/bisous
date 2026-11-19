@@ -7,7 +7,8 @@ use async_trait::async_trait;
 use futures::TryStreamExt as _;
 use meili_connect_core::{
     AckReceiver, Capabilities, Change, CheckReport, CheckStatus, CollectionInfo, EventSender,
-    FieldInfo, Op, Opened, Source, SourceError, SourceEvent, StreamMapping,
+    FieldInfo, Lag, LagReporter, Op, Opened, Source, SourceError, SourceEvent, StreamMapping,
+    seconds_since_unix_millis,
 };
 use mongodb::bson::{Bson, Document, doc};
 use mongodb::change_stream::ChangeStream;
@@ -51,6 +52,7 @@ pub struct MongoSource {
     /// access goes through `&mut self`).
     stream: std::sync::Mutex<Option<Held>>,
     idle_checkpoint: Duration,
+    lag: Option<LagReporter>,
 }
 
 impl std::fmt::Debug for MongoSource {
@@ -103,6 +105,7 @@ impl MongoSource {
             position: None,
             stream: std::sync::Mutex::new(None),
             idle_checkpoint: IDLE_CHECKPOINT,
+            lag: None,
         })
     }
 
@@ -702,6 +705,8 @@ impl Source for MongoSource {
                 };
 
             let Some(event) = event else {
+                // Nothing more to read right now: caught up.
+                report_lag(&self.lag, Some(0.0));
                 // The batch is exhausted: the post-batch resume token covers
                 // everything seen, including events filtered out by $match.
                 if let Some(t) = &token {
@@ -734,6 +739,7 @@ impl Source for MongoSource {
                 continue;
             };
 
+            report_lag(&self.lag, event_lag_seconds(&event));
             match map_event(&event, &self.names)? {
                 Mapped::Events(out) => {
                     for e in out {
@@ -825,12 +831,49 @@ impl Source for MongoSource {
         // A change stream leaves nothing behind on the server.
         Ok(())
     }
+
+    fn report_lag(&mut self, reporter: LagReporter) {
+        self.lag = Some(reporter);
+    }
+}
+
+/// `now − clusterTime` of a change event (its oplog time), in seconds.
+fn event_lag_seconds(event: &Document) -> Option<f64> {
+    let ts = event.get_timestamp("clusterTime").ok()?;
+    Some(seconds_since_unix_millis(i64::from(ts.time) * 1000))
+}
+
+fn report_lag(reporter: &Option<LagReporter>, seconds: Option<f64>) {
+    if let (Some(r), Some(seconds)) = (reporter, seconds) {
+        r.report(Lag {
+            seconds: Some(seconds),
+            bytes: None,
+            records: None,
+        });
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use mongodb::bson::oid::ObjectId;
+
+    #[test]
+    fn lag_is_the_age_of_the_event_cluster_time() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as u32)
+            .unwrap_or(0);
+        let event = doc! {
+            "clusterTime": mongodb::bson::Timestamp { time: now - 30, increment: 1 },
+        };
+        let s = event_lag_seconds(&event).unwrap_or(-1.0);
+        assert!((29.0..32.0).contains(&s), "{s}");
+        assert_eq!(event_lag_seconds(&doc! {}), None);
+        let (reporter, watch) = LagReporter::new();
+        report_lag(&Some(reporter), Some(0.0));
+        assert_eq!(watch.borrow().and_then(|l| l.seconds), Some(0.0));
+    }
 
     #[test]
     fn field_inference() {

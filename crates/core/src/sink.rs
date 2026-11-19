@@ -57,6 +57,12 @@ pub struct RejectedDoc {
 pub struct ApplyReport {
     pub written: u64,
     pub deleted: u64,
+    /// Uncompressed bytes of the payloads Meilisearch accepted: each
+    /// written or deleted document's wire form (NDJSON line or JSON id)
+    /// plus one separator byte, counted once however many times it was
+    /// sent (retries and bisection are not counted again). Rejected
+    /// documents are not counted. Metered as the `bytes` unit.
+    pub bytes: u64,
     /// Documents Meilisearch refused individually (found by bisecting a
     /// failed task). The engine sends them to the dead-letter queue and
     /// carries on; they do not fail the batch.

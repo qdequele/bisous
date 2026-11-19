@@ -18,10 +18,12 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use meili_connect_core::{
     AckReceiver, ApplyReport, Capabilities, CheckReport, Checkpoint, CollectionInfo, DocOp,
-    Endpoint, EventSender, HostPolicy, HostPolicyError, IndexTarget, Opened, Sink, SinkError,
-    Source, SourceError, SourceFactory, SourceSpec, StreamMapping,
+    Endpoint, EventSender, HostPolicy, HostPolicyError, IndexTarget, LagReporter, Opened, Sink,
+    SinkError, Source, SourceError, SourceFactory, SourceSpec, StreamMapping,
 };
 use tokio_util::sync::CancellationToken;
+
+use crate::metrics::Metrics;
 
 /// Why a source spec did not pass the policy.
 #[derive(Debug)]
@@ -121,6 +123,8 @@ pub struct GuardedSources {
     inner: Arc<dyn SourceFactory>,
     policy: Arc<HostPolicy>,
     coarse: bool,
+    metrics: Option<Arc<Metrics>>,
+    refuse_ambient: bool,
 }
 
 impl GuardedSources {
@@ -129,7 +133,23 @@ impl GuardedSources {
             inner,
             policy,
             coarse,
+            metrics: None,
+            refuse_ambient: false,
         }
+    }
+
+    /// Refuse, before any connection, a source that would use the
+    /// server's own identity or files (`crate::ambient`): a tenant's sync
+    /// on a hosted server, even one stored before the API refused it.
+    pub fn refusing_ambient_identity(mut self, refuse: bool) -> Self {
+        self.refuse_ambient = refuse;
+        self
+    }
+
+    /// Count the errors of the sources it builds (`connect_source_errors_total`).
+    pub fn with_metrics(mut self, metrics: Arc<Metrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 
     fn wrap(&self, inner: Box<dyn Source>, spec: &SourceSpec, vetted: bool) -> Box<dyn Source> {
@@ -140,6 +160,8 @@ impl GuardedSources {
             spec: spec.clone(),
             coarse: self.coarse,
             vetted,
+            metrics: self.metrics.clone(),
+            refuse_ambient: self.refuse_ambient,
         })
     }
 
@@ -181,10 +203,15 @@ struct GuardedSource {
     spec: SourceSpec,
     coarse: bool,
     vetted: bool,
+    metrics: Option<Arc<Metrics>>,
+    refuse_ambient: bool,
 }
 
 impl GuardedSource {
     fn surface(&self, e: SourceError) -> SourceError {
+        if let Some(m) = &self.metrics {
+            m.source_error(self.spec.kind.as_str(), &e);
+        }
         if self.coarse {
             coarse_source_error(e)
         } else {
@@ -193,6 +220,12 @@ impl GuardedSource {
     }
 
     async fn ensure_vetted(&mut self) -> Result<(), SourceError> {
+        if self.refuse_ambient
+            && let Some(why) = crate::ambient::ambient_identity(&self.spec)
+        {
+            // Held: the user must change the credentials.
+            return Err(SourceError::Config(why));
+        }
         if self.vetted {
             return Ok(());
         }
@@ -201,7 +234,13 @@ impl GuardedSource {
                 self.vetted = true;
                 Ok(())
             }
-            Err(VetError::Policy(e)) => Err(SourceError::Config(e.to_string())),
+            Err(VetError::Policy(e)) => {
+                let e = SourceError::Config(e.to_string());
+                if let Some(m) = &self.metrics {
+                    m.source_error(self.spec.kind.as_str(), &e);
+                }
+                Err(e)
+            }
             Err(VetError::Source(e)) => Err(self.surface(e)),
         }
     }
@@ -256,6 +295,10 @@ impl Source for GuardedSource {
         self.ensure_vetted().await?;
         let r = self.inner.teardown().await;
         r.map_err(|e| self.surface(e))
+    }
+
+    fn report_lag(&mut self, reporter: LagReporter) {
+        self.inner.report_lag(reporter);
     }
 }
 
