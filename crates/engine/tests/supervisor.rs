@@ -20,6 +20,7 @@ fn supervisor(h: &Harness) -> Supervisor {
         backoff_max: Duration::from_millis(40),
         healthy_after: Duration::from_secs(30),
         paused_retry: Duration::from_millis(30),
+        ..SupervisorConfig::default()
     };
     Supervisor::new(h.deps(), config, CancellationToken::new())
 }
@@ -299,4 +300,31 @@ async fn start_validates_the_spec() {
         Err(SupervisorError::Engine(EngineError::Spec(_)))
     ));
     assert!(s.sync_ids().is_empty());
+}
+
+#[tokio::test]
+async fn endless_position_loss_holds_the_sync() {
+    let h = Harness::new();
+    h.origin.seed(vec![upsert(1, json!({}))]);
+    {
+        let mut st = h.origin.state();
+        for _ in 0..50 {
+            st.stream_faults
+                .push_back((0, SourceError::PositionLost("slot invalidated".into())));
+        }
+    }
+    let s = supervisor(&h);
+    s.start(spec()).expect("start");
+    wait_status(&s, "held", |st| !st.running && st.phase == SyncPhase::Held).await;
+    let st = status(&s).await;
+    assert!(
+        st.message
+            .as_deref()
+            .is_some_and(|m| m.contains("retention")),
+        "{st:?}"
+    );
+    // The first snapshot, then three resyncs.
+    assert_eq!(h.origin.state().snapshots, 4);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(h.origin.state().snapshots, 4, "no further resync");
 }

@@ -15,7 +15,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::error::{EngineError, Reaction};
-use crate::sync::{SyncDeps, SyncOptions, run_sync};
+use crate::sync::{RunMonitor, SyncDeps, SyncOptions, run_sync_monitored};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SupervisorConfig {
@@ -30,6 +30,10 @@ pub struct SupervisorConfig {
     pub healthy_after: Duration,
     /// Retry interval while the source is paused.
     pub paused_retry: Duration,
+    /// Resyncs after a lost position allowed in a row before the sync is
+    /// held: the origin's retention is then shorter than a snapshot. A
+    /// resync stops counting once the sync streamed for `healthy_after`.
+    pub max_consecutive_resyncs: u32,
 }
 
 impl Default for SupervisorConfig {
@@ -40,6 +44,7 @@ impl Default for SupervisorConfig {
             backoff_max: Duration::from_secs(60),
             healthy_after: Duration::from_secs(120),
             paused_retry: Duration::from_secs(60),
+            max_consecutive_resyncs: 3,
         }
     }
 }
@@ -338,6 +343,8 @@ async fn supervise(
     options.resync = launch.resync;
     options.release_hold = launch.release_hold;
     let mut failures: u32 = 0;
+    // Shared by every attempt, so the resync budget spans them.
+    let monitor = RunMonitor::new(config.max_consecutive_resyncs, config.healthy_after);
     info!(%sync_id, "sync supervised");
 
     loop {
@@ -345,11 +352,12 @@ async fn supervise(
             break;
         }
         let started = Instant::now();
-        let result = run_sync(
+        let result = run_sync_monitored(
             spec.clone(),
             deps.clone(),
             options.clone(),
             cancel.child_token(),
+            &monitor,
         )
         .await;
         options.resync = false;
