@@ -12,13 +12,19 @@ use meili_connect_core::{Endpoint, HostPolicy, Secret};
 use thiserror::Error;
 
 use crate::limits::Limits;
+use crate::tinybird::TinybirdConfig;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 #[error("{0}")]
 pub struct ConfigError(pub String);
 
 /// Variables whose blank value is an error rather than "unset".
-const AUTH_VARS: &[&str] = &["ADMIN_API_KEY", "LAB_SERVICE_TOKEN", "METRICS_TOKEN"];
+const AUTH_VARS: &[&str] = &[
+    "ADMIN_API_KEY",
+    "LAB_SERVICE_TOKEN",
+    "METRICS_TOKEN",
+    "TINYBIRD_TOKEN",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogFormat {
@@ -57,6 +63,8 @@ pub struct Config {
     /// `ALLOW_OPEN_MODE=true`.
     pub open_mode: bool,
     pub lab_events: Option<LabEventsConfig>,
+    /// Usage analytics (`TINYBIRD_URL` + `TINYBIRD_TOKEN`).
+    pub tinybird: Option<TinybirdConfig>,
     pub log_format: LogFormat,
     /// `RUST_LOG` syntax; `LOG_LEVEL` is the simple form.
     pub log_filter: String,
@@ -190,6 +198,25 @@ impl Config {
             }
         };
 
+        let tinybird = match (get("TINYBIRD_URL"), get("TINYBIRD_TOKEN")) {
+            (None, None) => None,
+            (Some(url), Some(token)) => {
+                let url = url.trim().trim_end_matches('/').to_owned();
+                if !(url.starts_with("http://") || url.starts_with("https://")) {
+                    return Err(ConfigError("TINYBIRD_URL must be an http(s) URL".into()));
+                }
+                Some(TinybirdConfig {
+                    url,
+                    token: Secret::new(token.trim()),
+                })
+            }
+            _ => {
+                return Err(ConfigError(
+                    "TINYBIRD_URL and TINYBIRD_TOKEN go together: set both or neither".into(),
+                ));
+            }
+        };
+
         let log_format = match get("LOG_FORMAT").as_deref() {
             None | Some("pretty") | Some("text") => LogFormat::Pretty,
             Some("json") => LogFormat::Json,
@@ -263,6 +290,7 @@ impl Config {
             open_mode,
             host_policy,
             lab_events,
+            tinybird,
             log_format,
             log_filter,
             usage_flush_interval: secs(&get, "USAGE_FLUSH_INTERVAL_SECS", 60, 1, 3600)?,
@@ -476,6 +504,31 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn tinybird_variables_go_together() {
+        let cfg = |pairs: &[(&str, &str)]| {
+            let mut all = pairs.to_vec();
+            all.push(("ADMIN_API_KEY", "k"));
+            cfg(&all)
+        };
+        assert!(cfg(&[]).unwrap().tinybird.is_none());
+        assert!(cfg(&[("TINYBIRD_URL", "https://api.tinybird.co")]).is_err());
+        assert!(cfg(&[("TINYBIRD_TOKEN", "t")]).is_err());
+        assert!(cfg(&[("TINYBIRD_URL", "ftp://x"), ("TINYBIRD_TOKEN", "t")]).is_err());
+        let tb = cfg(&[
+            ("TINYBIRD_URL", "https://api.eu-central-1.aws.tinybird.co/"),
+            ("TINYBIRD_TOKEN", "p.tok-hunter2"),
+        ])
+        .unwrap()
+        .tinybird
+        .unwrap();
+        assert_eq!(
+            tb.events_url(),
+            "https://api.eu-central-1.aws.tinybird.co/v0/events?name=connect_usage&wait=true"
+        );
+        assert!(!format!("{tb:?}").contains("hunter2"));
     }
 
     #[test]

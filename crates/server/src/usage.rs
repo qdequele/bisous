@@ -434,6 +434,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_full_lab_lane_does_not_hold_tinybird_back() {
+        let store = MemStore::new();
+        let events = UsageEvents::new(vec![Lane::Lab, Lane::Tinybird]).with_backlog_cap(1);
+        store.set_usage_lanes(events.lanes());
+        let s = spec("s1", Some("t"));
+        store.create_sync(Some("t"), &s).await.unwrap();
+        // The Lab is down: its lane is full.
+        store.enqueue_event(Some("t"), &json!({})).await.unwrap();
+        store
+            .record_progress("s1", &progress(5, 0, 0, 0))
+            .await
+            .unwrap();
+        assert_eq!(events.flush(&store).await.unwrap(), 1, "Tinybird's only");
+        assert_eq!(store.pending_usage(Lane::Lab).await.unwrap().len(), 1);
+        assert_eq!(
+            store.outbox(Lane::Tinybird).count_unsent().await.unwrap(),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn a_full_lane_keeps_the_usage_pending() {
         let store = MemStore::new();
         let events = UsageEvents::new(vec![Lane::Lab]).with_backlog_cap(2);

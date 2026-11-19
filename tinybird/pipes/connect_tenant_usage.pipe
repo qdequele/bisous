@@ -1,0 +1,38 @@
+#
+# connect_tenant_usage — one tenant's usage per day and per sync, over a
+# closed date range. Read by meili-connect's GET /usage (which groups the
+# rows by day or by sync) with TINYBIRD_TOKEN.
+#
+# Reads the raw table with FINAL so a redelivered row is counted once (the
+# daily materialized view does not deduplicate). The column names of the
+# answer are the unit names of the contract: never rename them.
+#
+
+TOKEN "connect_engine" READ
+
+NODE connect_tenant_usage_rows
+DESCRIPTION >
+    Usage of one tenant per UTC day and sync, deduplicated by event_id.
+
+SQL >
+    %
+    SELECT
+        toDate(u.occurred_at) AS day,
+        u.sync_id AS sync_id,
+        sum(u.documents_streamed) AS documents_streamed,
+        sum(u.documents_snapshot) AS documents_snapshot,
+        sum(u.documents_resync) AS documents_resync,
+        sum(u.bytes) AS bytes,
+        sum(u.sync_seconds) AS sync_seconds
+    FROM (
+        SELECT *
+        FROM connect_usage FINAL
+        WHERE
+            tenant_id = {{ String(tenant_id, '', description="Lab account id; empty for the global scope") }}
+            AND toDate(occurred_at) >= {{ Date(date_from, required=True, description="First UTC day, inclusive (YYYY-MM-DD)") }}
+            AND toDate(occurred_at) <= {{ Date(date_to, required=True, description="Last UTC day, inclusive (YYYY-MM-DD)") }}
+    ) AS u
+    GROUP BY day, sync_id
+    ORDER BY day ASC, sync_id ASC
+
+TYPE ENDPOINT

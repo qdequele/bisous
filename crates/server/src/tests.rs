@@ -317,6 +317,7 @@ fn app_tweaked(
         credits: None,
         metrics_token: Some(METRICS.into()),
         lag_guard: Default::default(),
+        tinybird: None,
         limits,
     };
     tweak(&mut wiring);
@@ -1046,6 +1047,7 @@ async fn a_loopback_destination_is_host_not_allowed_with_the_real_sinks() {
             credits: None,
             metrics_token: Some(METRICS.into()),
             lag_guard: Default::default(),
+            tinybird: None,
             limits: Limits::default(),
         },
         CancellationToken::new(),

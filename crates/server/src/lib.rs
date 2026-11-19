@@ -17,6 +17,7 @@ pub mod redact;
 pub mod registry;
 pub mod routes;
 pub mod state;
+pub mod tinybird;
 pub mod usage;
 
 #[cfg(test)]
@@ -40,6 +41,7 @@ use crate::manager::{ManagerDeps, SinkFactory, SyncManager, meili_sinks};
 use crate::metrics::Metrics;
 use crate::registry::SourceRegistry;
 use crate::state::{AppState, Backend};
+use crate::tinybird::{TinybirdConfig, TinybirdSender};
 use crate::usage::{MeteredStore, UsageEvents};
 
 /// The API. Every path is listed in [`routes::ROUTES`].
@@ -89,6 +91,8 @@ pub struct Wiring {
     /// `GET /metrics` answers 404 without it.
     pub metrics_token: Option<Secret>,
     pub lag_guard: crate::config::LagGuard,
+    /// Usage analytics: its own outbox lane, `GET /usage` from its pipe.
+    pub tinybird: Option<TinybirdConfig>,
 }
 
 /// Assemble the shared state around a backend. The engine gets the
@@ -101,6 +105,9 @@ pub fn build_state(
     let mut lanes = Vec::new();
     if wiring.lab_events {
         lanes.push(Lane::Lab);
+    }
+    if wiring.tinybird.is_some() {
+        lanes.push(Lane::Tinybird);
     }
     let usage =
         Arc::new(UsageEvents::new(lanes).with_backlog_cap(wiring.limits.outbox_max_pending));
@@ -296,6 +303,7 @@ pub async fn run() -> Result<(), String> {
             credits: credits.clone(),
             metrics_token: config.metrics_token.clone(),
             lag_guard: config.lag_guard,
+            tinybird: config.tinybird.clone(),
         },
         cancel.child_token(),
     );
@@ -320,6 +328,15 @@ pub async fn run() -> Result<(), String> {
             config.credits_check_interval,
             background.child_token(),
         )));
+    }
+    if let Some(tb) = &config.tinybird {
+        info!(tinybird_url = %tb.url, "usage rows go to Tinybird");
+        let sender = TinybirdSender::new(backend.outbox(Lane::Tinybird), tb.clone())
+            .map_err(|e| format!("cannot build the Tinybird HTTP client: {e}"))?
+            .with_metrics(Arc::clone(&state.metrics));
+        tasks.push(tokio::spawn(
+            sender.run(config.lab_send_interval, background.child_token()),
+        ));
     }
     if let Some(lab) = &config.lab_events {
         info!(lab_url = %lab.url, "usage events go to the Lab");

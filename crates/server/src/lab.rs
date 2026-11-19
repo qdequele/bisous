@@ -107,7 +107,7 @@ pub struct LabSender {
     metrics: Option<Arc<Metrics>>,
 }
 
-async fn read_capped(mut resp: reqwest::Response, cap: usize) -> Option<Vec<u8>> {
+pub(crate) async fn read_capped(mut resp: reqwest::Response, cap: usize) -> Option<Vec<u8>> {
     if resp.content_length().is_some_and(|n| n > cap as u64) {
         return None;
     }
