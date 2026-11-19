@@ -8,7 +8,7 @@ use std::time::Duration;
 use common::*;
 use meili_connect_core::{SinkError, SourceError, SyncPhase};
 use meili_connect_engine::{
-    EngineError, Supervisor, SupervisorConfig, SupervisorError, SyncStatus,
+    EngineError, Supervisor, SupervisorConfig, SupervisorError, SyncStatus, shadow_index_uid,
 };
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
@@ -62,7 +62,7 @@ async fn transient_errors_are_retried_with_backoff() {
         }
     }
     let s = supervisor(&h);
-    s.start(spec()).expect("start");
+    s.start(spec()).await.expect("start");
     wait_status(&s, "streaming", streaming).await;
     let st = status(&s).await;
     assert_eq!(st.consecutive_failures, 3);
@@ -88,7 +88,7 @@ async fn a_sink_transient_error_is_retried() {
         .apply_faults
         .push_back(SinkError::Transient("429".into()));
     let s = supervisor(&h);
-    s.start(spec()).expect("start");
+    s.start(spec()).await.expect("start");
     wait_status(&s, "streaming", streaming).await;
     assert_eq!(h.sink.docs(INDEX).len(), 1);
     assert_eq!(status(&s).await.consecutive_failures, 1);
@@ -103,7 +103,7 @@ async fn a_paused_source_is_retried_slowly() {
         .open_faults
         .push_back(SourceError::Paused("project paused".into()));
     let s = supervisor(&h);
-    s.start(spec()).expect("start");
+    s.start(spec()).await.expect("start");
     wait_status(&s, "streaming", streaming).await;
     let history = h.store.inner().history.clone();
     let paused = history
@@ -127,7 +127,7 @@ async fn a_config_error_holds_the_sync() {
         .open_faults
         .push_back(SourceError::Config("password authentication failed".into()));
     let s = supervisor(&h);
-    s.start(spec()).expect("start");
+    s.start(spec()).await.expect("start");
     wait_status(&s, "held", |st| !st.running && st.phase == SyncPhase::Held).await;
     assert!(
         status(&s)
@@ -148,7 +148,7 @@ async fn a_sink_config_error_holds_the_sync() {
         .apply_faults
         .push_back(SinkError::Config("invalid API key".into()));
     let s = supervisor(&h);
-    s.start(spec()).expect("start");
+    s.start(spec()).await.expect("start");
     wait_status(&s, "held", |st| !st.running && st.phase == SyncPhase::Held).await;
 }
 
@@ -160,7 +160,7 @@ async fn a_fatal_error_fails_the_sync() {
         .open_faults
         .push_back(SourceError::Fatal("unsupported column type".into()));
     let s = supervisor(&h);
-    s.start(spec()).expect("start");
+    s.start(spec()).await.expect("start");
     wait_status(&s, "failed", |st| {
         !st.running && st.phase == SyncPhase::Failed
     })
@@ -169,7 +169,7 @@ async fn a_fatal_error_fails_the_sync() {
     assert_eq!(h.origin.state().opens.len(), 1, "no retry");
 
     // A failed sync can be started again by the user.
-    s.start(spec()).expect("start again");
+    s.start(spec()).await.expect("start again");
     wait_status(&s, "streaming", streaming).await;
     s.shutdown().await;
 }
@@ -179,7 +179,7 @@ async fn position_lost_is_resynced() {
     let h = Harness::new();
     h.origin.seed(vec![upsert(1, json!({}))]);
     let s = supervisor(&h);
-    s.start(spec()).expect("start");
+    s.start(spec()).await.expect("start");
     wait_status(&s, "streaming", streaming).await;
     s.stop(SYNC_ID).await.expect("stop");
     h.origin.state().min_resume = 1_000;
@@ -194,10 +194,10 @@ async fn position_lost_is_resynced() {
 async fn stop_pauses_and_restart_resumes() {
     let h = Harness::new();
     let s = supervisor(&h);
-    s.start(spec()).expect("start");
+    s.start(spec()).await.expect("start");
     wait_status(&s, "streaming", streaming).await;
     assert!(matches!(
-        s.start(spec()),
+        s.start(spec()).await,
         Err(SupervisorError::AlreadyRunning(_))
     ));
 
@@ -223,7 +223,7 @@ async fn resync_command_rebuilds_through_a_shadow() {
     h.origin
         .seed(vec![upsert(1, json!({})), upsert(2, json!({}))]);
     let s = supervisor(&h);
-    s.start(spec()).expect("start");
+    s.start(spec()).await.expect("start");
     wait_status(&s, "streaming", streaming).await;
     wait_for("2 docs", 5, || h.sink.docs(INDEX).len() == 2).await;
 
@@ -246,7 +246,7 @@ async fn release_lets_a_held_truncate_through() {
     h.origin
         .seed(vec![upsert(1, json!({})), upsert(2, json!({}))]);
     let s = supervisor(&h);
-    s.start(spec()).expect("start");
+    s.start(spec()).await.expect("start");
     wait_status(&s, "streaming", streaming).await;
     wait_for("2 docs", 5, || h.sink.docs(INDEX).len() == 2).await;
 
@@ -270,7 +270,7 @@ async fn unknown_syncs_and_removal() {
     ));
     assert!(s.status("nope").await.expect("status").is_none());
 
-    s.start(spec()).expect("start");
+    s.start(spec()).await.expect("start");
     wait_status(&s, "streaming", streaming).await;
     assert_eq!(s.sync_ids(), vec![SYNC_ID.to_owned()]);
     s.remove(SYNC_ID).await.expect("remove");
@@ -284,7 +284,7 @@ async fn shutdown_refuses_new_syncs() {
     let s = supervisor(&h);
     s.shutdown().await;
     assert!(matches!(
-        s.start(spec()),
+        s.start(spec()).await,
         Err(SupervisorError::ShuttingDown)
     ));
 }
@@ -296,7 +296,7 @@ async fn start_validates_the_spec() {
     let mut bad = spec();
     bad.streams[0].index = "not a uid".into();
     assert!(matches!(
-        s.start(bad),
+        s.start(bad).await,
         Err(SupervisorError::Engine(EngineError::Spec(_)))
     ));
     assert!(s.sync_ids().is_empty());
@@ -314,7 +314,7 @@ async fn endless_position_loss_holds_the_sync() {
         }
     }
     let s = supervisor(&h);
-    s.start(spec()).expect("start");
+    s.start(spec()).await.expect("start");
     wait_status(&s, "held", |st| !st.running && st.phase == SyncPhase::Held).await;
     let st = status(&s).await;
     assert!(
@@ -343,7 +343,7 @@ async fn a_batch_that_keeps_failing_transiently_holds_the_sync() {
     h.origin.seed(vec![upsert(1, json!({}))]);
     sink_faults(&h, 50);
     let s = supervisor(&h);
-    s.start(spec()).expect("start");
+    s.start(spec()).await.expect("start");
     wait_status(&s, "held", |st| !st.running && st.phase == SyncPhase::Held).await;
     let st = status(&s).await;
     assert!(
@@ -362,7 +362,7 @@ async fn progress_resets_the_transient_sink_count() {
     h.origin.seed(vec![upsert(1, json!({}))]);
     sink_faults(&h, 9);
     let s = supervisor(&h);
-    s.start(spec()).expect("start");
+    s.start(spec()).await.expect("start");
     wait_status(&s, "streaming", streaming).await;
     wait_for("doc 1", 5, || h.sink.docs(INDEX).len() == 1).await;
 
@@ -374,12 +374,51 @@ async fn progress_resets_the_transient_sink_count() {
 }
 
 #[tokio::test]
+async fn remove_deletes_leftover_shadows_and_tears_the_source_down() {
+    let h = Harness::new();
+    let s = supervisor(&h);
+    s.start(spec()).await.expect("start");
+    wait_status(&s, "streaming", streaming).await;
+    let shadow = shadow_index_uid(INDEX, SYNC_ID);
+    // Left behind by a crashed resync.
+    h.sink.create(&shadow, json!({}), vec![]);
+    h.sink.create("unrelated", json!({}), vec![]);
+
+    s.remove(SYNC_ID).await.expect("remove");
+    let indexes = h.sink.state().indexes.keys().cloned().collect::<Vec<_>>();
+    assert_eq!(indexes, vec![INDEX.to_owned(), "unrelated".to_owned()]);
+    assert_eq!(h.origin.state().teardowns, 1);
+    assert!(s.sync_ids().is_empty());
+}
+
+#[tokio::test]
+async fn a_stop_racing_a_restart_wins_when_issued_last() {
+    let h = Harness::new();
+    let s = supervisor(&h);
+    s.start(spec()).await.expect("start");
+    wait_status(&s, "streaming", streaming).await;
+
+    let (restarted, stopped) = tokio::join!(s.restart(SYNC_ID), s.stop(SYNC_ID));
+    restarted.expect("restart");
+    stopped.expect("stop");
+    let st = status(&s).await;
+    assert!(!st.running, "{st:?}");
+    assert_eq!(st.phase, SyncPhase::Paused);
+
+    let (stopped, restarted) = tokio::join!(s.stop(SYNC_ID), s.restart(SYNC_ID));
+    stopped.expect("stop");
+    restarted.expect("restart");
+    wait_status(&s, "streaming", streaming).await;
+    s.shutdown().await;
+}
+
+#[tokio::test]
 async fn a_release_survives_a_run_that_failed_before_applying_it() {
     let h = Harness::new();
     h.origin
         .seed(vec![upsert(1, json!({})), upsert(2, json!({}))]);
     let s = supervisor(&h);
-    s.start(spec()).expect("start");
+    s.start(spec()).await.expect("start");
     wait_status(&s, "streaming", streaming).await;
     wait_for("2 docs", 5, || h.sink.docs(INDEX).len() == 2).await;
     h.origin.truncate(COLLECTION);
@@ -402,7 +441,7 @@ async fn a_resync_survives_a_run_that_failed_before_starting_it() {
     h.origin
         .seed(vec![upsert(1, json!({})), upsert(2, json!({}))]);
     let s = supervisor(&h);
-    s.start(spec()).expect("start");
+    s.start(spec()).await.expect("start");
     wait_status(&s, "streaming", streaming).await;
     wait_for("2 docs", 5, || h.sink.docs(INDEX).len() == 2).await;
 

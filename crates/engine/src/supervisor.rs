@@ -9,13 +9,14 @@ use std::time::Duration;
 use chrono::Utc;
 use meili_connect_core::{Checkpoint, SinkError, StoreError, SyncPhase, SyncSpec, SyncState};
 use thiserror::Error;
+use tokio::sync::OwnedMutexGuard;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::error::{EngineError, Reaction};
-use crate::sync::{RunMonitor, SyncDeps, SyncOptions, run_sync_monitored};
+use crate::sync::{RunMonitor, SyncDeps, SyncOptions, run_sync_monitored, shadow_index_uid};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SupervisorConfig {
@@ -110,6 +111,10 @@ pub struct Supervisor {
     config: SupervisorConfig,
     cancel: CancellationToken,
     syncs: Mutex<HashMap<String, Entry>>,
+    /// One lock per sync, held for the whole of `start`, `stop`, `remove`
+    /// and the relaunches, so concurrent calls on one sync run one after
+    /// the other, in the order they were issued (tokio's mutex is fair).
+    ops: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -125,29 +130,63 @@ impl Supervisor {
             config,
             cancel,
             syncs: Mutex::new(HashMap::new()),
+            ops: Mutex::new(HashMap::new()),
         }
+    }
+
+    async fn serialize(&self, sync_id: &str) -> OwnedMutexGuard<()> {
+        let op = Arc::clone(lock(&self.ops).entry(sync_id.to_owned()).or_default());
+        op.lock_owned().await
     }
 
     /// Starts supervising a sync. Fails if it is already running; a sync
     /// that stopped (held, failed, user-stopped) is started again with the
     /// new spec.
-    pub fn start(&self, spec: SyncSpec) -> Result<(), SupervisorError> {
+    pub async fn start(&self, spec: SyncSpec) -> Result<(), SupervisorError> {
         spec.validate().map_err(EngineError::Spec)?;
+        let _op = self.serialize(&spec.id).await;
         self.launch(spec, Launch::default())
     }
 
     /// Stops a sync and marks it `Paused` (stopped by the user). It stays
     /// known: `restart`, `resync` and `release` start it again.
     pub async fn stop(&self, sync_id: &str) -> Result<(), SupervisorError> {
+        let _op = self.serialize(sync_id).await;
         self.halt(sync_id).await?;
         persist_phase(&*self.deps.store, sync_id, SyncPhase::Paused, None).await?;
         Ok(())
     }
 
-    /// Stops a sync (if running) and forgets it, without touching its state.
+    /// Stops a sync (if running), deletes the shadow indexes a crashed
+    /// resync may have left (best effort), tears the source down on the
+    /// origin (replication slot, publication, consumer group) and forgets
+    /// the sync. Its saved state is left alone. When the teardown fails the
+    /// sync stays known (stopped), so the call can be retried.
     pub async fn remove(&self, sync_id: &str) -> Result<(), SupervisorError> {
-        self.halt(sync_id).await?;
+        let _op = self.serialize(sync_id).await;
+        let spec = self.halt(sync_id).await?;
+        for stream in &spec.streams {
+            let shadow = shadow_index_uid(&stream.index, &spec.id);
+            let deleted = tokio::select! {
+                _ = self.cancel.cancelled() => return Err(SupervisorError::ShuttingDown),
+                r = self.deps.sink.delete_index(&shadow) => r,
+            };
+            if let Err(e) = deleted {
+                warn!(sync_id, index = %shadow, error = %e, "could not delete a shadow index");
+            }
+        }
+        let mut source = self
+            .deps
+            .sources
+            .build(&spec.id, &spec.source, &spec.streams)
+            .map_err(EngineError::from)?;
+        let torn_down = tokio::select! {
+            _ = self.cancel.cancelled() => return Err(SupervisorError::ShuttingDown),
+            r = source.teardown() => r,
+        };
+        torn_down.map_err(EngineError::from)?;
         lock(&self.syncs).remove(sync_id);
+        info!(sync_id, "sync removed");
         Ok(())
     }
 
@@ -257,6 +296,7 @@ impl Supervisor {
     }
 
     async fn relaunch(&self, sync_id: &str, launch: Launch) -> Result<(), SupervisorError> {
+        let _op = self.serialize(sync_id).await;
         let spec = self.halt(sync_id).await?;
         self.launch(spec, launch)
     }
