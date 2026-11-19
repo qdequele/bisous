@@ -2445,3 +2445,194 @@ async fn metrics_take_only_the_metrics_token() {
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
 }
+
+// ------------------------------------------------------------- GET /usage
+
+async fn snapshot_done(a: &App, headers: &[(&'static str, String)], id: &str) {
+    wait_for(async || {
+        call(
+            &a.router,
+            "GET",
+            &format!("/syncs/{id}/status"),
+            headers,
+            None,
+        )
+        .await
+        .1["documents"]["documents_snapshot"]
+            == 3
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn usage_is_per_day_or_per_sync_and_scoped_to_the_tenant() {
+    let a = app(locked());
+    let s1 = create(&a, &lab("team-a"), "first").await;
+    let s2 = create(&a, &lab("team-a"), "second").await;
+    let other = create(&a, &lab("team-b"), "theirs").await;
+    for id in [&s1, &s2] {
+        snapshot_done(&a, &lab("team-a"), id).await;
+    }
+    snapshot_done(&a, &lab("team-b"), &other).await;
+    let today = chrono::Utc::now().date_naive();
+
+    let (status, body) = call(&a.router, "GET", "/usage", &lab("team-a"), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["source"], "state");
+    assert_eq!(body["group_by"], "day");
+    let units = json!({
+        "documents_streamed": 0,
+        "documents_snapshot": 6,
+        "documents_resync": 0,
+        "bytes": 6 * FAKE_BYTES_PER_DOC,
+        "sync_seconds": body["totals"]["sync_seconds"],
+    });
+    assert_eq!(body["totals"], units);
+    assert_eq!(
+        body["rows"],
+        json!([{ "day": today.to_string(), "units": units }])
+    );
+
+    let (_, by_sync) = call(
+        &a.router,
+        "GET",
+        &format!("/usage?group_by=sync&from={today}&to={today}"),
+        &lab("team-a"),
+        None,
+    )
+    .await;
+    let rows = by_sync["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 2, "{by_sync}");
+    let mut seen: Vec<(String, String, u64)> = rows
+        .iter()
+        .map(|r| {
+            (
+                r["sync_id"].as_str().unwrap().to_owned(),
+                r["name"].as_str().unwrap().to_owned(),
+                r["units"]["documents_snapshot"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    seen.sort();
+    let mut expected = vec![(s1, "first".to_owned(), 3), (s2, "second".to_owned(), 3)];
+    expected.sort();
+    assert_eq!(seen, expected);
+    assert_eq!(by_sync["totals"]["documents_snapshot"], 6);
+
+    // Another tenant sees its own only.
+    let (_, theirs) = call(&a.router, "GET", "/usage", &lab("team-b"), None).await;
+    assert_eq!(theirs["totals"]["documents_snapshot"], 3);
+    // A range without activity is empty, with zero totals.
+    let (_, empty) = call(
+        &a.router,
+        "GET",
+        "/usage?from=2020-01-01&to=2020-01-31",
+        &lab("team-a"),
+        None,
+    )
+    .await;
+    assert_eq!(empty["rows"], json!([]));
+    assert_eq!(empty["totals"]["documents_snapshot"], 0);
+}
+
+#[tokio::test]
+async fn usage_validates_its_range() {
+    let a = app(locked());
+    for query in [
+        "from=2026-02-01&to=2026-01-01",
+        "from=2025-01-01&to=2026-01-02",
+        "group_by=week",
+        "from=yesterday",
+    ] {
+        let (status, body) = call(
+            &a.router,
+            "GET",
+            &format!("/usage?{query}"),
+            &lab("team-a"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{query}: {body}");
+        assert_eq!(body["code"], "invalid_request");
+    }
+    // Exactly 366 days is allowed.
+    let (status, _) = call(
+        &a.router,
+        "GET",
+        "/usage?from=2025-01-01&to=2026-01-01",
+        &lab("team-a"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn usage_comes_from_tinybird_when_configured_with_the_same_shape() {
+    use wiremock::matchers::{method, path, query_param};
+    let tb = wiremock::MockServer::start().await;
+    wiremock::Mock::given(method("GET"))
+        .and(path("/v0/pipes/connect_tenant_usage.json"))
+        .and(query_param("tenant_id", "team-a"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+            "data": [
+                {"day": "2026-11-17", "sync_id": "s1", "documents_streamed": 10,
+                 "documents_snapshot": 0, "documents_resync": 0, "bytes": 1000, "sync_seconds": 60},
+                {"day": "2026-11-18", "sync_id": "s1", "documents_streamed": 5,
+                 "documents_snapshot": 2, "documents_resync": 0, "bytes": 700, "sync_seconds": 60},
+                {"day": "2026-11-18", "sync_id": "s2", "documents_streamed": 0,
+                 "documents_snapshot": 0, "documents_resync": 4, "bytes": 400, "sync_seconds": 30}
+            ]
+        })))
+        .mount(&tb)
+        .await;
+    let a = app_tweaked(
+        locked(),
+        Arc::new(MemStore::new()),
+        HostPolicy::any(),
+        Limits::default(),
+        Duration::from_millis(200),
+        |w| {
+            w.tinybird = Some(crate::tinybird::TinybirdConfig {
+                url: tb.uri(),
+                token: "tb".into(),
+            })
+        },
+    );
+    let (_, body) = call(
+        &a.router,
+        "GET",
+        "/usage?from=2026-11-01&to=2026-11-30",
+        &lab("team-a"),
+        None,
+    )
+    .await;
+    assert_eq!(body["source"], "tinybird");
+    assert_eq!(body["rows"].as_array().unwrap().len(), 2);
+    assert_eq!(body["rows"][1]["day"], "2026-11-18");
+    assert_eq!(body["rows"][1]["units"]["documents_streamed"], 5);
+    assert_eq!(body["rows"][1]["units"]["documents_resync"], 4);
+    assert_eq!(
+        body["totals"],
+        json!({"documents_streamed": 15, "documents_snapshot": 2, "documents_resync": 4,
+               "bytes": 2100, "sync_seconds": 150})
+    );
+    let (_, by_sync) = call(
+        &a.router,
+        "GET",
+        "/usage?from=2026-11-01&to=2026-11-30&group_by=sync",
+        &lab("team-a"),
+        None,
+    )
+    .await;
+    assert_eq!(by_sync["rows"][0]["sync_id"], "s1");
+    assert_eq!(by_sync["rows"][0]["units"]["documents_streamed"], 15);
+    assert!(by_sync["rows"][0]["name"].is_null(), "unknown here");
+
+    // Tinybird down: the state database answers, same shape.
+    tb.reset().await;
+    let (status, body) = call(&a.router, "GET", "/usage", &lab("team-a"), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["source"], "state");
+    assert!(body["totals"].is_object());
+}

@@ -35,6 +35,8 @@ pub struct AppState {
     pub metrics: Arc<Metrics>,
     /// When a stuck sync's lag deserves a warning in its status.
     pub lag_guard: crate::config::LagGuard,
+    /// `GET /usage` reads Tinybird when configured.
+    pub usage_reader: Option<Arc<crate::tinybird::TinybirdReader>>,
     /// The only credential `GET /metrics` accepts.
     pub metrics_token: Option<Secret>,
     pub limits: Limits,

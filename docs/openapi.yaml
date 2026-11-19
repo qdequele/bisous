@@ -76,6 +76,53 @@ paths:
         "401": { $ref: "#/components/responses/Error" }
         "404": { $ref: "#/components/responses/Error" }
 
+  /usage:
+    get:
+      summary: Metered usage of the caller's syncs
+      description: |
+        The units of `docs/LAB_INTEGRATION.md` ("Pricing") per UTC day
+        (`group_by=day`, the default) or per sync (`group_by=sync`) over
+        `from..=to` (default: the last 30 days; at most 366 days), with
+        their totals. Scoped to the caller's tenant (the global scope for
+        the admin key). Days and syncs without usage are absent.
+
+        Served from the Tinybird `connect_tenant_usage` pipe when
+        `TINYBIRD_URL` is set (falling back to the state database when it
+        cannot answer), else from the state database's progress table;
+        `source` says which. The shape is the same either way. The state
+        database counts a batch on the day it was applied; Tinybird on the
+        day it was flushed (at most `USAGE_FLUSH_INTERVAL_SECS` later). The
+        state database forgets a deleted sync's usage; Tinybird keeps it.
+      parameters:
+        - { $ref: "#/components/parameters/TenantId" }
+        - { name: from, in: query, schema: { type: string, format: date } }
+        - { name: to, in: query, schema: { type: string, format: date } }
+        - { name: group_by, in: query, schema: { type: string, enum: [day, sync], default: day } }
+      responses:
+        "200":
+          description: The usage.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  from: { type: string, format: date }
+                  to: { type: string, format: date }
+                  group_by: { type: string, enum: [day, sync] }
+                  source: { type: string, enum: [tinybird, state] }
+                  rows:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        day: { type: string, format: date, description: "With group_by=day." }
+                        sync_id: { type: string, description: "With group_by=sync." }
+                        name: { type: [string, "null"], description: "With group_by=sync: the sync's name, null once deleted." }
+                        units: { $ref: "#/components/schemas/Units" }
+                  totals: { $ref: "#/components/schemas/Units" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+
   /sources/check:
     post:
       summary: Pre-flight checks of a source
@@ -455,6 +502,16 @@ components:
             carry a fixed description of their class, not the driver's
             text.
         message: { type: string }
+
+    Units:
+      type: object
+      description: The metered units (`docs/LAB_INTEGRATION.md`, "Pricing").
+      properties:
+        documents_streamed: { type: integer }
+        documents_snapshot: { type: integer }
+        documents_resync: { type: integer }
+        bytes: { type: integer }
+        sync_seconds: { type: integer }
 
     SyncPhase:
       type: string

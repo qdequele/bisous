@@ -41,7 +41,7 @@ use crate::manager::{ManagerDeps, SinkFactory, SyncManager, meili_sinks};
 use crate::metrics::Metrics;
 use crate::registry::SourceRegistry;
 use crate::state::{AppState, Backend};
-use crate::tinybird::{TinybirdConfig, TinybirdSender};
+use crate::tinybird::{TinybirdConfig, TinybirdReader, TinybirdSender};
 use crate::usage::{MeteredStore, UsageEvents};
 
 /// The API. Every path is listed in [`routes::ROUTES`].
@@ -51,6 +51,7 @@ pub fn router(state: AppState) -> Router {
         .route("/metrics", get(metrics::metrics))
         .route("/sources/check", post(api::check_source))
         .route("/sources/discover", post(api::discover_source))
+        .route("/usage", get(api::usage))
         .route("/syncs", post(api::create_sync).get(api::list_syncs))
         .route(
             "/syncs/{id}",
@@ -143,6 +144,16 @@ pub fn build_state(
         metrics,
         metrics_token: wiring.metrics_token,
         lag_guard: wiring.lag_guard,
+        usage_reader: match &wiring.tinybird {
+            Some(tb) => match TinybirdReader::new(tb.clone()) {
+                Ok(reader) => Some(Arc::new(reader)),
+                Err(e) => {
+                    warn!(error = %e, "cannot build the Tinybird client; GET /usage reads the state database");
+                    None
+                }
+            },
+            None => None,
+        },
         probes: Arc::new(ProbeSlots::new(
             wiring.limits.probe_concurrency,
             wiring.limits.probe_concurrency_per_tenant,
