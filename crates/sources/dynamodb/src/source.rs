@@ -463,7 +463,7 @@ impl Source for DynamoSource {
             }
         }
         if self.tables.is_empty() {
-            report.push("tables", CheckStatus::Warning, "no table is mapped yet");
+            report.push_none_selected("tables", "table");
         }
         for table in self.tables.clone() {
             self.check_table(&clients, &table, &mut report).await;
@@ -722,6 +722,33 @@ mod tests {
                 "{region}"
             );
         }
+    }
+
+    /// No table picked yet (the setup UI tests the connection first): the
+    /// table, stream and permission checks are one `Ok` item and touch no
+    /// table (the endpoint here answers nothing).
+    #[tokio::test]
+    async fn check_without_tables_is_a_connection_check() {
+        let spec = SourceSpec {
+            kind: SourceKind::Dynamodb,
+            config: json!({
+                "region": "us-east-1",
+                "endpoint_url": "http://127.0.0.1:1",
+                "credentials": {"type": "static", "access_key_id": "a", "secret_access_key": "b"},
+            }),
+        };
+        let mut src = DynamoSourceFactory.build("s", &spec, &[]).unwrap();
+        let report = src.check().await.unwrap();
+        assert!(report.passed(), "{report:?}");
+        let names: Vec<_> = report.items.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(names, ["credentials", "tables"]);
+        assert_eq!(report.items[1].status, CheckStatus::Ok);
+        assert_eq!(
+            report.items[1].message,
+            "no table selected yet: table checks run once you pick them"
+        );
+        // A sync still needs a table.
+        assert!(matches!(src.open(None).await, Err(SourceError::Config(_))));
     }
 
     fn table(view: Option<StreamViewType>, enabled: bool) -> TableDescription {

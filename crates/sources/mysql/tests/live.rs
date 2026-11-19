@@ -249,6 +249,32 @@ async fn check_and_discover() {
     src.teardown().await.unwrap();
 }
 
+/// No table picked yet (the setup UI tests the connection first): the
+/// server checks run, the table checks are one `Ok` item, the report passes.
+#[tokio::test]
+async fn check_without_tables_is_a_connection_check() {
+    let Some(url) = url() else { return };
+    let _g = SERIAL.lock().await;
+    let mut conn = admin(&url).await;
+    fresh_db(&mut conn, "mc_check_none").await;
+    let mut src = source(&url, "mc_check_none", &[], "check-none");
+    let report = src.check().await.unwrap();
+    assert!(report.passed(), "{report:#?}");
+    for name in ["connection", "log_bin", "binlog_format", "binlog_row_image"] {
+        assert!(
+            report.items.iter().any(|i| i.name == name),
+            "{name}: {report:#?}"
+        );
+    }
+    let tables: Vec<_> = report.items.iter().filter(|i| i.name == "tables").collect();
+    assert_eq!(tables.len(), 1, "{report:#?}");
+    assert_eq!(tables[0].status, meili_connect_core::CheckStatus::Ok);
+    assert_eq!(
+        tables[0].message,
+        "no table selected yet: table checks run once you pick them"
+    );
+}
+
 #[tokio::test]
 async fn fresh_snapshot_then_stream_is_gapless_and_resumable() {
     let Some(url) = url() else { return };

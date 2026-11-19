@@ -101,6 +101,21 @@ All notable changes to meili-connect are listed here. The format follows
 
 ### Fixed
 
+- An idle sync no longer sends a `usage.recorded` event (and a Tinybird row)
+  every flush interval carrying only its free `sync_seconds`: about 1,440
+  zero-amount ledger rows a day per sync. Its seconds accumulate (none is
+  lost) and go with its next billable usage, when it stops (pause, hold,
+  failure, deletion, graceful shutdown), or after `USAGE_IDLE_FLUSH_SECS`
+  (new, default 3600). `GET /usage` from Tinybird adds what is not sent yet.
+  Migration `20261119000007` adds `usage_pending.pending_since`.
+- `POST /sources/check` without `streams` is a connection-level pre-flight,
+  as the Lab console's wizard sends it before the tables are picked: it no
+  longer fails a healthy origin with `tables: no table is mapped`. Every
+  connector reports the per-collection checks as one `ok` item (`tables`,
+  `collections` or `topics`: "no table selected yet: table checks run once
+  you pick them"); MongoDB and DynamoDB no longer warn either. Kafka accepts
+  a check or a discovery without topics (it answered `422 source_config`).
+  With streams nothing changes, and a sync still needs at least one.
 - Every change to a sync (create, update, delete, pause, resume, resync,
   release) runs under the sync's lock on the row read inside it: a `PUT`
   racing a `DELETE` no longer restarts a deleted sync, and a `resume` racing a

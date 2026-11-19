@@ -321,6 +321,7 @@ impl SyncManager {
         )
         .await?;
         lock(&self.credit_held).insert(sync_id.to_owned());
+        self.usage.flush_sync(&*self.backend, sync_id).await;
         Ok(())
     }
 
@@ -617,6 +618,8 @@ impl SyncManager {
         persist_phase(&*self.store, id, SyncPhase::Paused, None).await?;
         // The user's pause wins over a credit hold: it stays paused.
         lock(&self.credit_held).remove(id);
+        // It accrues nothing more: its pending usage goes now.
+        self.usage.flush_sync(&*self.backend, id).await;
         Ok(())
     }
 
@@ -795,6 +798,17 @@ impl SyncManager {
 
     pub fn running_ids(&self) -> Vec<String> {
         lock(&self.supervisors).keys().cloned().collect()
+    }
+
+    /// The syncs whose supervision loop is alive (streaming, snapshotting
+    /// or retrying): only they may still accrue `sync_seconds`. A held or
+    /// failed sync's loop has ended.
+    pub fn active_ids(&self) -> Vec<String> {
+        lock(&self.supervisors)
+            .iter()
+            .filter(|(id, sup)| sup.is_running(id))
+            .map(|(id, _)| id.clone())
+            .collect()
     }
 }
 

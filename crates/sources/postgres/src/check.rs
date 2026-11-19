@@ -207,7 +207,7 @@ pub async fn run(src: &mut PostgresSource) -> Result<CheckReport, SourceError> {
     }
 
     if targets.is_empty() {
-        report.push("tables", CheckStatus::Failed, "no table is mapped");
+        report.push_none_selected("tables", "table");
         return Ok(report);
     }
     let found = catalog::tables(sql, version, Some(&list)).await?;

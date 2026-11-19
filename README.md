@@ -91,7 +91,12 @@ curl -s $API/sources/discover -H "$AUTH" -H 'Content-Type: application/json' -d 
 }' | jq '.collections[] | {name, key, estimated_rows}'
 ```
 
-Both are bounded by `SOURCE_PROBE_TIMEOUT_SECS` (`504 source_timeout`).
+Without `streams`, the check tests the connection and the server settings
+only, before any table is picked: the table checks are one `ok` item
+(`{"name": "tables", "status": "ok", "message": "no table selected yet: table
+checks run once you pick them"}`; `collections` for MongoDB, `topics` for
+Kafka). Both are bounded by `SOURCE_PROBE_TIMEOUT_SECS` (`504
+source_timeout`).
 
 ### Create, read, list
 
@@ -226,7 +231,8 @@ Every variable, with defaults, is in [`.env.example`](.env.example).
 | `CONNECT_HOST_POLICY` | `public` with `LAB_SERVICE_TOKEN`, else `any` | Which hosts sources and destinations may point at: `public`, `any` or `allowlist`. See [Host policy](#host-policy). |
 | `CONNECT_HOST_ALLOWLIST` | unset | With `allowlist`: comma-separated `host`, `host:port`, IP addresses and CIDRs. |
 | `LAB_URL`, `LAB_INSTANCE_ID`, `LAB_INSTANCE_SECRET` | unset | Lab mode: usage events and credit holds. All three or none. |
-| `USAGE_FLUSH_INTERVAL_SECS` | `60` | How often recorded usage becomes events. |
+| `USAGE_FLUSH_INTERVAL_SECS` | `60` | How often recorded usage with documents or bytes becomes events. |
+| `USAGE_IDLE_FLUSH_SECS` | `3600` | How long a running sync's `sync_seconds` alone (an idle sync) wait before they become an event (1-86400). |
 | `LAB_SEND_INTERVAL_SECS` | `2` | How often the outbox lanes are delivered. |
 | `CREDITS_CHECK_INTERVAL_SECS` | `15` | Lab mode: how often the teams' credits are checked. |
 | `CREDITS_CACHE_FRESH_SECS` / `CREDITS_CACHE_STALE_SECS` | `30` / `300` | How long a credits answer is reused, and kept quietly while the Lab cannot answer. |
@@ -323,9 +329,15 @@ tenant's per day or per sync.
 
 With the three `LAB_*` variables set, the units are added, in the same
 transaction as the progress counters, to a pending row per tenant-owned
-sync; every `USAGE_FLUSH_INTERVAL_SECS` the pending rows become one
-`usage.recorded` event per sync with non-zero units, in one transaction
-(nothing is lost on a crash, nothing is held in memory):
+sync; every `USAGE_FLUSH_INTERVAL_SECS` the pending rows that are due become
+one `usage.recorded` event per sync, in one transaction (nothing is lost on a
+crash, nothing is held in memory). A row is due when it holds documents or
+bytes (it carries the seconds accumulated so far), when its sync stopped
+(paused, held, failed, deleted, out of credits: the tail goes at once or at
+the next flush; a graceful shutdown sends everything), or when it has held
+only `sync_seconds` for `USAGE_IDLE_FLUSH_SECS`: an idle sync sends about one
+event an hour, not one a minute, and no second is lost. `GET /usage` and the
+status include what is still pending:
 
 ```json
 {"id": "<UUIDv7>", "type": "usage.recorded", "occurred_at": "...", "account_id": "<tenant>",

@@ -372,10 +372,15 @@ impl LabSender {
     }
 }
 
-/// Every `interval`, turn pending usage into outbox events, lane by lane.
+/// The syncs running now (their idle seconds may wait).
+pub type ActiveSyncs = Arc<dyn Fn() -> Vec<String> + Send + Sync>;
+
+/// Every `interval`, turn the pending usage that is due into outbox events,
+/// lane by lane (`UsageEvents::flush`).
 pub async fn run_usage_flush(
     usage: Arc<UsageEvents>,
     ledger: Arc<dyn UsageLedger>,
+    active: ActiveSyncs,
     interval: Duration,
     cancel: CancellationToken,
 ) {
@@ -384,7 +389,7 @@ pub async fn run_usage_flush(
             _ = cancel.cancelled() => return,
             _ = tokio::time::sleep(interval) => {}
         }
-        match usage.flush(&*ledger).await {
+        match usage.flush(&*ledger, &active()).await {
             Ok(n) if n > 0 => tracing::debug!(events = n, "usage enqueued"),
             Ok(_) => {}
             Err(e) => tracing::warn!(error = %e, "cannot enqueue usage events; retrying later"),

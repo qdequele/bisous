@@ -74,7 +74,24 @@ A table taking 100 k changes a day at 1 KB costs about $3.00 + $0.30 a month.
 
 ## Usage event
 
-One `usage.recorded` event per sync per flush interval with non-zero units:
+One `usage.recorded` event per sync, enqueued at a flush
+(`USAGE_FLUSH_INTERVAL_SECS`, default 60 s) when its pending usage is due:
+
+- **activity**: a billable unit (`documents_streamed`, `documents_snapshot`,
+  `documents_resync`, `bytes`) is pending. The event carries the
+  `sync_seconds` accumulated so far too.
+- **idle**: only `sync_seconds` (free) is pending, and the first of them was
+  recorded at least `USAGE_IDLE_FLUSH_SECS` (default 3600 s) ago, so after
+  the sync's previous event. An idle sync sends about one event an hour
+  instead of one a minute (one ledger row each). The age is stored with the
+  pending row and survives restarts.
+- **stop**: the sync was paused, held (by a guard or out of credits),
+  failed or deleted: its tail goes at once or at the next flush. A graceful
+  shutdown sends everything pending.
+
+No second is lost: they accumulate in the state database until they go.
+`GET /usage` and `GET /syncs/{id}/status` count them as soon as they are
+recorded, so at any time they equal the events sent plus what is pending.
 
 ```json
 {

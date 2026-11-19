@@ -282,6 +282,29 @@ pub struct PendingUsage {
 /// Turns pending usage into the payload of an outbox event.
 pub type EventBuilder<'a> = dyn Fn(&PendingUsage) -> serde_json::Value + Send + Sync + 'a;
 
+/// Which pending rows [`UsageLedger::drain_usage`] takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsageDrain<'a> {
+    /// Every row of one sync (it stopped, or it is being deleted), or of
+    /// all (the server stops).
+    All(Option<&'a str>),
+    /// The rows due an event: those with a billable unit (documents or
+    /// bytes, with the `sync_seconds` accumulated so far); those of a sync
+    /// not in `active` (it stopped: its tail goes); and those holding only
+    /// `sync_seconds` for at least `idle_after`. An idle sync's seconds
+    /// thus go out about every `idle_after`, not every flush.
+    Due {
+        idle_after: Duration,
+        /// The syncs running now, accruing `sync_seconds`.
+        active: &'a [String],
+    },
+}
+
+/// Whether a pending row has a unit billed by the document or the byte.
+pub(crate) fn billable(u: &Usage) -> bool {
+    u.documents_streamed > 0 || u.documents_snapshot > 0 || u.documents_resync > 0 || u.bytes > 0
+}
+
 /// What [`UsageLedger::drain_usage`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DrainOutcome {
@@ -319,15 +342,18 @@ pub trait UsageLedger: Send + Sync {
     /// Usage recorded for a lane and not enqueued yet.
     async fn pending_usage(&self, lane: Lane) -> Result<Vec<PendingUsage>, RepoError>;
 
-    /// Atomically take the lane's pending usage (of one sync, or of all),
+    /// Atomically take the lane's pending rows that `which` selects,
     /// enqueue one event per sync with non-zero units (built by `event`),
     /// and clear what was taken. Takes nothing while the lane holds
     /// `backlog_cap` unsent events or more (`0`: no cap): the usage keeps
     /// accumulating in its pending row (one per sync, bounded).
+    ///
+    /// A row's age is counted from the first usage recorded after the
+    /// sync's previous event, and is stored with it: it survives a restart.
     async fn drain_usage(
         &self,
         lane: Lane,
-        sync_id: Option<&str>,
+        which: UsageDrain<'_>,
         backlog_cap: u64,
         event: &EventBuilder<'_>,
     ) -> Result<DrainOutcome, RepoError>;
@@ -537,7 +563,7 @@ pub(crate) mod test_support {
     where
         S: meili_connect_core::StateStore + crate::SyncRepository + crate::UsageLedger,
     {
-        use crate::{DrainOutcome, Lane, PendingUsage};
+        use crate::{DrainOutcome, Lane, PendingUsage, UsageDrain};
         use std::time::Duration;
         store.set_usage_lanes(&[Lane::Lab, Lane::Tinybird]);
         store
@@ -594,7 +620,10 @@ pub(crate) mod test_support {
             .await
             .unwrap();
         assert_eq!(
-            store.drain_usage(Lane::Lab, None, 1, &build).await.unwrap(),
+            store
+                .drain_usage(Lane::Lab, UsageDrain::All(None), 1, &build)
+                .await
+                .unwrap(),
             DrainOutcome::Backlogged(1)
         );
         assert_eq!(store.pending_usage(Lane::Lab).await.unwrap().len(), 1);
@@ -608,12 +637,18 @@ pub(crate) mod test_support {
             .unwrap();
 
         assert_eq!(
-            store.drain_usage(Lane::Lab, None, 1, &build).await.unwrap(),
+            store
+                .drain_usage(Lane::Lab, UsageDrain::All(None), 1, &build)
+                .await
+                .unwrap(),
             DrainOutcome::Enqueued(1)
         );
         assert!(store.pending_usage(Lane::Lab).await.unwrap().is_empty());
         assert_eq!(
-            store.drain_usage(Lane::Lab, None, 0, &build).await.unwrap(),
+            store
+                .drain_usage(Lane::Lab, UsageDrain::All(None), 0, &build)
+                .await
+                .unwrap(),
             DrainOutcome::Enqueued(0),
             "nothing new"
         );
@@ -639,7 +674,7 @@ pub(crate) mod test_support {
         // Drain one sync, then delete the other: its usage is still sent.
         assert_eq!(
             store
-                .drain_usage(Lane::Tinybird, Some("gs"), 0, &build)
+                .drain_usage(Lane::Tinybird, UsageDrain::All(Some("gs")), 0, &build)
                 .await
                 .unwrap(),
             DrainOutcome::Enqueued(1)
@@ -651,7 +686,7 @@ pub(crate) mod test_support {
         store.delete_sync(Some("t"), "ts").await.unwrap();
         assert_eq!(
             store
-                .drain_usage(Lane::Tinybird, None, 0, &build)
+                .drain_usage(Lane::Tinybird, UsageDrain::All(None), 0, &build)
                 .await
                 .unwrap(),
             DrainOutcome::Enqueued(1)
@@ -688,6 +723,110 @@ pub(crate) mod test_support {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    /// What both stores take with [`crate::UsageDrain::Due`]: billable usage
+    /// at once (with the seconds so far), only seconds once the row is
+    /// `idle_after` old or its sync stopped; nothing else, and nothing lost.
+    /// `age` makes the pending rows look older (the store's own clock).
+    pub async fn idle_usage_contract<S>(store: &S, age: impl AsyncFn(&S, std::time::Duration))
+    where
+        S: meili_connect_core::StateStore + crate::SyncRepository + crate::UsageLedger,
+    {
+        use crate::{DrainOutcome, Lane, PendingUsage, UsageDrain};
+        use std::time::Duration;
+        store.set_usage_lanes(&[Lane::Lab]);
+        store
+            .create_sync(Some("t"), &spec("ts", Some("t"), "products"))
+            .await
+            .unwrap();
+        let build = |p: &PendingUsage| json!({"s": p.usage.sync_seconds, "n": p.usage.documents_streamed, "b": p.usage.bytes});
+        let active = ["ts".to_owned()];
+        let hour = Duration::from_secs(3600);
+        let due = UsageDrain::Due {
+            idle_after: hour,
+            active: &active,
+        };
+        let drain = async |which| match store.drain_usage(Lane::Lab, which, 0, &build).await {
+            Ok(DrainOutcome::Enqueued(n)) => n,
+            other => panic!("{other:?}"),
+        };
+        let outbox = store.outbox(Lane::Lab);
+        let take = async || {
+            let lease = outbox
+                .lease_events(10, Duration::from_secs(30))
+                .await
+                .unwrap();
+            let ids: Vec<uuid::Uuid> = lease.events.iter().map(|e| e.id).collect();
+            outbox.mark_events_sent(lease.token, &ids).await.unwrap();
+            lease
+                .events
+                .into_iter()
+                .map(|e| e.payload)
+                .collect::<Vec<_>>()
+        };
+
+        // An idle sync: its seconds accumulate, no event.
+        for _ in 0..3 {
+            store
+                .record_progress("ts", &units(0, 0, 0, 0, 15))
+                .await
+                .unwrap();
+            assert_eq!(drain(due).await, 0);
+        }
+        assert_eq!(
+            store.pending_usage(Lane::Lab).await.unwrap()[0]
+                .usage
+                .sync_seconds,
+            45
+        );
+        // Recording more does not make the row younger.
+        age(store, Duration::from_secs(3599)).await;
+        store
+            .record_progress("ts", &units(0, 0, 0, 0, 15))
+            .await
+            .unwrap();
+        age(store, Duration::from_secs(2)).await;
+        assert_eq!(drain(due).await, 1, "an idle period passed");
+        assert_eq!(take().await, vec![json!({"s": 60, "n": 0, "b": 0})]);
+        assert_eq!(drain(due).await, 0);
+
+        // Activity takes the seconds with it.
+        store
+            .record_progress("ts", &units(0, 0, 0, 0, 15))
+            .await
+            .unwrap();
+        store
+            .record_progress("ts", &units(2, 0, 0, 20, 0))
+            .await
+            .unwrap();
+        assert_eq!(drain(due).await, 1);
+        assert_eq!(take().await, vec![json!({"s": 15, "n": 2, "b": 20})]);
+
+        // A stopped sync's tail goes at the next drain, or at once.
+        store
+            .record_progress("ts", &units(0, 0, 0, 0, 5))
+            .await
+            .unwrap();
+        let stopped = UsageDrain::Due {
+            idle_after: hour,
+            active: &[],
+        };
+        assert_eq!(drain(stopped).await, 1);
+        store
+            .record_progress("ts", &units(0, 0, 0, 0, 7))
+            .await
+            .unwrap();
+        assert_eq!(drain(UsageDrain::All(Some("other"))).await, 0);
+        assert_eq!(drain(UsageDrain::All(Some("ts"))).await, 1);
+        assert_eq!(
+            take().await,
+            vec![
+                json!({"s": 5, "n": 0, "b": 0}),
+                json!({"s": 7, "n": 0, "b": 0})
+            ]
+        );
+        assert!(store.pending_usage(Lane::Lab).await.unwrap().is_empty());
     }
 
     /// Phase counts span every scope; a sync that never ran is pending.

@@ -317,11 +317,7 @@ impl MongoSource {
         }
 
         if self.targets.is_empty() {
-            report.push(
-                "collections",
-                CheckStatus::Warning,
-                "no collection is mapped",
-            );
+            report.push_none_selected("collections", "collection");
         }
         for t in &self.targets {
             let name = format!("collection {}.{}", t.db, t.coll);

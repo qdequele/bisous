@@ -206,11 +206,28 @@ SOURCE=$(jq -nc --arg url "$ORIGIN_URL" '{kind: "postgres", config: {url: $url}}
 scenario_check_discover() {
   local name="postgres: check and discover"
   local check discover
-  # The checks cover the mapped tables, so pass the streams.
+  # First without streams, like the console's wizard before the tables are
+  # picked: a connection-level check that passes, the table checks one ok item.
+  check=$(api POST /sources/check "$(jq -nc --argjson s "$SOURCE" '{source: $s}')")
+  if [[ "$(tail -n1 <<<"$check")" != 200 ]] || [[ "$(sed '$d' <<<"$check" | jq -r .passed)" != true ]]; then
+    fail "$name" "check without streams: $(sed '$d' <<<"$check")"; return
+  fi
+  if ! sed '$d' <<<"$check" | jq -e '[.items[] | select(.name == "tables")] == [{name: "tables", status: "ok",
+        message: "no table selected yet: table checks run once you pick them"}]
+      and ([.items[] | select(.status == "failed")] | length) == 0' >/dev/null; then
+    fail "$name" "check without streams, items: $(sed '$d' <<<"$check")"; return
+  fi
+  # With the streams, the tables are checked.
   check=$(api POST /sources/check "$(jq -nc --argjson s "$SOURCE" \
     '{source: $s, streams: [{collection: "public.items", index: "items"}]}')")
   if [[ "$(tail -n1 <<<"$check")" != 200 ]] || [[ "$(sed '$d' <<<"$check" | jq -r .passed)" != true ]]; then
     fail "$name" "check: $(sed '$d' <<<"$check")"; return
+  fi
+  check=$(api POST /sources/check "$(jq -nc --argjson s "$SOURCE" \
+    '{source: $s, streams: [{collection: "public.missing", index: "missing"}]}')")
+  if [[ "$(tail -n1 <<<"$check")" != 200 ]] || [[ "$(sed '$d' <<<"$check" | jq -r .passed)" != false ]] \
+      || ! sed '$d' <<<"$check" | jq -e '[.items[] | select(.status == "failed") | .name] == ["table public.missing"]' >/dev/null; then
+    fail "$name" "check of a missing table: $(sed '$d' <<<"$check")"; return
   fi
   discover=$(api_body POST /sources/discover "$(jq -nc --argjson s "$SOURCE" '{source: $s}')")
   if ! jq -e '.collections[] | select(.name == "public.items" and .key == ["id"])' <<<"$discover" >/dev/null; then
@@ -461,13 +478,24 @@ scenario_metering() {
   twait "$METERED_ID" .documents.documents_streamed 80 30 \
     || { fail "$name" "streamed = $(tstatus "$METERED_ID" .documents.documents_streamed), expected 80"; return; }
 
+  # Idle for several flush intervals (2 s): its seconds accumulate, but no
+  # event carries them alone (they wait for USAGE_IDLE_FLUSH_SECS, activity
+  # or a stop).
+  sleep 8
+  local idle_events
+  idle_events=$(jq -s --arg id "$METERED_ID" '[.[] | select(.data.job_id == $id) | .data.units
+      | select(.documents_streamed + .documents_snapshot + .documents_resync + .bytes == 0)] | length' \
+    "$WORK/lab_events.jsonl")
+  [[ "$idle_events" == 0 ]] || { fail "$name" "$idle_events event(s) carry only sync_seconds while the sync runs"; return; }
+
   # A resync the user asks for is a snapshot (340 rows now).
   local resync_bytes; resync_bytes=$(line_bytes true)
   [[ "$(tapi_code POST "/syncs/$METERED_ID/resync")" == 200 ]] || { fail "$name" "resync refused"; return; }
   twait "$METERED_ID" '[.documents.documents_snapshot, .resyncing, .phase] | map(tostring) | join("/")' 640/false/streaming "$TIMEOUT" \
     || { fail "$name" "after the resync: $(tapi_body GET "/syncs/$METERED_ID/status" | jq -c '{documents, resyncing, phase}')"; return; }
 
-  # Paused: no more sync seconds accrue, so every unit can be compared.
+  # Paused: no more sync seconds accrue and the pause sends the pending tail
+  # (idle seconds included), so every unit can be compared.
   [[ "$(tapi_code POST "/syncs/$METERED_ID/pause")" == 200 ]] || { fail "$name" "pause refused"; return; }
   local expected_bytes=$((snap_bytes + stream_bytes + resync_bytes))
   local usage totals

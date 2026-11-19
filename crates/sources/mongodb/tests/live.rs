@@ -221,6 +221,44 @@ async fn check_and_discover() {
     c.database(&db).drop().await.unwrap();
 }
 
+/// No collection picked yet (the setup UI tests the connection first): the
+/// server checks run, the collection checks are one `Ok` item, and the
+/// report passes.
+#[tokio::test]
+async fn check_without_collections_is_a_connection_check() {
+    let Some(url) = url() else { return };
+    let mut source = build(&url, json!({}), &[]);
+    let report = source.check().await.unwrap();
+    assert!(report.passed(), "{report:#?}");
+    for name in ["connection", "topology", "server_version"] {
+        assert!(
+            report
+                .items
+                .iter()
+                .any(|i| i.name == name && i.status == CheckStatus::Ok),
+            "{name}: {report:#?}"
+        );
+    }
+    let collections: Vec<_> = report
+        .items
+        .iter()
+        .filter(|i| i.name == "collections")
+        .collect();
+    assert_eq!(collections.len(), 1, "{report:#?}");
+    assert_eq!(collections[0].status, CheckStatus::Ok);
+    assert_eq!(
+        collections[0].message,
+        "no collection selected yet: collection checks run once you pick them"
+    );
+    assert!(
+        report
+            .items
+            .iter()
+            .all(|i| !i.name.starts_with("collection ")),
+        "{report:#?}"
+    );
+}
+
 #[tokio::test]
 async fn wrong_credentials_fail_the_check_without_leaking() {
     let Some(url) = url() else { return };

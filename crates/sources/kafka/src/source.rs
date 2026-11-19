@@ -150,8 +150,14 @@ impl Source for KafkaSource {
             Ok(items)
         })
         .await?;
+        let reached = items
+            .iter()
+            .any(|(name, status, _)| *name == "brokers" && *status == CheckStatus::Ok);
         for (name, status, msg) in items {
             report.push(name, status, msg);
+        }
+        if reached && self.topics.is_empty() {
+            report.push_none_selected("topics", "topic");
         }
         Ok(report)
     }
@@ -191,6 +197,11 @@ impl Source for KafkaSource {
     }
 
     async fn open(&mut self, resume: Option<Checkpoint>) -> Result<Opened, SourceError> {
+        if self.topics.is_empty() {
+            return Err(SourceError::Config(
+                "a kafka sync needs at least one topic mapping".to_owned(),
+            ));
+        }
         let consumer = self.consumer()?;
         let config = self.config.clone();
         let topics = self.topics.clone();

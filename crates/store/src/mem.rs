@@ -22,9 +22,16 @@ use uuid::Uuid;
 use crate::{
     BootSync, DailyProgress, DeadLetterLimits, DeadLetterPage, DrainOutcome, EventBuilder,
     LabOutbox, Lane, OutboxEvent, OutboxLease, PendingUsage, RepoError, RetryBackoff,
-    StoredDeadLetter, StoredSync, SyncRepository, SyncRow, UnreadableSync, UsageLedger, UsageRow,
-    bound_letter, lane_mask, lanes_of, validate_spec,
+    StoredDeadLetter, StoredSync, SyncRepository, SyncRow, UnreadableSync, UsageDrain, UsageLedger,
+    UsageRow, billable, bound_letter, lane_mask, lanes_of, validate_spec,
 };
+
+/// A pending usage row and when its first usage was recorded (after the
+/// sync's previous event).
+struct Pending {
+    usage: PendingUsage,
+    since: DateTime<Utc>,
+}
 
 #[derive(Default)]
 struct Inner {
@@ -36,7 +43,7 @@ struct Inner {
     progress: BTreeMap<(String, NaiveDate), ([u64; 4], Usage)>,
     outbox: Vec<OutboxRow>,
     /// Usage recorded and not yet enqueued, per lane and sync.
-    pending: BTreeMap<(Lane, String), PendingUsage>,
+    pending: BTreeMap<(Lane, String), Pending>,
     /// Test hook: rows reported as unreadable, like a Postgres row sealed
     /// with another key.
     unreadable: std::collections::HashSet<String>,
@@ -151,6 +158,17 @@ impl MemStore {
         }
     }
 
+    /// Test helper: make every pending usage row look `by` older, as if
+    /// that much time had passed since its first usage was recorded.
+    pub fn age_pending_usage(&self, by: Duration) {
+        if let Ok(mut inner) = self.lock() {
+            let by = chrono::Duration::from_std(by).unwrap_or(chrono::Duration::MAX);
+            for p in inner.pending.values_mut() {
+                p.since = p.since.checked_sub_signed(by).unwrap_or(p.since);
+            }
+        }
+    }
+
     /// Bound what one sync may keep in the dead-letter table.
     pub fn with_dead_letter_limits(mut self, limits: DeadLetterLimits) -> Self {
         self.limits = limits;
@@ -243,6 +261,10 @@ impl StateStore for MemStore {
             ),
             None => (None, String::new(), String::new()),
         };
+        if p.usage.is_zero() {
+            return Ok(());
+        }
+        let now = Utc::now();
         for lane in lanes_of(self.lanes.load(Ordering::Relaxed)) {
             // The Lab bills tenants only: global syncs are never sent.
             if lane == Lane::Lab && tenant.is_none() {
@@ -251,14 +273,17 @@ impl StateStore for MemStore {
             let entry = inner
                 .pending
                 .entry((lane, sync_id.to_owned()))
-                .or_insert_with(|| PendingUsage {
-                    sync_id: sync_id.to_owned(),
-                    tenant: tenant.clone(),
-                    source_kind: kind.clone(),
-                    sync_name: name.clone(),
-                    usage: Default::default(),
+                .or_insert_with(|| Pending {
+                    usage: PendingUsage {
+                        sync_id: sync_id.to_owned(),
+                        tenant: tenant.clone(),
+                        source_kind: kind.clone(),
+                        sync_name: name.clone(),
+                        usage: Default::default(),
+                    },
+                    since: now,
                 });
-            entry.usage.add(&p.usage);
+            entry.usage.usage.add(&p.usage);
         }
         Ok(())
     }
@@ -497,14 +522,14 @@ impl UsageLedger for MemStore {
             .pending
             .iter()
             .filter(|((l, _), _)| *l == lane)
-            .map(|(_, p)| p.clone())
+            .map(|(_, p)| p.usage.clone())
             .collect())
     }
 
     async fn drain_usage(
         &self,
         lane: Lane,
-        sync_id: Option<&str>,
+        which: UsageDrain<'_>,
         backlog_cap: u64,
         event: &EventBuilder<'_>,
     ) -> Result<DrainOutcome, RepoError> {
@@ -519,15 +544,24 @@ impl UsageLedger for MemStore {
                 return Ok(DrainOutcome::Backlogged(backlog));
             }
         }
+        let now = Utc::now();
+        let due = |id: &str, p: &Pending| match which {
+            UsageDrain::All(sync_id) => sync_id.is_none_or(|s| s == id),
+            UsageDrain::Due { idle_after, active } => {
+                billable(&p.usage.usage)
+                    || !active.iter().any(|a| a == id)
+                    || (now - p.since).to_std().is_ok_and(|age| age >= idle_after)
+            }
+        };
         let keys: Vec<(Lane, String)> = inner
             .pending
-            .keys()
-            .filter(|(l, id)| *l == lane && sync_id.is_none_or(|s| s == id))
-            .cloned()
+            .iter()
+            .filter(|((l, id), p)| *l == lane && due(id, p))
+            .map(|(k, _)| k.clone())
             .collect();
         let mut enqueued = 0;
         for key in keys {
-            let Some(p) = inner.pending.remove(&key) else {
+            let Some(Pending { usage: p, .. }) = inner.pending.remove(&key) else {
                 continue;
             };
             if p.usage.is_zero() {
@@ -998,6 +1032,14 @@ mod tests {
     #[tokio::test]
     async fn usage_is_durable_per_lane() {
         crate::test_support::ledger_contract(&MemStore::new()).await;
+    }
+
+    #[tokio::test]
+    async fn idle_usage_waits_for_its_period() {
+        crate::test_support::idle_usage_contract(&MemStore::new(), async |s: &MemStore, by| {
+            s.age_pending_usage(by)
+        })
+        .await;
     }
 
     #[tokio::test]

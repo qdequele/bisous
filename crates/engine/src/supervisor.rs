@@ -260,6 +260,15 @@ impl Supervisor {
         lock(&self.syncs).keys().cloned().collect()
     }
 
+    /// Whether a supervision loop is alive for the sync (running or waiting
+    /// to retry), without reading the store. A held, failed or stopped
+    /// sync is not.
+    pub fn is_running(&self, sync_id: &str) -> bool {
+        lock(&self.syncs)
+            .get(sync_id)
+            .is_some_and(|entry| lock(&entry.info).running)
+    }
+
     pub async fn status(&self, sync_id: &str) -> Result<Option<SyncStatus>, SupervisorError> {
         let (info, monitor) = {
             let syncs = lock(&self.syncs);
