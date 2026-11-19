@@ -16,6 +16,10 @@ All notable changes to meili-connect are listed here. The format follows
   at check, discover, create, update and every sync (re)start
   (`422 host_not_allowed`). The Meilisearch client connects only to vetted
   addresses, uses no proxy and follows no redirects.
+- A `PUT` may no longer send `"<redacted>"` for a secret whose connection
+  changed (new source host, port, URL, user, database or TLS settings, new
+  Meilisearch URL): the stored secret would have gone to the new host.
+  `422 secret_required` asks for it again.
 - Errors returned to the Lab and stored for a tenant's sync are reduced to
   their class and a fixed description; non-Meilisearch response bodies are
   never echoed in errors.

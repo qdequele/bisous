@@ -19,7 +19,9 @@ use crate::auth::{Principal, Scope};
 use crate::error::{ApiError, source_error};
 use crate::guard::{VetError, coarse_source_error, vet_destination, vet_source};
 use crate::manager::RemoveError;
-use crate::redact::{REDACTED, contains_redacted, redact_spec, restore_redacted};
+use crate::redact::{
+    REDACTED, check_placeholders, contains_redacted, redact_spec, restore_redacted,
+};
 use crate::state::AppState;
 
 type ApiResult<T> = Result<T, ApiError>;
@@ -287,6 +289,7 @@ pub async fn update_sync(
     let current = owned(&state, &scope, &id).await?;
     let stored_json = serde_json::to_value(&current.spec)
         .map_err(|_| ApiError::internal("cannot serialize the sync"))?;
+    check_placeholders(&value, &stored_json).map_err(ApiError::secret_required)?;
     restore_redacted(&mut value, &stored_json).map_err(ApiError::invalid)?;
     let input: SyncInput =
         serde_json::from_value(value).map_err(|e| ApiError::invalid(e.to_string()))?;

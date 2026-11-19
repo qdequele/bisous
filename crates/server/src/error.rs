@@ -45,6 +45,11 @@ impl ApiError {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", message)
     }
 
+    /// A `"<redacted>"` placeholder for a secret whose connection changed.
+    pub fn secret_required(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::UNPROCESSABLE_ENTITY, "secret_required", message)
+    }
+
     /// A source or destination the host policy refuses.
     pub fn host_not_allowed(message: impl Into<String>) -> Self {
         Self::new(

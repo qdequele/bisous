@@ -121,7 +121,11 @@ spec the API returns has the Meilisearch key and the source's secrets
 
 `PUT` replaces the spec, then stops and restarts the sync. Send
 `"<redacted>"` for any secret to keep the stored value, so a `GET` body can be
-edited and sent back:
+edited and sent back. A placeholder is only accepted while the connection it
+belongs to is unchanged: the source's kind, hosts, ports, URLs, user,
+database and TLS settings for a source secret, the URL for the Meilisearch
+key. Point the sync somewhere else and the secret must be sent again
+(`422 secret_required`), so a stored secret never follows a new host.
 
 ```bash
 curl -s $API/syncs/$ID -H "$AUTH" | jq '.name = "products v2"' \

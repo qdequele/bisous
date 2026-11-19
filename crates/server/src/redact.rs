@@ -145,9 +145,116 @@ pub fn redact_spec(spec: &mut Value) {
     }
 }
 
+/// The non-secret fields that say where, and as whom, a connector connects.
+/// A stored secret belongs to them: it is only sent again to the same place.
+fn identity_paths(kind: SourceKind) -> &'static [&'static [&'static str]] {
+    match kind {
+        SourceKind::Postgres | SourceKind::Supabase => &[
+            &["url"],
+            &["host"],
+            &["port"],
+            &["database"],
+            &["user"],
+            &["sslmode"],
+            &["ca_cert"],
+        ],
+        SourceKind::Mysql => &[
+            &["host"],
+            &["port"],
+            &["user"],
+            &["database"],
+            &["tls", "mode"],
+            &["tls", "ca_pem"],
+        ],
+        SourceKind::Mongodb => &[&["uri"], &["database"]],
+        SourceKind::Kafka => &[
+            &["bootstrap_servers"],
+            &["security", "protocol"],
+            &["security", "tls", "ca_pem"],
+            &["security", "tls", "cert_pem"],
+            &["security", "tls", "verify_hostname"],
+            &["security", "sasl", "mechanism"],
+            &["security", "sasl", "username"],
+        ],
+        SourceKind::Dynamodb => &[
+            &["region"],
+            &["endpoint_url"],
+            &["credentials", "type"],
+            &["credentials", "access_key_id"],
+            &["credentials", "role_arn"],
+            &["credentials", "session_name"],
+        ],
+    }
+}
+
+fn at<'a>(value: &'a Value, path: &[&str]) -> Option<&'a Value> {
+    path.iter()
+        .try_fold(value, |v, p| v.get(*p))
+        .filter(|v| !v.is_null())
+}
+
+/// `incoming` (with its placeholders) names the same thing as `stored`: a
+/// placeholder restores the stored value, so it counts as unchanged.
+fn same(incoming: Option<&Value>, stored: Option<&Value>) -> bool {
+    incoming.and_then(Value::as_str) == Some(REDACTED) || incoming == stored
+}
+
+/// A [`REDACTED`] placeholder may only stand for a secret whose connection
+/// identity did not change: the same source kind, hosts, ports, URLs,
+/// users, databases, TLS settings… for a source secret; the same URL for
+/// the Meilisearch key. Otherwise a `PUT` could send a stored secret to a
+/// new host. Names the first changed field.
+pub fn check_placeholders(incoming: &Value, stored: &Value) -> Result<(), String> {
+    let refuse = |secret: String, changed: String| {
+        Err(format!(
+            "`{secret}` is \"{REDACTED}\" but `{changed}` changed: send the secret again \
+             (a stored secret is only reused for the same connection)"
+        ))
+    };
+    if let Some(dest) = incoming.get("destination")
+        && let Some(secret) = contains_redacted(dest)
+    {
+        let url = |v: &Value| {
+            v.get("destination")
+                .and_then(|d| d.get("url"))
+                .and_then(Value::as_str)
+                .map(|u| u.trim().to_owned())
+        };
+        if url(incoming) != url(stored) {
+            return refuse(
+                format!("destination.{secret}"),
+                "destination.url".to_owned(),
+            );
+        }
+    }
+    if let Some(source) = incoming.get("source")
+        && let Some(secret) = contains_redacted(source)
+    {
+        let secret = format!("source.{secret}");
+        let kind_of = |v: &Value| v.get("source").and_then(|s| s.get("kind")).cloned();
+        let kind = kind_of(incoming)
+            .filter(|k| Some(k) == kind_of(stored).as_ref())
+            .and_then(|k| serde_json::from_value::<SourceKind>(k).ok());
+        let Some(kind) = kind else {
+            return refuse(secret, "source.kind".to_owned());
+        };
+        let config = |v: &'_ Value| v.get("source").and_then(|s| s.get("config")).cloned();
+        let (new, old) = (
+            config(incoming).unwrap_or(Value::Null),
+            config(stored).unwrap_or(Value::Null),
+        );
+        for path in identity_paths(kind) {
+            if !same(at(&new, path), at(&old, path)) {
+                return refuse(secret, format!("source.config.{}", path.join(".")));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Replace every [`REDACTED`] string of `incoming` by the value at the same
 /// path in `stored`. Fails, naming the field, when there is nothing to
-/// restore it from.
+/// restore it from. Run [`check_placeholders`] first.
 pub fn restore_redacted(incoming: &mut Value, stored: &Value) -> Result<(), String> {
     let mut path = Vec::new();
     restore(incoming, Some(stored), &mut path)
@@ -282,18 +389,91 @@ mod tests {
     }
 
     #[test]
-    fn redacted_values_round_trip() {
+    fn redacted_values_round_trip_for_the_same_connection_only() {
         let stored = json!({
-            "source": {"kind": "postgres", "config": {"url": "postgres://u:pw@h/db"}},
+            "source": {"kind": "postgres", "config": {
+                "url": "postgres://u:pw@h/db", "password": "pw", "slot_name": "s"}},
             "destination": {"url": "http://m", "api_key": "k"},
         });
         let mut view = stored.clone();
         redact_spec(&mut view);
-        view["destination"]["url"] = json!("http://m2");
-        restore_redacted(&mut view, &stored).unwrap();
-        assert_eq!(view["source"]["config"]["url"], "postgres://u:pw@h/db");
-        assert_eq!(view["destination"]["api_key"], "k");
-        assert_eq!(view["destination"]["url"], "http://m2");
+        // Unchanged identity, other fields edited: the secrets come back.
+        view["source"]["config"]["slot_name"] = json!("s2");
+        check_placeholders(&view, &stored).unwrap();
+        let mut restored = view.clone();
+        restore_redacted(&mut restored, &stored).unwrap();
+        assert_eq!(restored["source"]["config"]["url"], "postgres://u:pw@h/db");
+        assert_eq!(restored["destination"]["api_key"], "k");
+
+        // A new Meilisearch URL with the stored key: refused.
+        let mut moved = view.clone();
+        moved["destination"]["url"] = json!("http://attacker.example");
+        let err = check_placeholders(&moved, &stored).unwrap_err();
+        assert!(
+            err.contains("destination.api_key") && err.contains("destination.url"),
+            "{err}"
+        );
+        // With the key sent again it is fine.
+        moved["destination"]["api_key"] = json!("new-key");
+        check_placeholders(&moved, &stored).unwrap();
+
+        // A new source host (overriding the URL's) with the stored password.
+        let mut moved = view.clone();
+        moved["source"]["config"]["host"] = json!("attacker.example");
+        let err = check_placeholders(&moved, &stored).unwrap_err();
+        assert!(err.contains("source.config.host"), "{err}");
+        // Same with another kind, user or port.
+        for (path, value) in [
+            ("kind", json!("mysql")),
+            ("user", json!("admin")),
+            ("port", json!(5433)),
+            ("sslmode", json!("disable")),
+        ] {
+            let mut moved = view.clone();
+            if path == "kind" {
+                moved["source"]["kind"] = value;
+            } else {
+                moved["source"]["config"][path] = value;
+            }
+            assert!(check_placeholders(&moved, &stored).is_err(), "{path}");
+        }
+    }
+
+    #[test]
+    fn identity_of_every_connector() {
+        let kafka = json!({"source": {"kind": "kafka", "config": {
+            "bootstrap_servers": ["b:9092"],
+            "security": {"protocol": "sasl_ssl", "sasl": {"mechanism": "PLAIN", "username": "u",
+                "password": "pw"}}}}});
+        let mut view = kafka.clone();
+        redact_spec(&mut view);
+        check_placeholders(&view, &kafka).unwrap();
+        view["source"]["config"]["bootstrap_servers"] = json!(["evil:9092"]);
+        assert!(check_placeholders(&view, &kafka).is_err());
+
+        let dynamo = json!({"source": {"kind": "dynamodb", "config": {"region": "eu-west-1",
+            "credentials": {"type": "static", "access_key_id": "AKIA", "secret_access_key": "s"}}}});
+        let mut view = dynamo.clone();
+        redact_spec(&mut view);
+        check_placeholders(&view, &dynamo).unwrap();
+        view["source"]["config"]["endpoint_url"] = json!("http://evil:8000");
+        assert!(check_placeholders(&view, &dynamo).is_err());
+
+        let mysql = json!({"source": {"kind": "mysql", "config": {"host": "h", "user": "u",
+            "password": "pw"}}});
+        let mut view = mysql.clone();
+        redact_spec(&mut view);
+        check_placeholders(&view, &mysql).unwrap();
+        view["source"]["config"]["tls"] = json!({"mode": "disabled"});
+        assert!(check_placeholders(&view, &mysql).is_err());
+
+        // The MongoDB URI is itself the secret: a new URI is a real value.
+        let mongo = json!({"source": {"kind": "mongodb", "config": {"uri": "mongodb://u:pw@h"}}});
+        let mut view = mongo.clone();
+        redact_spec(&mut view);
+        check_placeholders(&view, &mongo).unwrap();
+        view["source"]["config"]["uri"] = json!("mongodb://evil");
+        check_placeholders(&view, &mongo).unwrap();
     }
 
     #[test]

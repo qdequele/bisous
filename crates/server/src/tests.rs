@@ -579,7 +579,7 @@ async fn put_keeps_redacted_secrets() {
         "PUT",
         &format!("/syncs/{id}"),
         &[],
-        Some(current),
+        Some(current.clone()),
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -589,6 +589,54 @@ async fn put_keeps_redacted_secrets() {
             .unwrap()
             .contains("source.config.new_token")
     );
+
+    // A placeholder never follows a new destination or a new source host.
+    current["source"]["config"]["new_token"] = json!("t");
+    let mut moved = current.clone();
+    moved["destination"]["url"] = json!("http://attacker.example:7700");
+    let (status, body) = call(
+        &a.router,
+        "PUT",
+        &format!("/syncs/{id}"),
+        &[],
+        Some(moved.clone()),
+    )
+    .await;
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (StatusCode::UNPROCESSABLE_ENTITY, Some("secret_required")),
+        "{body}"
+    );
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap()
+            .contains("destination.api_key")
+    );
+    let mut moved_source = current.clone();
+    moved_source["source"]["config"]["host"] = json!("attacker.example");
+    let (status, body) = call(
+        &a.router,
+        "PUT",
+        &format!("/syncs/{id}"),
+        &[],
+        Some(moved_source),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["code"], "secret_required");
+    let stored = a.store.get_sync(None, &id).await.unwrap().unwrap().spec;
+    assert_eq!(
+        stored.destination.url, "http://meili:7700",
+        "nothing changed"
+    );
+    // Sending the key again moves it.
+    moved["destination"]["api_key"] = json!("other-key");
+    let (status, _) = call(&a.router, "PUT", &format!("/syncs/{id}"), &[], Some(moved)).await;
+    assert_eq!(status, StatusCode::OK);
+    let stored = a.store.get_sync(None, &id).await.unwrap().unwrap().spec;
+    assert_eq!(stored.destination.url, "http://attacker.example:7700");
+    assert_eq!(stored.destination.api_key.expose(), "other-key");
 
     // A create never accepts placeholders.
     let mut body = sync_body("other");
