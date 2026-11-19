@@ -18,12 +18,13 @@ use meili_connect_core::{
     StreamMapping, SyncPhase,
 };
 use meili_connect_engine::SupervisorConfig;
-use meili_connect_store::{LabOutbox, Lane, MemStore, SyncRepository, UsageLedger};
+use meili_connect_store::{LabOutbox, Lane, MemStore, SecretKey, SyncRepository, UsageLedger};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 use tower::ServiceExt;
 
 use crate::auth::{AuthConfig, H_TENANT_ID};
+use crate::external_id::{AwsPrincipal, ExternalIds};
 use crate::limits::Limits;
 use crate::manager::SinkFactory;
 use crate::routes::ROUTES;
@@ -319,6 +320,8 @@ fn app_tweaked(
         lag_guard: Default::default(),
         tinybird: None,
         hosted: false,
+        external_ids: None,
+        aws_principal: test_principal(),
         limits,
     };
     tweak(&mut wiring);
@@ -1050,6 +1053,8 @@ async fn a_loopback_destination_is_host_not_allowed_with_the_real_sinks() {
             lag_guard: Default::default(),
             tinybird: None,
             hosted: false,
+            external_ids: None,
+            aws_principal: test_principal(),
             limits: Limits::default(),
         },
         CancellationToken::new(),
@@ -2650,6 +2655,20 @@ fn dynamo_body(name: &str, credentials: Value) -> Value {
     })
 }
 
+const TEST_PRINCIPAL: &str = "arn:aws:iam::111122223333:role/meili-connect";
+
+fn test_principal() -> Arc<AwsPrincipal> {
+    Arc::new(AwsPrincipal::with_lookup(Arc::new(|| {
+        Box::pin(async {
+            Ok("arn:aws:sts::111122223333:assumed-role/meili-connect/pod".to_owned())
+        })
+    })))
+}
+
+fn test_external_ids() -> Arc<ExternalIds> {
+    Arc::new(ExternalIds::new(&SecretKey::from_bytes([9; 32])))
+}
+
 fn hosted_app(store: Arc<MemStore>) -> App {
     app_tweaked(
         locked(),
@@ -2657,7 +2676,10 @@ fn hosted_app(store: Arc<MemStore>) -> App {
         HostPolicy::any(),
         Limits::default(),
         Duration::from_millis(200),
-        |w| w.hosted = true,
+        |w| {
+            w.hosted = true;
+            w.external_ids = Some(test_external_ids());
+        },
     )
 }
 
@@ -2789,4 +2811,403 @@ async fn a_stored_tenant_sync_with_the_servers_identity_is_held_on_a_hosted_serv
         None,
         "never opened"
     );
+}
+
+// ------------------------------------------------------------- DynamoDB external ID
+
+fn role(external_id: Option<&str>) -> Value {
+    let mut credentials =
+        json!({"type": "assume_role", "role_arn": "arn:aws:iam::123456789012:role/r"});
+    if let Some(id) = external_id {
+        credentials["external_id"] = json!(id);
+    }
+    credentials
+}
+
+fn dynamo_probe(credentials: Value) -> Value {
+    json!({"source": {"kind": "dynamodb", "config": {"region": "eu-west-1", "credentials": credentials}}})
+}
+
+fn opened_external_id(app: &App) -> Option<String> {
+    app.probe
+        .last_opened
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|c| c["credentials"]["external_id"].as_str().map(str::to_owned))
+}
+
+async fn stored_credentials(app: &App, tenant: Option<&str>, id: &str) -> Value {
+    let stored = app
+        .store
+        .get_sync(tenant, id)
+        .await
+        .unwrap()
+        .unwrap()
+        .readable()
+        .unwrap();
+    stored.spec.source.config["credentials"].clone()
+}
+
+#[tokio::test]
+async fn a_tenant_assumes_its_role_with_the_external_id_the_server_derives() {
+    let a = hosted_app(Arc::new(MemStore::new()));
+    let ids = test_external_ids();
+    let (a_id, b_id) = (ids.for_tenant("team-a"), ids.for_tenant("team-b"));
+    assert_ne!(a_id, b_id);
+
+    // Tenant B names A's role with A's external ID: refused everywhere.
+    let (status, body) = call(
+        &a.router,
+        "POST",
+        "/syncs",
+        &lab("team-b"),
+        Some(dynamo_body("stolen", role(Some(&a_id)))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["code"], "external_id_not_allowed");
+    let message = body["message"].as_str().unwrap();
+    assert!(message.contains("/sources/dynamodb/trust"), "{message}");
+    assert!(!message.contains(&a_id), "{message}");
+    for route in ["/sources/check", "/sources/discover"] {
+        let (status, body) = call(
+            &a.router,
+            "POST",
+            route,
+            &lab("team-b"),
+            Some(dynamo_probe(role(Some(&a_id)))),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{route}: {body}");
+        assert_eq!(body["code"], "external_id_not_allowed");
+    }
+    // Its own ID, or none: the check runs.
+    for given in [Some(b_id.as_str()), None] {
+        let (status, body) = call(
+            &a.router,
+            "POST",
+            "/sources/check",
+            &lab("team-b"),
+            Some(dynamo_probe(role(given))),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    // A's own ID or none: accepted, never stored, and the engine assumes
+    // the role with A's ID.
+    let mut syncs_of_a = Vec::new();
+    for (name, given) in [("own", Some(a_id.as_str())), ("none", None)] {
+        let (status, body) = call(
+            &a.router,
+            "POST",
+            "/syncs",
+            &lab("team-a"),
+            Some(dynamo_body(name, role(given))),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let id = body["id"].as_str().unwrap().to_owned();
+        assert_eq!(
+            body["source"]["config"]["credentials"].get("external_id"),
+            None
+        );
+        let stored = stored_credentials(&a, Some("team-a"), &id).await;
+        assert_eq!(stored.get("external_id"), None, "{stored}");
+        syncs_of_a.push(id);
+    }
+    wait_for(async || opened_external_id(&a).as_deref() == Some(a_id.as_str())).await;
+
+    // An update with another tenant's ID is refused; with its own, the
+    // stored spec still holds none.
+    let id = &syncs_of_a[0];
+    let (status, body) = call(
+        &a.router,
+        "PUT",
+        &format!("/syncs/{id}"),
+        &lab("team-a"),
+        Some(dynamo_body("own", role(Some(&b_id)))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["code"], "external_id_not_allowed");
+    let (status, body) = call(
+        &a.router,
+        "PUT",
+        &format!("/syncs/{id}"),
+        &lab("team-a"),
+        Some(dynamo_body("renamed", role(Some(&a_id)))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        stored_credentials(&a, Some("team-a"), id)
+            .await
+            .get("external_id"),
+        None
+    );
+}
+
+#[tokio::test]
+async fn the_trust_route_gives_each_tenant_its_own_external_id_and_policy() {
+    let a = hosted_app(Arc::new(MemStore::new()));
+    let ids = test_external_ids();
+    let mut seen = Vec::new();
+    for tenant in ["team-a", "team-b"] {
+        let (status, body) = call(
+            &a.router,
+            "GET",
+            "/sources/dynamodb/trust",
+            &lab(tenant),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let expected = ids.for_tenant(tenant);
+        assert_eq!(body["external_id"], expected.as_str());
+        assert_eq!(body["principal"], TEST_PRINCIPAL);
+        assert_eq!(body["note"], Value::Null);
+        let statement = &body["trust_policy"]["Statement"][0];
+        assert_eq!(body["trust_policy"]["Version"], "2012-10-17");
+        assert_eq!(statement["Effect"], "Allow");
+        assert_eq!(statement["Action"], "sts:AssumeRole");
+        assert_eq!(statement["Principal"]["AWS"], TEST_PRINCIPAL);
+        assert_eq!(
+            statement["Condition"]["StringEquals"]["sts:ExternalId"],
+            expected.as_str()
+        );
+        seen.push(expected);
+    }
+    assert_ne!(seen[0], seen[1]);
+    // The admin acting for a tenant gets that tenant's.
+    let mut tenant_admin = admin();
+    tenant_admin.push((H_TENANT_ID, "team-a".to_owned()));
+    let (_, body) = call(
+        &a.router,
+        "GET",
+        "/sources/dynamodb/trust",
+        &tenant_admin,
+        None,
+    )
+    .await;
+    assert_eq!(body["external_id"], seen[0].as_str());
+
+    // The global scope and a server that is not hosted choose their own.
+    let (status, body) = call(&a.router, "GET", "/sources/dynamodb/trust", &admin(), None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let s = app(locked());
+    let (status, _) = call(
+        &s.router,
+        "GET",
+        "/sources/dynamodb/trust",
+        &lab("team-a"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // No CONNECT_SECRET_KEY: no external IDs. An unknown principal: null,
+    // a note, and a placeholder in the policy.
+    let unknown = app_tweaked(
+        locked(),
+        Arc::new(MemStore::new()),
+        HostPolicy::any(),
+        Limits::default(),
+        Duration::from_millis(200),
+        |w| w.hosted = true,
+    );
+    let (status, body) = call(
+        &unknown.router,
+        "GET",
+        "/sources/dynamodb/trust",
+        &lab("team-a"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["code"], "external_id_unavailable");
+    let unknown = app_tweaked(
+        locked(),
+        Arc::new(MemStore::new()),
+        HostPolicy::any(),
+        Limits::default(),
+        Duration::from_millis(200),
+        |w| {
+            w.hosted = true;
+            w.external_ids = Some(test_external_ids());
+            w.aws_principal = Arc::new(AwsPrincipal::with_lookup(Arc::new(|| {
+                Box::pin(async { Err("no credentials".to_owned()) })
+            })));
+        },
+    );
+    let (status, body) = call(
+        &unknown.router,
+        "GET",
+        "/sources/dynamodb/trust",
+        &lab("team-a"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["principal"], Value::Null);
+    assert!(body["note"].as_str().unwrap().contains("operator"));
+    assert_eq!(
+        body["trust_policy"]["Statement"][0]["Principal"]["AWS"],
+        crate::external_id::PRINCIPAL_PLACEHOLDER
+    );
+}
+
+#[tokio::test]
+async fn the_global_scope_and_a_standalone_server_keep_a_free_form_external_id() {
+    // The standalone admin on a hosted server.
+    let a = hosted_app(Arc::new(MemStore::new()));
+    let (status, body) = call(
+        &a.router,
+        "POST",
+        "/syncs",
+        &admin(),
+        Some(dynamo_body("g", role(Some("chosen-by-the-operator")))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let id = body["id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        stored_credentials(&a, None, &id).await["external_id"],
+        "chosen-by-the-operator"
+    );
+    wait_for(async || opened_external_id(&a).as_deref() == Some("chosen-by-the-operator")).await;
+
+    // A server that is not hosted: its tenants choose too.
+    let s = app(locked());
+    let (status, body) = call(
+        &s.router,
+        "POST",
+        "/syncs",
+        &lab("team-a"),
+        Some(dynamo_body("t", role(Some("chosen")))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let id = body["id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        stored_credentials(&s, Some("team-a"), &id).await["external_id"],
+        "chosen"
+    );
+    wait_for(async || opened_external_id(&s).as_deref() == Some("chosen")).await;
+}
+
+#[tokio::test]
+async fn without_a_secret_key_a_hosted_server_refuses_assume_role_for_tenants() {
+    let a = app_tweaked(
+        locked(),
+        Arc::new(MemStore::new()),
+        HostPolicy::any(),
+        Limits::default(),
+        Duration::from_millis(200),
+        |w| w.hosted = true,
+    );
+    let (status, body) = call(
+        &a.router,
+        "POST",
+        "/syncs",
+        &lab("team-a"),
+        Some(dynamo_body("r", role(None))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["code"], "external_id_unavailable");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap()
+            .contains("CONNECT_SECRET_KEY")
+    );
+    let (status, body) = call(
+        &a.router,
+        "POST",
+        "/sources/check",
+        &lab("team-a"),
+        Some(dynamo_probe(role(None))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["code"], "external_id_unavailable");
+    // Static keys and the global scope are unaffected.
+    let (status, _) = call(
+        &a.router,
+        "POST",
+        "/syncs",
+        &lab("team-a"),
+        Some(dynamo_body(
+            "s",
+            json!({"type": "static", "access_key_id": "A", "secret_access_key": "S"}),
+        )),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = call(
+        &a.router,
+        "POST",
+        "/syncs",
+        &admin(),
+        Some(dynamo_body("g", role(Some("x")))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn a_stored_tenant_sync_with_a_foreign_external_id_is_held_at_start() {
+    // Stored before the rule, with an external ID its tenant chose.
+    let before = app(locked());
+    let (status, body) = call(
+        &before.router,
+        "POST",
+        "/syncs",
+        &lab("team-a"),
+        Some(dynamo_body("legacy", role(Some("chosen-by-team-a")))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let id = body["id"].as_str().unwrap().to_owned();
+    let row = before
+        .store
+        .get_sync(Some("team-a"), &id)
+        .await
+        .unwrap()
+        .unwrap()
+        .readable()
+        .unwrap();
+    before.state.manager.shutdown(Duration::from_secs(5)).await;
+
+    let store = Arc::new(MemStore::new());
+    store.create_sync(Some("team-a"), &row.spec).await.unwrap();
+    let a = hosted_app(Arc::clone(&store));
+    boot_syncs(&a.state).await.unwrap();
+    let path = format!("/syncs/{id}/status");
+    wait_for(async || {
+        call(&a.router, "GET", &path, &lab("team-a"), None).await.1["phase"] == "held"
+    })
+    .await;
+    let (_, status) = call(&a.router, "GET", &path, &lab("team-a"), None).await;
+    let message = status["message"].as_str().unwrap_or_default().to_owned();
+    let expected = test_external_ids().for_tenant("team-a");
+    assert!(
+        message.contains("trust policy") && message.contains(&expected),
+        "{status}"
+    );
+    assert_eq!(opened_external_id(&a), None, "never opened");
+
+    // Saved again without it: it runs with the derived ID.
+    let (status, body) = call(
+        &a.router,
+        "PUT",
+        &format!("/syncs/{id}"),
+        &lab("team-a"),
+        Some(dynamo_body("legacy", role(None))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    wait_for(async || opened_external_id(&a).as_deref() == Some(expected.as_str())).await;
 }

@@ -159,6 +159,9 @@ Standalone works with none of the `LAB_*` variables set. With them:
 - **Secrets at rest** are sealed with ChaCha20-Poly1305
   (`version(1)‖nonce(12)‖ciphertext`, key from `CONNECT_SECRET_KEY`), same
   layout as glutony's connections.
+- **A tenant's DynamoDB role** is assumed with an external ID the server
+  derives for that tenant (see "Host policy", confused deputy), shown by
+  `GET /sources/dynamodb/trust`.
 
 ## Telemetry (`server::metrics`)
 
@@ -216,6 +219,40 @@ environment (`server::ambient`: DynamoDB `credentials: default`, MongoDB URI
 file options and host-identity auth mechanisms, Postgres URL file
 parameters). Refused by the API (`422 ambient_credentials`) and, for a sync
 stored earlier, by `GuardedSources` before its first connection (held).
+
+**Lending the server's identity to a tenant-named resource** (confused
+deputy). A DynamoDB `credentials: assume_role` source makes the server call
+`sts:AssumeRole` with its own AWS identity on a role ARN the tenant names.
+Every role that trusts that identity would be reachable by every tenant who
+learns its ARN, so the external ID of a tenant's role is chosen by the
+server, never by the tenant (`server::external_id`):
+`"mc-" + hex(HMAC-SHA256(k, "dynamodb-external-id:v1:" + tenant))[..32]`,
+with `k = SecretKey::derive_subkey("dynamodb-external-id")` (HMAC-SHA256 of
+`CONNECT_SECRET_KEY` under a fixed label; the sealing key itself is never
+used). It is stable per tenant, different between tenants, and no tenant can
+compute another's.
+
+- Check, discover, create and update refuse another `external_id`
+  (`422 external_id_not_allowed`) and drop the tenant's own: a stored spec
+  holds none.
+- `GuardedSources` builds every source of a tenant's sync (probes and each
+  engine start) with the tenant's external ID; a spec stored earlier with
+  another one is held before its first connection, with a message naming
+  the new external ID to put in the role's trust policy.
+- `GET /sources/dynamodb/trust` gives a tenant its external ID, the server's
+  principal (`sts:GetCallerIdentity`, cached) and the trust policy to paste.
+- Without `CONNECT_SECRET_KEY` (in-memory store) there is no key: a tenant's
+  assume-role is refused (`422 external_id_unavailable`).
+- The global scope (standalone admin) and a server that is not hosted keep a
+  free-form `external_id`: the operator owns both sides.
+- Rotating `CONNECT_SECRET_KEY` changes every tenant's external ID: their
+  assume-role syncs fail until the trust policies follow.
+
+The same shape elsewhere is refused by `server::ambient`: MongoDB
+`authMechanism=MONGODB-AWS` (and `MONGODB-OIDC`, `GSSAPI`, `MONGODB-X509`)
+would authenticate with the host's identity. Kafka offers only `PLAIN` and
+`SCRAM-*` (no MSK IAM, no `OAUTHBEARER`), and neither Postgres nor MySQL has
+RDS IAM authentication: nothing else lends the server's identity.
 
 ## Changes to a sync (`server::manager`)
 

@@ -58,6 +58,8 @@ pub enum CredentialsConfig {
     /// default). The base credentials are the host's default chain.
     AssumeRole {
         role_arn: String,
+        /// For a tenant's sync on a hosted server, the server sets it (one
+        /// per tenant, derived from its secret key) and refuses another.
         #[serde(default)]
         external_id: Option<Secret>,
         /// Defaults to `meili-connect-<sync id>`.

@@ -19,6 +19,7 @@ use serde_json::{Value, json};
 
 use crate::auth::{Principal, Scope};
 use crate::error::{ApiError, source_error};
+use crate::external_id::Refusal;
 use crate::guard::{VetError, coarse_source_error, vet_destination, vet_source};
 use crate::redact::{
     REDACTED, check_placeholders, contains_redacted, redact_spec, restore_redacted,
@@ -72,16 +73,36 @@ async fn probe_source(
     scope: &Scope,
 ) -> ApiResult<Box<dyn Source>> {
     let coarse = coarse(scope);
-    refuse_ambient(state, scope.tenant.is_some(), &req.source)?;
-    let sources = state.sources(coarse);
+    let tenant = scope.tenant.as_deref();
+    refuse_ambient(state, tenant.is_some(), &req.source)?;
+    let mut source = req.source.clone();
+    take_external_id(state, tenant, &mut source)?;
+    let sources = state.sources(coarse, tenant);
     state
         .registry
-        .build(PROBE_ID, &req.source, &req.streams)
+        .build(PROBE_ID, &source, &req.streams)
         .map_err(|e| source_error(&e))?;
-    vet(state, &req.source, coarse).await?;
+    vet(state, &source, coarse).await?;
     sources
-        .build_vetted(PROBE_ID, &req.source, &req.streams)
+        .build_vetted(PROBE_ID, &source, &req.streams)
         .map_err(|e| source_error(&e))
+}
+
+/// On a hosted server, a tenant's DynamoDB role is assumed with the
+/// external ID this server derives for it (`crate::external_id`): refuse
+/// another one, drop the tenant's own (it is put back at every build).
+fn take_external_id(
+    state: &AppState,
+    tenant: Option<&str>,
+    source: &mut SourceSpec,
+) -> ApiResult<()> {
+    let Some(binding) = state.external_id_binding(tenant) else {
+        return Ok(());
+    };
+    crate::external_id::take_requested(source, &binding).map_err(|refusal| match refusal {
+        Refusal::Mismatch { .. } => ApiError::external_id_not_allowed(),
+        Refusal::Unavailable => ApiError::external_id_unavailable(),
+    })
 }
 
 /// Every endpoint of the source passes the host policy.
@@ -168,6 +189,26 @@ pub async fn discover_source(
     Ok(Json(json!({ "collections": collections })))
 }
 
+/// What a tenant puts in its DynamoDB role's trust policy: the external ID
+/// this server assumes the role with for it, and the server's principal.
+pub async fn dynamodb_trust(State(state): State<AppState>, scope: Scope) -> ApiResult<Json<Value>> {
+    let Some(binding) = state.external_id_binding(scope.tenant.as_deref()) else {
+        return Err(ApiError::invalid(
+            "the external ID is chosen by this server only for a tenant's syncs on a hosted \
+             server: here, choose your own `external_id`",
+        ));
+    };
+    let ids = binding.ids.ok_or_else(ApiError::external_id_unavailable)?;
+    let external_id = ids.for_tenant(&binding.tenant);
+    let principal = state.aws_principal.get().await;
+    Ok(Json(json!({
+        "external_id": external_id,
+        "principal": principal,
+        "trust_policy": crate::external_id::trust_policy(principal.as_deref(), &external_id),
+        "note": principal.is_none().then_some(crate::external_id::PRINCIPAL_UNKNOWN),
+    })))
+}
+
 // ---------------------------------------------------------------- syncs
 
 /// The writable part of a sync. `id`, `tenant`, `created_at` and
@@ -213,8 +254,9 @@ impl SyncInput {
 /// `SyncSpec::validate` plus what the server needs: a name, a
 /// Meilisearch URL, a source config its connector accepts, and a source and
 /// a destination the host policy allows (resolved now, so a refusal is
-/// immediate; vetted again on every start).
-async fn validate(state: &AppState, spec: &SyncSpec, coarse: bool) -> ApiResult<()> {
+/// immediate; vetted again on every start). A tenant's DynamoDB
+/// `external_id` is checked and dropped (`crate::external_id`).
+async fn validate(state: &AppState, spec: &mut SyncSpec, coarse: bool) -> ApiResult<()> {
     if spec.name.is_empty() || spec.name.len() > MAX_NAME_LEN {
         return Err(ApiError::invalid(format!(
             "name must be 1 to {MAX_NAME_LEN} characters"
@@ -230,8 +272,9 @@ async fn validate(state: &AppState, spec: &SyncSpec, coarse: bool) -> ApiResult<
     vet_destination(&state.policy, url)
         .await
         .map_err(ApiError::host_not_allowed)?;
-    validate_shape(state, spec)?;
     refuse_ambient(state, spec.tenant.is_some(), &spec.source)?;
+    take_external_id(state, spec.tenant.as_deref(), &mut spec.source)?;
+    validate_shape(state, spec)?;
     vet(state, &spec.source, coarse).await
 }
 
@@ -313,8 +356,8 @@ pub async fn create_sync(
     let input: SyncInput =
         serde_json::from_value(value).map_err(|e| ApiError::invalid(e.to_string()))?;
     let id = uuid::Uuid::now_v7().to_string();
-    let spec = input.into_spec(id, scope.tenant.clone());
-    validate(&state, &spec, coarse(&scope)).await?;
+    let mut spec = input.into_spec(id, scope.tenant.clone());
+    validate(&state, &mut spec, coarse(&scope)).await?;
     let manager = Arc::clone(&state.manager);
     let stored = detached(async move { manager.create(spec).await }).await?;
     tracing::info!(sync_id = %stored.spec.id, tenant = ?scope.tenant(), "sync created");
@@ -356,8 +399,8 @@ pub async fn update_sync(
             restore_redacted(&mut value, &stored_json).map_err(ApiError::invalid)?;
             let input: SyncInput = serde_json::from_value(std::mem::take(&mut value))
                 .map_err(|e| ApiError::invalid(e.to_string()))?;
-            let spec = input.into_spec(current.spec.id.clone(), current.spec.tenant.clone());
-            validate(&state, &spec, coarse).await?;
+            let mut spec = input.into_spec(current.spec.id.clone(), current.spec.tenant.clone());
+            validate(&state, &mut spec, coarse).await?;
             Ok(spec)
         };
         state

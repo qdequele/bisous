@@ -84,6 +84,41 @@ impl Clients {
     }
 }
 
+/// The ARN of this host's own AWS identity (the default provider chain), from
+/// `sts:GetCallerIdentity`: the principal that assumes customers' roles.
+/// The error is a short description, without the SDK's cause chain.
+pub async fn host_caller_arn(timeout: Duration) -> Result<String, String> {
+    let lookup = async {
+        let sdk = aws_config::defaults(BehaviorVersion::latest())
+            .timeout_config(
+                TimeoutConfig::builder()
+                    .connect_timeout(Duration::from_secs(3))
+                    .operation_timeout(timeout)
+                    .build(),
+            )
+            .load()
+            .await;
+        let mut sts = aws_sdk_sts::config::Builder::from(&sdk);
+        if sdk.region().is_none() {
+            // GetCallerIdentity answers in every region.
+            sts = sts.region(Region::new("us-east-1"));
+        }
+        let out = aws_sdk_sts::Client::from_conf(sts.build())
+            .get_caller_identity()
+            .send()
+            .await
+            .map_err(|e| {
+                tracing::warn!(error = %aws_smithy_types::error::display::DisplayErrorContext(&e), "sts:GetCallerIdentity failed");
+                "sts:GetCallerIdentity failed (no AWS credentials on this server?)".to_owned()
+            })?;
+        out.arn
+            .ok_or_else(|| "sts:GetCallerIdentity returned no ARN".to_owned())
+    };
+    tokio::time::timeout(timeout, lookup)
+        .await
+        .map_err(|_| "sts:GetCallerIdentity did not answer in time".to_owned())?
+}
+
 /// STS session names: 2–64 chars of `[\w+=,.@-]`.
 fn session_name_for(sync_id: &str) -> String {
     let clean: String = sync_id

@@ -291,6 +291,15 @@ identity (`authMechanism=MONGODB-AWS`, `GSSAPI`, `MONGODB-X509`,
 (`sslrootcert`, `sslcert`, `sslkey`, `passfile`, `service`, …; paste the CA
 as `ca_cert`). The standalone global scope keeps them.
 
+**DynamoDB external IDs.** On a hosted server the server assumes a tenant's
+DynamoDB role with its own AWS identity, so the external ID is chosen by the
+server, one per tenant, never by the tenant: leave `external_id` out (another
+value answers `422 external_id_not_allowed`) and trust the role as
+`GET /sources/dynamodb/trust` shows. It needs `CONNECT_SECRET_KEY`: without
+it a tenant's `assume_role` answers `422 external_id_unavailable`. Changing
+`CONNECT_SECRET_KEY` changes every tenant's external ID. The standalone
+global scope sets its own `external_id`.
+
 ### Pricing and usage
 
 The contract with the Lab is [`docs/LAB_INTEGRATION.md`](docs/LAB_INTEGRATION.md)
@@ -444,6 +453,24 @@ Config: `region`, `endpoint_url` (DynamoDB Local), `credentials`
 (`{"type": "default"}`, `{"type": "static", "access_key_id", "secret_access_key"}`,
 `{"type": "assume_role", "role_arn", "external_id"}`), `scan`, `stream`.
 
+- On a hosted server (the Lab), with `assume_role`: let this server assume
+  the role. `GET /sources/dynamodb/trust` returns your team's external ID,
+  the server's AWS principal and the trust policy to paste on the role; do
+  not send `external_id` (it is set for you).
+
+  ```bash
+  curl -s $API/sources/dynamodb/trust -H "$AUTH" -H "X-Connect-Tenant-Id: $TEAM" | jq
+  # {"external_id": "mc-3f9a1c0e5b7d2a4e8c6f1b0d9e7a5c3b",
+  #  "principal": "arn:aws:iam::111122223333:role/meili-connect",
+  #  "trust_policy": {"Version": "2012-10-17", "Statement": [{"Effect": "Allow",
+  #    "Principal": {"AWS": "arn:aws:iam::111122223333:role/meili-connect"},
+  #    "Action": "sts:AssumeRole",
+  #    "Condition": {"StringEquals": {"sts:ExternalId": "mc-3f9a1c0e5b7d2a4e8c6f1b0d9e7a5c3b"}}}]},
+  #  "note": null}
+  ```
+
+  `principal` is `null` (with a `note`, and a placeholder in the policy)
+  when the server cannot resolve its own identity.
 - DynamoDB Streams enabled on every table with `NEW_IMAGE` or
   `NEW_AND_OLD_IMAGES` (never enabled for you).
 - IAM: `DescribeTable`, `Scan` on the tables; `DescribeStream`,

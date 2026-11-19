@@ -173,6 +173,58 @@ paths:
         "502": { $ref: "#/components/responses/Error" }
         "504": { $ref: "#/components/responses/Error" }
 
+  /sources/dynamodb/trust:
+    get:
+      summary: What a tenant's DynamoDB role must trust
+      description: |
+        On a hosted server (Lab mode or `CONNECT_HOST_POLICY=public`) the
+        server assumes a tenant's DynamoDB role (`credentials: assume_role`)
+        with its own AWS identity and with an external ID it derives for
+        that tenant: stable, different for every tenant, and never chosen by
+        the tenant. A sync, check or discovery that sends another
+        `external_id` is refused (`422 external_id_not_allowed`); leave it
+        out. This route gives the external ID, the server's principal and
+        the trust policy to put on the role.
+
+        Tenant scope only: the global scope chooses its own `external_id`
+        (`400 invalid_request`). Without `CONNECT_SECRET_KEY` the server
+        has no external IDs (`422 external_id_unavailable`).
+      parameters: [{ $ref: "#/components/parameters/TenantId" }]
+      responses:
+        "200":
+          description: The trust to grant.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [external_id, principal, trust_policy, note]
+                properties:
+                  external_id:
+                    type: string
+                    description: "`mc-` and 32 hex characters; the `sts:ExternalId` the role must require."
+                    example: mc-3f9a1c0e5b7d2a4e8c6f1b0d9e7a5c3b
+                  principal:
+                    type: [string, "null"]
+                    description: |
+                      The ARN of this server's AWS principal (from
+                      `sts:GetCallerIdentity`; an assumed-role session is
+                      given as its role), or `null` when it cannot be
+                      resolved (see `note`).
+                    example: arn:aws:iam::111122223333:role/meili-connect
+                  trust_policy:
+                    type: object
+                    description: |
+                      A ready-to-paste IAM trust policy: `principal` may call
+                      `sts:AssumeRole` with `sts:ExternalId` equal to
+                      `external_id`. When `principal` is `null`, it holds a
+                      placeholder in its place.
+                  note:
+                    type: [string, "null"]
+                    description: Why `principal` is `null`; `null` otherwise.
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "422": { $ref: "#/components/responses/Error" }
+
   /syncs:
     post:
       summary: Create a sync and start it
@@ -511,6 +563,11 @@ components:
             whose source or destination changed), `ambient_credentials` (422,
             hosted server: a tenant's source would use the server's own
             identity or files, e.g. DynamoDB `credentials: default`),
+            `external_id_not_allowed` (422, hosted server: a tenant sent a
+            DynamoDB `external_id` other than the one
+            `GET /sources/dynamodb/trust` gives), `external_id_unavailable`
+            (422, hosted server without `CONNECT_SECRET_KEY`: a tenant's
+            role cannot be assumed),
             `out_of_credits` (402, Lab mode: the team cannot spend; its
             syncs are held and resume by themselves), `host_not_allowed` (422:
             the host policy refuses the source or

@@ -68,6 +68,26 @@ impl ApiError {
         )
     }
 
+    /// A tenant sent a DynamoDB `external_id` other than the one this
+    /// server derives for it (`crate::external_id`).
+    pub fn external_id_not_allowed() -> Self {
+        Self::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "external_id_not_allowed",
+            crate::external_id::NOT_ALLOWED,
+        )
+    }
+
+    /// A tenant's DynamoDB role cannot be assumed: no key to derive its
+    /// external ID with (no `CONNECT_SECRET_KEY`).
+    pub fn external_id_unavailable() -> Self {
+        Self::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "external_id_unavailable",
+            crate::external_id::UNAVAILABLE,
+        )
+    }
+
     /// The sync's team has no credits left (Lab mode).
     pub fn out_of_credits() -> Self {
         Self::new(

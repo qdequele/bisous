@@ -13,9 +13,11 @@ async-trait.workspace = true
 base64.workspace = true
 chacha20poly1305 = "0.10"
 chrono.workspace = true
+hmac.workspace = true
 rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 sqlx = { version = "0.9", default-features = false, features = [
     "runtime-tokio",
     "tls-rustls",

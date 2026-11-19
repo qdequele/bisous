@@ -9,6 +9,7 @@ pub mod auth;
 pub mod config;
 pub mod credits;
 pub mod error;
+pub mod external_id;
 pub mod guard;
 pub mod lab;
 pub mod limits;
@@ -37,6 +38,7 @@ use tracing::{error, info, warn};
 use crate::auth::AuthConfig;
 use crate::config::{Config, LogFormat};
 use crate::credits::CreditCache;
+use crate::external_id::{AwsPrincipal, ExternalIds};
 use crate::limits::{Limits, ProbeSlots};
 use crate::manager::{ManagerDeps, SinkFactory, SyncManager, meili_sinks};
 use crate::metrics::Metrics;
@@ -52,6 +54,7 @@ pub fn router(state: AppState) -> Router {
         .route("/metrics", get(metrics::metrics))
         .route("/sources/check", post(api::check_source))
         .route("/sources/discover", post(api::discover_source))
+        .route("/sources/dynamodb/trust", get(api::dynamodb_trust))
         .route("/usage", get(api::usage))
         .route("/syncs", post(api::create_sync).get(api::list_syncs))
         .route(
@@ -97,6 +100,12 @@ pub struct Wiring {
     pub tinybird: Option<TinybirdConfig>,
     /// Lab mode or `CONNECT_HOST_POLICY=public`.
     pub hosted: bool,
+    /// Derives the external ID of a tenant's DynamoDB roles; `None`
+    /// without `CONNECT_SECRET_KEY` (assume-role is then refused for
+    /// tenants on a hosted server).
+    pub external_ids: Option<Arc<ExternalIds>>,
+    /// The server's own AWS principal, for `GET /sources/dynamodb/trust`.
+    pub aws_principal: Arc<AwsPrincipal>,
 }
 
 /// Assemble the shared state around a backend. The engine gets the
@@ -134,6 +143,7 @@ pub fn build_state(
         credits: wiring.credits,
         metrics: Arc::clone(&metrics),
         hosted: wiring.hosted,
+        external_ids: wiring.external_ids.clone(),
         cancel,
     }));
     AppState {
@@ -149,6 +159,8 @@ pub fn build_state(
         metrics_token: wiring.metrics_token,
         lag_guard: wiring.lag_guard,
         hosted: wiring.hosted,
+        external_ids: wiring.external_ids,
+        aws_principal: wiring.aws_principal,
         usage_reader: match &wiring.tinybird {
             Some(tb) => match TinybirdReader::new(tb.clone()) {
                 Ok(reader) => Some(Arc::new(reader)),
@@ -253,9 +265,11 @@ pub async fn run() -> Result<(), String> {
         max_per_sync: config.limits.dead_letters_max_per_sync,
         ..DeadLetterLimits::default()
     };
+    let mut external_ids = None;
     let backend: Arc<dyn Backend> = match (&config.database_url, &config.secret_key) {
         (Some(url), Some(key)) => {
             let key = SecretKey::from_base64(key).map_err(|e| e.to_string())?;
+            external_ids = Some(Arc::new(ExternalIds::new(&key)));
             let store = PgStore::connect(url, key)
                 .await
                 .map_err(|e| format!("cannot open the state database: {e}"))?
@@ -321,6 +335,8 @@ pub async fn run() -> Result<(), String> {
             lag_guard: config.lag_guard,
             tinybird: config.tinybird.clone(),
             hosted: config.hosted(),
+            external_ids,
+            aws_principal: Arc::new(AwsPrincipal::from_host()),
         },
         cancel.child_token(),
     );

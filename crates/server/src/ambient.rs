@@ -83,8 +83,8 @@ pub fn ambient_identity(spec: &SourceSpec) -> Option<String> {
                 (None | Some(Value::Null), _) | (_, Some("default")) => Some(
                     "DynamoDB `credentials: default` would use this server's own AWS identity: \
                      give a role to assume ({\"type\": \"assume_role\", \"role_arn\": \
-                     \"arn:aws:iam::<account>:role/<name>\", \"external_id\": \"...\"}) or \
-                     static keys ({\"type\": \"static\", \"access_key_id\": \"...\", \
+                     \"arn:aws:iam::<account>:role/<name>\"}, trusted as GET \
+                     /sources/dynamodb/trust shows) or static keys ({\"type\": \"static\", \"access_key_id\": \"...\", \
                      \"secret_access_key\": \"...\"})"
                         .to_owned(),
                 ),
