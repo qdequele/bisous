@@ -207,11 +207,19 @@ impl SyncManager {
     pub async fn remove(&self, spec: &SyncSpec, force: bool) -> Result<(), RemoveError> {
         let _op = self.serialize(&spec.id).await;
         let torn_down = match self.supervisor(&spec.id) {
-            Some(sup) => match sup.remove(&spec.id).await {
-                Ok(()) => Ok(()),
-                Err(SupervisorError::NotFound(_)) => self.teardown_idle(spec).await,
-                Err(SupervisorError::Engine(e)) => Err(e.to_string()),
-                Err(e) => return Err(e.into()),
+            // Bounded: an origin that hangs fails the call instead of
+            // holding it forever (the sync is already stopped by then).
+            Some(sup) => match tokio::time::timeout(
+                self.teardown_timeout.saturating_mul(2),
+                sup.remove(&spec.id),
+            )
+            .await
+            {
+                Err(_) => Err("teardown timed out".to_owned()),
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(SupervisorError::NotFound(_))) => self.teardown_idle(spec).await,
+                Ok(Err(SupervisorError::Engine(e))) => Err(e.to_string()),
+                Ok(Err(e)) => return Err(e.into()),
             },
             None => self.teardown_idle(spec).await,
         };
