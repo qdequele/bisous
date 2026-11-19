@@ -816,6 +816,71 @@ async fn teardown_never_reports_success_while_the_slot_survives() {
 }
 
 #[tokio::test]
+async fn covering_indexes_key_on_their_key_columns_only() {
+    let Some(url) = url() else { return };
+    let db = admin(&url).await;
+    let pk = unique("cpk");
+    let ri = unique("cri");
+    db.batch_execute(&format!(
+        "CREATE TABLE {pk} (id int4, name text, PRIMARY KEY (id) INCLUDE (name));
+         CREATE TABLE {ri} (code text NOT NULL, name text, n int4);
+         CREATE UNIQUE INDEX {ri}_code ON {ri} (code) INCLUDE (name);
+         ALTER TABLE {ri} REPLICA IDENTITY USING INDEX {ri}_code;"
+    ))
+    .await
+    .unwrap();
+    let (cp, cr) = (format!("public.{pk}"), format!("public.{ri}"));
+    let sync_id = unique("cov");
+    let mut src = source(&url, &sync_id, &[&cp, &cr]);
+    let all = src.discover().await.unwrap();
+    let key = |c: &str| all.iter().find(|i| i.name == c).unwrap().key.clone();
+    assert_eq!(key(&cp), vec!["id"]);
+    assert_eq!(key(&cr), vec!["code"]);
+
+    let Opened::Fresh { start } = src.open(None).await.unwrap() else {
+        panic!()
+    };
+    let (tx, _rx) = mpsc::channel(4);
+    src.snapshot(tx, CancellationToken::new()).await.unwrap();
+    let mut s = start_stream(src);
+    s.ack.send(Some(start)).unwrap();
+    let mut model = Model::default();
+    db.batch_execute(&format!(
+        "INSERT INTO {pk} VALUES (1, 'a'); UPDATE {pk} SET name = 'b' WHERE id = 1;
+         INSERT INTO {pk} VALUES (2, 'x'); DELETE FROM {pk} WHERE id = 2;
+         INSERT INTO {ri} VALUES ('c1', 'a', 0); UPDATE {ri} SET name = 'b' WHERE code = 'c1';
+         INSERT INTO {ri} VALUES ('c2', 'x', 0); DELETE FROM {ri} WHERE code = 'c2';"
+    ))
+    .await
+    .unwrap();
+    let ok = pump_until(&mut s.rx, &mut model, Duration::from_secs(30), |m| {
+        m.changes.len() >= 8
+    })
+    .await;
+    assert!(ok, "{model:#?}");
+    assert_eq!(
+        model.table(&cp),
+        HashMap::from([(
+            "1".to_owned(),
+            json!({"id": 1, "name": "b"}).as_object().cloned().unwrap()
+        )])
+    );
+    assert_eq!(
+        model.table(&cr),
+        HashMap::from([(
+            "c1".to_owned(),
+            json!({"code": "c1", "name": "b", "n": 0})
+                .as_object()
+                .cloned()
+                .unwrap()
+        )])
+    );
+    assert!(model.changes.iter().all(|c| c.key.len() == 1), "{model:#?}");
+    let mut src = s.stop().await;
+    src.teardown().await.unwrap();
+}
+
+#[tokio::test]
 async fn key_change_with_unchanged_toast_gives_whole_documents() {
     let Some(url) = url() else { return };
     let db = admin(&url).await;

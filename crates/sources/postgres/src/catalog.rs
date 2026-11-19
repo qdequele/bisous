@@ -84,7 +84,9 @@ pub async fn tables(
                FROM pg_index i
                CROSS JOIN LATERAL unnest(i.indkey::int2[]) WITH ORDINALITY AS k(attnum, ord)
                JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum
-               WHERE i.indrelid = c.oid AND i.{flag}), '{{}}')"
+               WHERE i.indrelid = c.oid AND i.{flag}
+                 -- Key columns only: INCLUDE columns do not identify a row.
+                 AND k.ord <= i.indnkeyatts), '{{}}')"
         )
     };
     let col_agg = |expr: &str, ty: &str| {
