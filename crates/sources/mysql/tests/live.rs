@@ -114,8 +114,11 @@ impl Running {
         loop {
             let ev = tokio::time::timeout(Duration::from_secs(30), self.rx.recv())
                 .await
-                .expect("timed out waiting for binlog events")
-                .expect("stream ended");
+                .expect("timed out waiting for binlog events");
+            let Some(ev) = ev else {
+                let res = (&mut self.task).await;
+                panic!("stream ended: {res:?}");
+            };
             let stop = done(&ev);
             out.push(ev);
             if stop {
@@ -679,6 +682,46 @@ async fn snapshot_honours_cancellation() {
         .expect("snapshot did not honour cancellation")
         .unwrap();
     assert!(res.is_ok(), "{res:?}");
+}
+
+/// The stream publishes its lag: event age while reading, then zero seconds
+/// and zero bytes once the server is idle (heartbeat).
+#[tokio::test]
+async fn reports_lag() {
+    let Some(url) = url() else { return };
+    let _g = SERIAL.lock().await;
+    let mut conn = admin(&url).await;
+    fresh_db(&mut conn, "mc_lag").await;
+    conn.query_drop("CREATE TABLE mc_lag.items (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    let mut src = source(&url, "mc_lag", &["items"], "lag-sync");
+    let (reporter, mut watch) = meili_connect_core::LagReporter::new();
+    src.report_lag(reporter);
+    src.open(None).await.unwrap();
+    let mut run = Running::start(src);
+    conn.query_drop("INSERT INTO mc_lag.items VALUES (1)")
+        .await
+        .unwrap();
+    run.until(|e| is_change_with(e, 1)).await;
+    let lag = watch
+        .borrow_and_update()
+        .expect("lag published after a commit");
+    let secs = lag.seconds.expect("seconds known");
+    assert!((0.0..10.0).contains(&secs), "{lag:?}");
+    // Caught up: a heartbeat (every 5 s) and a position probe follow.
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            watch.changed().await.unwrap();
+            let l = watch.borrow().unwrap();
+            if l.seconds == Some(0.0) && l.bytes == Some(0) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("no caught-up lag report");
+    run.stop().await;
 }
 
 /// `stream` returns `Ok(())` promptly on cancel: while blocked on a full

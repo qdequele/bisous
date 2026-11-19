@@ -5,7 +5,8 @@ use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use meili_connect_core::{
-    AckReceiver, CheckReport, CheckStatus, EventSender, SourceError, SourceEvent,
+    AckReceiver, CheckReport, CheckStatus, EventSender, Lag, LagReporter, SourceError, SourceEvent,
+    seconds_since_unix_millis,
 };
 use mysql_async::binlog::EventType;
 use mysql_async::binlog::events::{EventData, RowsEventData, TableMapEvent};
@@ -18,13 +19,15 @@ use crate::error::map_err;
 use crate::position::Position;
 use crate::rows::{BinlogTable, RowKind};
 use crate::schema::{TableSchema, load_table};
-use crate::source::{MysqlSource, global_var, or_cancel, send, server_info};
+use crate::source::{MysqlSource, current_file_position, global_var, or_cancel, send, server_info};
 
 /// Heartbeat period asked of the server, and the idle checkpoint cadence.
 const HEARTBEAT: Duration = Duration::from_secs(5);
 /// A transaction without mapped changes moves the checkpoint at most this
 /// often, so busy unrelated tables do not flood the engine.
 const QUIET_CHECKPOINT_EVERY: Duration = Duration::from_secs(1);
+/// How often the server's binlog position is read to measure `Lag::bytes`.
+const LAG_BYTES_EVERY: Duration = Duration::from_secs(10);
 /// Below this retention a sync paused over a weekend loses its position.
 const SHORT_RETENTION_SECS: u64 = 3 * 24 * 3600;
 
@@ -273,6 +276,50 @@ async fn check_privileges(conn: &mut Conn, report: &mut CheckReport) -> Result<(
         }
     }
     Ok(())
+}
+
+/// What the stream knows of its lag. `seconds` comes from each event's
+/// header timestamp (no query); `bytes` from a periodic
+/// `SHOW BINARY LOG STATUS` compared with the read position, only when both
+/// are in the same binlog file.
+struct StreamLag {
+    reporter: Option<LagReporter>,
+    seconds: Option<f64>,
+    bytes: Option<u64>,
+}
+
+impl StreamLag {
+    /// A binlog event written at `timestamp` (Unix seconds; 0 for events
+    /// the server synthesizes, which say nothing about lag).
+    fn event_at(&mut self, timestamp: u32) {
+        if timestamp != 0 {
+            self.seconds = Some(seconds_since_unix_millis(i64::from(timestamp) * 1000));
+        }
+    }
+
+    /// A heartbeat: the server has nothing more to send.
+    fn caught_up(&mut self) {
+        self.seconds = Some(0.0);
+        self.bytes = Some(0);
+    }
+
+    /// The server's current binlog position against ours.
+    fn server_at(&mut self, server: &Position, file: &str, offset: u64) {
+        self.bytes = match server {
+            Position::File { file: f, pos } if f == file => Some(pos.saturating_sub(offset)),
+            _ => None,
+        };
+    }
+
+    fn publish(&self) {
+        if let Some(r) = &self.reporter {
+            r.report(Lag {
+                seconds: self.seconds,
+                bytes: self.bytes,
+                records: None,
+            });
+        }
+    }
 }
 
 /// Mutable state of one `stream` call.
@@ -534,12 +581,32 @@ pub(crate) async fn run(
     st.schemas = schemas;
     let mut idle = tokio::time::interval(HEARTBEAT);
     idle.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut lag = StreamLag {
+        reporter: src.lag.clone(),
+        seconds: None,
+        bytes: None,
+    };
+    let mut last_bytes_probe: Option<Instant> = None;
 
     loop {
         let next = tokio::select! {
             biased;
             _ = cancel.cancelled() => return Ok(()),
             _ = idle.tick() => {
+                if lag.reporter.is_some()
+                    && last_bytes_probe.is_none_or(|t| t.elapsed() >= LAG_BYTES_EVERY)
+                {
+                    last_bytes_probe = Some(Instant::now());
+                    match or_cancel(&cancel, current_file_position(&mut meta)).await {
+                        None => return Ok(()),
+                        Some(Ok(server)) => lag.server_at(&server, &st.file, st.offset),
+                        Some(Err(e)) => {
+                            tracing::debug!(error = %e, "binlog position for lag unavailable");
+                            lag.bytes = None;
+                        }
+                    }
+                    lag.publish();
+                }
                 if let Some(p) = st.checkpoint_due(true)
                     && !send(&events, &cancel, SourceEvent::Checkpoint(p.to_checkpoint()?)).await
                 {
@@ -572,6 +639,8 @@ pub(crate) async fn run(
             let force = if is_heartbeat {
                 // The server is idle: whatever was pending ended.
                 st.heartbeat(prev_offset);
+                lag.caught_up();
+                lag.publish();
                 Some(true)
             } else {
                 st.group_start(None, prev_offset)
@@ -612,6 +681,7 @@ pub(crate) async fn run(
             }
         };
 
+        lag.event_at(header.timestamp());
         let mut out: Vec<SourceEvent> = Vec::new();
         let mut closed: Closed = None;
         match data {
@@ -715,6 +785,9 @@ pub(crate) async fn run(
             if !send(&events, &cancel, ev).await {
                 return Ok(());
             }
+        }
+        if closed.is_some() {
+            lag.publish();
         }
         if let Some(force) = closed
             && let Some(p) = st.checkpoint_due(force)
@@ -954,6 +1027,47 @@ mod tests {
                 file: "binlog.000001".into(),
                 pos: 400
             }
+        );
+    }
+
+    #[test]
+    fn lag_from_event_time_and_binlog_position() {
+        let (reporter, watch) = LagReporter::new();
+        let mut lag = StreamLag {
+            reporter: Some(reporter),
+            seconds: None,
+            bytes: None,
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as u32;
+        lag.event_at(now - 30);
+        lag.event_at(0); // synthesized events carry no time
+        let server = Position::File {
+            file: "binlog.000007".into(),
+            pos: 5_000,
+        };
+        lag.server_at(&server, "binlog.000007", 1_200);
+        lag.publish();
+        let got = watch.borrow().unwrap();
+        assert!((29.0..=32.0).contains(&got.seconds.unwrap()), "{got:?}");
+        assert_eq!(got.bytes, Some(3_800));
+        assert_eq!(got.records, None);
+
+        // Another file: the distance is unknown.
+        lag.server_at(&server, "binlog.000006", 1_200);
+        assert_eq!(lag.bytes, None);
+        // Idle and caught up.
+        lag.caught_up();
+        lag.publish();
+        assert_eq!(
+            *watch.borrow(),
+            Some(Lag {
+                seconds: Some(0.0),
+                bytes: Some(0),
+                records: None
+            })
         );
     }
 
