@@ -266,6 +266,51 @@ async fn index_operations() {
 }
 
 #[tokio::test]
+async fn delete_all_documents_keeps_settings() {
+    let Some(l) = live() else { return };
+    let s = sink(&l, opts());
+    let target = IndexTarget {
+        uid: uid("clear"),
+        primary_key: "id".into(),
+    };
+    s.ensure_index(&target).await.unwrap();
+    let resp = reqwest::Client::new()
+        .patch(format!("{}/indexes/{}/settings", l.url, target.uid))
+        .bearer_auth(&l.key)
+        .json(&json!({"filterableAttributes": ["v"]}))
+        .send()
+        .await
+        .unwrap();
+    let task: Value = resp.json().await.unwrap();
+    wait_task(&l, task["taskUid"].as_u64().unwrap()).await;
+    s.apply(
+        &target,
+        (0..10)
+            .map(|i| replace(&i.to_string(), json!({"v": i})))
+            .collect(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(s.document_count(&target.uid).await.unwrap(), Some(10));
+
+    s.delete_all_documents(&target.uid).await.unwrap();
+    assert_eq!(s.document_count(&target.uid).await.unwrap(), Some(0));
+    let settings: Value = reqwest::Client::new()
+        .get(format!("{}/indexes/{}/settings", l.url, target.uid))
+        .bearer_auth(&l.key)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(settings["filterableAttributes"], json!(["v"]));
+
+    s.delete_all_documents(&uid("missing")).await.unwrap();
+    s.delete_index(&target.uid).await.unwrap();
+}
+
+#[tokio::test]
 async fn wrong_key_is_config() {
     let Some(l) = live() else { return };
     if l.key.is_empty() {

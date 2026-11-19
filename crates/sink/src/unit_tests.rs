@@ -792,6 +792,48 @@ async fn delete_missing_index_is_ok() {
 }
 
 #[tokio::test]
+async fn delete_all_documents_cases() {
+    let server = MockServer::start().await;
+    Mock::given(method("DELETE"))
+        .and(path("/indexes/movies/documents"))
+        .respond_with(task_ok(7))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(path("/tasks/7"))
+        .respond_with(task_state(7, "succeeded", None))
+        .mount(&server)
+        .await;
+    // Missing index, reported on enqueue or by the task: nothing to delete.
+    Mock::given(method("DELETE"))
+        .and(path("/indexes/gone404/documents"))
+        .respond_with(err(404, "index_not_found", "invalid_request"))
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/indexes/gone/documents"))
+        .respond_with(task_ok(8))
+        .mount(&server)
+        .await;
+    Mock::given(path("/tasks/8"))
+        .respond_with(task_state(8, "failed", Some("index_not_found")))
+        .mount(&server)
+        .await;
+    // Any other failure is mapped.
+    Mock::given(method("DELETE"))
+        .and(path("/indexes/locked/documents"))
+        .respond_with(err(403, "invalid_api_key", "auth"))
+        .mount(&server)
+        .await;
+    let s = sink(&server, opts());
+    s.delete_all_documents("movies").await.unwrap();
+    s.delete_all_documents("gone404").await.unwrap();
+    s.delete_all_documents("gone").await.unwrap();
+    let e = s.delete_all_documents("locked").await.unwrap_err();
+    assert!(matches!(e, SinkError::Config(_)), "{e:?}");
+}
+
+#[tokio::test]
 async fn copy_settings_cases() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))

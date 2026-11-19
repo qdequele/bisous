@@ -430,6 +430,36 @@ impl MeiliSink {
         }
     }
 
+    /// Enqueue + wait for a payload-less task on an index; a missing index
+    /// (404 on enqueue or `index_not_found` on the task) counts as success.
+    async fn task_allow_missing(
+        &self,
+        context: &str,
+        method: Method,
+        segments: &[&str],
+    ) -> Result<(), SinkError> {
+        let task_uid = match self.client.enqueue(method, segments, &[], None).await? {
+            Ok(t) => t,
+            Err(api) if api.status == StatusCode::NOT_FOUND => return Ok(()),
+            Err(api) => return Err(map_api_error(context, &api)),
+        };
+        let task = self.client.wait_task(task_uid).await?;
+        match task.status {
+            TaskStatus::Succeeded => Ok(()),
+            TaskStatus::Canceled => Err(SinkError::Transient(format!(
+                "{context}: task {task_uid} was canceled"
+            ))),
+            _ => {
+                let error = task.error.unwrap_or_default();
+                if error.code == "index_not_found" {
+                    Ok(())
+                } else {
+                    Err(client::map_task_error(context, &error))
+                }
+            }
+        }
+    }
+
     /// `GET /indexes/{uid}` → `Some(primaryKey)`, `None` when missing.
     async fn index_primary_key(&self, uid: &str) -> Result<Option<Option<String>>, SinkError> {
         #[derive(Deserialize)]
@@ -540,31 +570,18 @@ impl Sink for MeiliSink {
         .await
     }
 
+    async fn delete_all_documents(&self, uid: &str) -> Result<(), SinkError> {
+        self.task_allow_missing(
+            "deleting all documents",
+            Method::DELETE,
+            &["indexes", uid, "documents"],
+        )
+        .await
+    }
+
     async fn delete_index(&self, uid: &str) -> Result<(), SinkError> {
-        let enqueued = self
-            .client
-            .enqueue(Method::DELETE, &["indexes", uid], &[], None)
-            .await?;
-        let task_uid = match enqueued {
-            Ok(t) => t,
-            Err(api) if api.status == StatusCode::NOT_FOUND => return Ok(()),
-            Err(api) => return Err(map_api_error("deleting index", &api)),
-        };
-        let task = self.client.wait_task(task_uid).await?;
-        match task.status {
-            TaskStatus::Succeeded => Ok(()),
-            TaskStatus::Canceled => Err(SinkError::Transient(format!(
-                "deleting index: task {task_uid} was canceled"
-            ))),
-            _ => {
-                let error = task.error.unwrap_or_default();
-                if error.code == "index_not_found" {
-                    Ok(())
-                } else {
-                    Err(client::map_task_error("deleting index", &error))
-                }
-            }
-        }
+        self.task_allow_missing("deleting index", Method::DELETE, &["indexes", uid])
+            .await
     }
 
     async fn copy_settings(&self, from: &str, to: &str) -> Result<(), SinkError> {
