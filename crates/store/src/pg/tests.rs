@@ -12,6 +12,11 @@ use super::*;
 use crate::test_support::{letter, spec, state};
 
 async fn store_with_key(key: SecretKey) -> Option<PgStore> {
+    store_with(key, &[]).await
+}
+
+/// A store whose connections also carry these server settings.
+async fn store_with(key: SecretKey, settings: &[(&str, &str)]) -> Option<PgStore> {
     let Ok(url) = std::env::var("DATABASE_URL") else {
         eprintln!("DATABASE_URL is unset: skipping Postgres store test");
         return None;
@@ -25,7 +30,8 @@ async fn store_with_key(key: SecretKey) -> Option<PgStore> {
     conn.close().await.unwrap();
     let options = PgConnectOptions::from_str(&url)
         .unwrap()
-        .options([("search_path", schema.as_str())]);
+        .options([("search_path", schema.as_str())])
+        .options(settings.iter().copied());
     let pool = PgPoolOptions::new()
         .max_connections(5)
         .connect_with(options)
@@ -552,5 +558,85 @@ async fn timeouts_and_read_only_transactions_are_transient() {
     assert!(
         matches!(&mapped, StoreError::Transient(m) if m.contains("25006")),
         "{mapped:?}"
+    );
+}
+
+/// Under a nested-loop plan an `IN (SELECT … LIMIT n FOR UPDATE SKIP
+/// LOCKED)` subquery can be re-run per outer row and lease more than `n`
+/// rows. Force that plan shape and race leasers: no call may exceed its
+/// limit, and no event may be leased twice.
+#[tokio::test]
+async fn outbox_lease_never_exceeds_its_limit() {
+    let Some(store) = store_with(
+        SecretKey::generate(),
+        &[
+            ("enable_hashjoin", "off"),
+            ("enable_mergejoin", "off"),
+            ("enable_material", "off"),
+            ("enable_memoize", "off"),
+            ("enable_indexscan", "off"),
+            ("enable_bitmapscan", "off"),
+        ],
+    )
+    .await
+    else {
+        return;
+    };
+    let store = Arc::new(store);
+    for i in 0..600 {
+        store
+            .enqueue_event(None, &serde_json::json!({ "n": i }))
+            .await
+            .unwrap();
+    }
+    async fn leaser(store: Arc<PgStore>) -> Vec<Uuid> {
+        let mut got = Vec::new();
+        loop {
+            let batch = store
+                .lease_events(5, Duration::from_secs(300))
+                .await
+                .unwrap();
+            assert!(
+                batch.len() <= 5,
+                "leased {} rows for a limit of 5",
+                batch.len()
+            );
+            if batch.is_empty() {
+                return got;
+            }
+            got.extend(batch.into_iter().map(|e| e.id));
+        }
+    }
+    let handles: Vec<_> = (0..4)
+        .map(|_| tokio::spawn(leaser(store.clone())))
+        .collect();
+    let mut all = Vec::new();
+    for h in handles {
+        all.extend(h.await.unwrap());
+    }
+    let distinct: HashSet<_> = all.iter().copied().collect();
+    assert_eq!(distinct.len(), all.len(), "an event was leased twice");
+    assert_eq!(distinct.len(), 600);
+}
+
+/// The picking query runs exactly once per lease (a materialized CTE), so
+/// no plan can make it pick twice.
+#[tokio::test]
+async fn outbox_lease_picks_once() {
+    let Some(store) = store().await else { return };
+    let plan: Json<serde_json::Value> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "EXPLAIN (FORMAT JSON) {LEASE_SQL}"
+    )))
+    .bind(5_i64)
+    .bind(60.0_f64)
+    .fetch_one(store.pool())
+    .await
+    .unwrap();
+    let text = plan.0.to_string();
+    assert!(text.contains(r#""CTE Name":"picked""#), "{text}");
+    assert_eq!(
+        text.matches(r#""Node Type":"LockRows""#).count(),
+        1,
+        "{text}"
     );
 }

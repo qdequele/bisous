@@ -23,6 +23,20 @@ use crate::{
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
+/// Pick then lease. The `MATERIALIZED` CTE runs once: an `IN (SELECT …
+/// LIMIT n FOR UPDATE SKIP LOCKED)` subquery may be re-run per outer row
+/// under a nested-loop plan and lease more than `n` rows.
+const LEASE_SQL: &str = "WITH picked AS MATERIALIZED (
+        SELECT id FROM lab_events_outbox
+        WHERE sent_at IS NULL AND (leased_until IS NULL OR leased_until <= now())
+        ORDER BY created_at, id
+        LIMIT $1
+        FOR UPDATE SKIP LOCKED
+     )
+     UPDATE lab_events_outbox o SET leased_until = now() + make_interval(secs => $2)
+     FROM picked WHERE o.id = picked.id
+     RETURNING o.id, o.tenant_id, o.payload, o.created_at";
+
 pub struct PgStore {
     pool: PgPool,
     key: SecretKey,
@@ -491,22 +505,12 @@ impl LabOutbox for PgStore {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let rows = sqlx::query(
-            "UPDATE lab_events_outbox SET leased_until = now() + make_interval(secs => $2)
-             WHERE id IN (
-                SELECT id FROM lab_events_outbox
-                WHERE sent_at IS NULL AND (leased_until IS NULL OR leased_until <= now())
-                ORDER BY created_at, id
-                LIMIT $1
-                FOR UPDATE SKIP LOCKED
-             )
-             RETURNING id, tenant_id, payload, created_at",
-        )
-        .bind(i64::from(limit))
-        .bind(lease.as_secs_f64())
-        .fetch_all(&self.pool)
-        .await
-        .map_err(from_sqlx)?;
+        let rows = sqlx::query(LEASE_SQL)
+            .bind(i64::from(limit))
+            .bind(lease.as_secs_f64())
+            .fetch_all(&self.pool)
+            .await
+            .map_err(from_sqlx)?;
         let mut out = rows
             .iter()
             .map(|r| {
