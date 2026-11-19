@@ -355,6 +355,19 @@ impl LabOutbox for MemStore {
         }
         Ok(n)
     }
+
+    async fn prune_sent_events(&self, older_than: Duration) -> Result<u64, RepoError> {
+        let cutoff = chrono::Duration::from_std(older_than)
+            .ok()
+            .and_then(|d| Utc::now().checked_sub_signed(d))
+            .unwrap_or(DateTime::<Utc>::MIN_UTC);
+        let mut inner = self.lock()?;
+        let before = inner.outbox.len();
+        inner
+            .outbox
+            .retain(|row| row.sent_at.is_none_or(|t| t >= cutoff));
+        Ok((before - inner.outbox.len()) as u64)
+    }
 }
 
 #[cfg(test)]
@@ -592,6 +605,35 @@ mod tests {
         assert_eq!(fresh.events[0].id, id);
         assert_eq!(store.mark_events_sent(stale.token, &[id]).await.unwrap(), 0);
         assert_eq!(store.mark_events_sent(fresh.token, &[id]).await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn outbox_prunes_only_old_sent_events() {
+        let store = MemStore::new();
+        let ids = enqueue_three(&store).await;
+        let lease = store
+            .lease_events(2, Duration::from_secs(60))
+            .await
+            .unwrap();
+        store.mark_events_sent(lease.token, &ids).await.unwrap();
+        // The first was sent two hours ago.
+        store.lock().unwrap().outbox[0].sent_at = Some(Utc::now() - chrono::Duration::hours(2));
+        assert_eq!(
+            store
+                .prune_sent_events(Duration::from_secs(3600))
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(store.prune_sent_events(Duration::ZERO).await.unwrap(), 1);
+        // The unsent one stays, whatever its age.
+        assert_eq!(store.prune_sent_events(Duration::ZERO).await.unwrap(), 0);
+        let rest = store
+            .lease_events(10, Duration::from_secs(60))
+            .await
+            .unwrap();
+        assert_eq!(rest.events.len(), 1);
+        assert_eq!(rest.events[0].id, ids[2]);
     }
 
     async fn enqueue_three(store: &MemStore) -> Vec<Uuid> {

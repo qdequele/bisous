@@ -23,6 +23,9 @@ use crate::{
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
+/// Rows deleted per statement by `prune_sent_events`.
+const PRUNE_BATCH: i64 = 1_000;
+
 /// Pick then lease. The `MATERIALIZED` CTE runs once: an `IN (SELECT …
 /// LIMIT n FOR UPDATE SKIP LOCKED)` subquery may be re-run per outer row
 /// under a nested-loop plan and lease more than `n` rows.
@@ -545,6 +548,36 @@ impl LabOutbox for PgStore {
         .await
         .map_err(from_sqlx)?;
         Ok(done.rows_affected())
+    }
+
+    async fn prune_sent_events(&self, older_than: Duration) -> Result<u64, RepoError> {
+        // One cutoff for every batch, so the loop ends even while events
+        // keep being delivered.
+        let cutoff: DateTime<Utc> = sqlx::query_scalar("SELECT now() - make_interval(secs => $1)")
+            .bind(older_than.as_secs_f64())
+            .fetch_one(&self.pool)
+            .await
+            .map_err(from_sqlx)?;
+        let mut total = 0;
+        loop {
+            let done = sqlx::query(
+                "WITH old AS MATERIALIZED (
+                    SELECT id FROM lab_events_outbox
+                    WHERE sent_at IS NOT NULL AND sent_at < $1
+                    LIMIT $2
+                 )
+                 DELETE FROM lab_events_outbox o USING old WHERE o.id = old.id",
+            )
+            .bind(cutoff)
+            .bind(PRUNE_BATCH)
+            .execute(&self.pool)
+            .await
+            .map_err(from_sqlx)?;
+            total += done.rows_affected();
+            if done.rows_affected() < PRUNE_BATCH as u64 {
+                return Ok(total);
+            }
+        }
     }
 }
 

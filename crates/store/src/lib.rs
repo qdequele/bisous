@@ -199,6 +199,11 @@ pub trait LabOutbox: Send + Sync {
     /// was taken by another leaser is left to that leaser. Returns how many
     /// were newly marked.
     async fn mark_events_sent(&self, lease: Uuid, ids: &[Uuid]) -> Result<u64, RepoError>;
+
+    /// Delete delivered events sent more than `older_than` ago, in bounded
+    /// batches so no single statement holds locks for long. Unsent events
+    /// are never deleted. Returns how many went.
+    async fn prune_sent_events(&self, older_than: Duration) -> Result<u64, RepoError>;
 }
 
 /// Checks shared by both stores before writing a spec.

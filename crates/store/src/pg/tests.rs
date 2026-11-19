@@ -673,3 +673,49 @@ async fn outbox_lease_picks_once() {
         "{text}"
     );
 }
+
+#[tokio::test]
+async fn outbox_prunes_old_sent_events_in_batches() {
+    let Some(store) = store().await else { return };
+    // 2 500 events sent a day ago: three delete batches.
+    sqlx::query(
+        "INSERT INTO lab_events_outbox (id, payload, created_at, sent_at)
+         SELECT gen_random_uuid(), '{}', now() - interval '2 days', now() - interval '1 day'
+         FROM generate_series(1, 2500)",
+    )
+    .execute(store.pool())
+    .await
+    .unwrap();
+    let recent = store
+        .enqueue_event(None, &serde_json::json!({ "n": 1 }))
+        .await
+        .unwrap();
+    let unsent = store
+        .enqueue_event(None, &serde_json::json!({ "n": 2 }))
+        .await
+        .unwrap();
+    let lease = store
+        .lease_events(1, Duration::from_secs(60))
+        .await
+        .unwrap();
+    assert_eq!(lease.events[0].id, recent);
+    store
+        .mark_events_sent(lease.token, &[recent])
+        .await
+        .unwrap();
+
+    assert_eq!(
+        store
+            .prune_sent_events(Duration::from_secs(3600))
+            .await
+            .unwrap(),
+        2500
+    );
+    assert_eq!(store.prune_sent_events(Duration::ZERO).await.unwrap(), 1);
+    assert_eq!(store.prune_sent_events(Duration::ZERO).await.unwrap(), 0);
+    let left: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM lab_events_outbox")
+        .fetch_all(store.pool())
+        .await
+        .unwrap();
+    assert_eq!(left, [unsent]);
+}
