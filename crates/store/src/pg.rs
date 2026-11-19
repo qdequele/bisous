@@ -536,3 +536,7 @@ impl LabOutbox for PgStore {
         Ok(done.rows_affected())
     }
 }
+
+/// Live tests: set `DATABASE_URL` to run them.
+#[cfg(test)]
+mod tests;
