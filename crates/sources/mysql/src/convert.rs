@@ -30,6 +30,11 @@ pub enum ConvertError {
     PartialJson(String),
     #[error("column `{column}`: {reason}")]
     Invalid { column: String, reason: String },
+    #[error(
+        "column `{column}` uses the character set `{charset}`, which binlog rows cannot be \
+         decoded from; convert the column to utf8mb4 or leave the table out of the sync"
+    )]
+    Charset { column: String, charset: String },
 }
 
 /// Converts one binlog cell.
@@ -276,20 +281,97 @@ fn bytes_to_json(col: &ColumnMeta, b: Vec<u8>, origin: Origin) -> Result<Json, C
             )
         }
         dt if is_binary_type(dt) || is_geometry_type(dt) => Json::String(BASE64.encode(&b)),
-        _ => Json::String(decode_text(col, b, origin)),
+        // A character type with the `binary` charset holds bytes, which no
+        // `SET NAMES` converts: base64 from either origin, like BLOBs.
+        _ if col.charset.as_deref() == Some("binary") => Json::String(BASE64.encode(&b)),
+        _ => Json::String(decode_text(col, b, origin)?),
     })
 }
 
-/// Character columns. A snapshot is already utf8mb4 (`SET NAMES`); binlog
-/// images carry the column's own charset.
-fn decode_text(col: &ColumnMeta, b: Vec<u8>, origin: Origin) -> String {
-    if origin == Origin::Binlog && col.charset.as_deref() == Some("latin1") {
-        // MySQL's latin1 is cp1252; ISO-8859-1 differs only on 0x80–0x9F.
-        return b.iter().map(|&x| char::from(x)).collect();
+/// How a binlog image of a character column is decoded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TextEncoding {
+    Utf8,
+    Utf32,
+    Other(&'static encoding_rs::Encoding),
+}
+
+/// The decoder for a MySQL character set name, `None` when unsupported.
+fn text_encoding(charset: &str) -> Option<TextEncoding> {
+    use TextEncoding::{Other, Utf8, Utf32};
+    use encoding_rs::*;
+    Some(match charset {
+        "utf8" | "utf8mb3" | "utf8mb4" => Utf8,
+        "utf32" => Utf32,
+        // Every ASCII byte decodes to itself in windows-1252.
+        "ascii" => Other(WINDOWS_1252),
+        // MySQL's latin1 is cp1252 with 0x81, 0x8D, 0x8F, 0x90 and 0x9D
+        // mapped to the C1 controls, exactly what WHATWG windows-1252 does.
+        "latin1" => Other(WINDOWS_1252),
+        "latin2" => Other(ISO_8859_2),
+        "latin7" => Other(ISO_8859_13),
+        "greek" => Other(ISO_8859_7),
+        "hebrew" => Other(ISO_8859_8),
+        "cp1250" => Other(WINDOWS_1250),
+        "cp1251" => Other(WINDOWS_1251),
+        "cp1256" => Other(WINDOWS_1256),
+        "cp1257" => Other(WINDOWS_1257),
+        "cp866" => Other(IBM866),
+        "koi8r" => Other(KOI8_R),
+        "koi8u" => Other(KOI8_U),
+        // GBK is a superset of GB2312.
+        "gbk" | "gb2312" => Other(GBK),
+        "gb18030" => Other(GB18030),
+        "big5" => Other(BIG5),
+        // WHATWG Shift_JIS is Microsoft's cp932, a superset of sjis.
+        "sjis" | "cp932" => Other(SHIFT_JIS),
+        "euckr" => Other(EUC_KR),
+        "ujis" | "eucjpms" => Other(EUC_JP),
+        // ucs2 is UTF-16BE restricted to the BMP.
+        "utf16" | "ucs2" => Other(UTF_16BE),
+        "utf16le" => Other(UTF_16LE),
+        _ => return None,
+    })
+}
+
+fn decode_utf32(col: &ColumnMeta, b: &[u8]) -> Result<String, ConvertError> {
+    let (chunks, rest) = b.as_chunks::<4>();
+    if !rest.is_empty() {
+        return Err(ConvertError::Invalid {
+            column: col.name.clone(),
+            reason: "utf32 value length is not a multiple of 4".into(),
+        });
     }
+    Ok(chunks
+        .iter()
+        .map(|c| char::from_u32(u32::from_be_bytes(*c)).unwrap_or(char::REPLACEMENT_CHARACTER))
+        .collect())
+}
+
+fn utf8_lossy(b: Vec<u8>) -> String {
     match String::from_utf8(b) {
         Ok(s) => s,
         Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+    }
+}
+
+/// Character columns. A snapshot is already utf8mb4 (`SET NAMES`); binlog
+/// images carry the bytes in the column's own charset, decoded here. A
+/// charset without a decoder is refused rather than guessed. A column the
+/// cached schema does not know (no charset) is read as UTF-8.
+fn decode_text(col: &ColumnMeta, b: Vec<u8>, origin: Origin) -> Result<String, ConvertError> {
+    let charset = match (origin, col.charset.as_deref()) {
+        (Origin::Binlog, Some(cs)) => cs,
+        _ => return Ok(utf8_lossy(b)),
+    };
+    match text_encoding(charset) {
+        Some(TextEncoding::Utf8) => Ok(utf8_lossy(b)),
+        Some(TextEncoding::Utf32) => decode_utf32(col, &b),
+        Some(TextEncoding::Other(enc)) => Ok(enc.decode_without_bom_handling(&b).0.into_owned()),
+        None => Err(ConvertError::Charset {
+            column: col.name.clone(),
+            charset: charset.to_owned(),
+        }),
     }
 }
 
@@ -462,6 +544,69 @@ mod tests {
         assert_eq!(
             snap(&latin, Value::Bytes("hé".as_bytes().to_vec())),
             json!("hé")
+        );
+    }
+
+    fn in_charset(charset: &str, bytes: &[u8]) -> Result<Json, ConvertError> {
+        let c = ColumnMeta::new("c", "varchar", "varchar(20)", Some(charset), true);
+        value_to_json(&c, Value::Bytes(bytes.to_vec()), Origin::Binlog)
+    }
+
+    #[test]
+    fn binlog_text_is_decoded_by_charset() {
+        // MySQL latin1 is cp1252: 0x80 is the euro sign, 0x93/0x94 curly
+        // quotes, 0x9C œ; 0x81 stays the C1 control U+0081.
+        assert_eq!(
+            in_charset("latin1", &[0x80, 0x93, 0x9C, 0x94, 0x81]).unwrap(),
+            json!("€“œ”\u{81}")
+        );
+        assert_eq!(
+            in_charset("cp1251", &[0xCF, 0xF0, 0xE8, 0xE2, 0xE5, 0xF2]).unwrap(),
+            json!("Привет")
+        );
+        assert_eq!(in_charset("cp1250", &[0x8A, 0xE8]).unwrap(), json!("Šč"));
+        assert_eq!(in_charset("cp1256", &[0xC7]).unwrap(), json!("ا"));
+        assert_eq!(in_charset("cp1257", &[0xE0]).unwrap(), json!("ą"));
+        assert_eq!(in_charset("ascii", b"plain").unwrap(), json!("plain"));
+        assert_eq!(in_charset("gbk", &[0xD6, 0xD0]).unwrap(), json!("中"));
+        assert_eq!(in_charset("gb2312", &[0xD6, 0xD0]).unwrap(), json!("中"));
+        assert_eq!(in_charset("gb18030", &[0xD6, 0xD0]).unwrap(), json!("中"));
+        assert_eq!(in_charset("big5", &[0xA4, 0xA4]).unwrap(), json!("中"));
+        assert_eq!(in_charset("sjis", &[0x82, 0xA0]).unwrap(), json!("あ"));
+        assert_eq!(in_charset("cp932", &[0x87, 0x40]).unwrap(), json!("①"));
+        assert_eq!(in_charset("euckr", &[0xC7, 0xD1]).unwrap(), json!("한"));
+        assert_eq!(in_charset("ujis", &[0xA4, 0xA2]).unwrap(), json!("あ"));
+        assert_eq!(in_charset("eucjpms", &[0xA4, 0xA2]).unwrap(), json!("あ"));
+        assert_eq!(in_charset("utf16", &[0x00, 0xE9]).unwrap(), json!("é"));
+        assert_eq!(in_charset("ucs2", &[0x4E, 0x2D]).unwrap(), json!("中"));
+        assert_eq!(in_charset("utf16le", &[0xE9, 0x00]).unwrap(), json!("é"));
+        assert_eq!(
+            in_charset("utf32", &[0, 0x01, 0xF6, 0x00]).unwrap(),
+            json!("😀")
+        );
+        assert_eq!(
+            in_charset("utf8mb3", "héllo".as_bytes()).unwrap(),
+            json!("héllo")
+        );
+        assert_eq!(in_charset("binary", &[0, 255]).unwrap(), json!("AP8="));
+    }
+
+    #[test]
+    fn undecodable_charsets_are_refused_not_guessed() {
+        let err = in_charset("dec8", &[0xE9]).unwrap_err();
+        assert_eq!(
+            err,
+            ConvertError::Charset {
+                column: "c".into(),
+                charset: "dec8".into()
+            }
+        );
+        assert!(err.to_string().contains("`c`") && err.to_string().contains("`dec8`"));
+        // The snapshot is utf8mb4 whatever the column's charset.
+        let c = ColumnMeta::new("c", "varchar", "varchar(20)", Some("dec8"), true);
+        assert_eq!(
+            value_to_json(&c, Value::Bytes(b"x".to_vec()), Origin::Snapshot).unwrap(),
+            json!("x")
         );
     }
 

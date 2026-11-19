@@ -681,6 +681,60 @@ async fn snapshot_honours_cancellation() {
     assert!(res.is_ok(), "{res:?}");
 }
 
+/// Binlog images carry text in the column's charset; the snapshot reads it
+/// as utf8mb4. Both must give the same document.
+#[tokio::test]
+async fn non_utf8_charsets_decode_like_the_snapshot() {
+    let Some(url) = url() else { return };
+    let _g = SERIAL.lock().await;
+    let mut conn = admin(&url).await;
+    fresh_db(&mut conn, "mc_charset").await;
+    conn.query_drop(
+        "CREATE TABLE mc_charset.t (
+            id INT PRIMARY KEY,
+            lat VARCHAR(40) CHARACTER SET latin1,
+            cyr VARCHAR(40) CHARACTER SET cp1251,
+            gb VARCHAR(40) CHARACTER SET gbk,
+            sj VARCHAR(40) CHARACTER SET cp932,
+            u16 VARCHAR(40) CHARACTER SET utf16
+        ) CHARACTER SET utf8mb4",
+    )
+    .await
+    .unwrap();
+    let values = "'€ “œ” Ÿ café', 'Привет, мир', '中文', 'あ①', 'é😀'";
+    conn.query_drop("SET NAMES utf8mb4").await.unwrap();
+    conn.query_drop(format!("INSERT INTO mc_charset.t VALUES (1, {values})"))
+        .await
+        .unwrap();
+
+    let mut src = source(&url, "mc_charset", &["t"], "charset-sync");
+    src.open(None).await.unwrap();
+    let (tx, mut rx) = mpsc::channel(16);
+    src.snapshot(tx, CancellationToken::new()).await.unwrap();
+    let Some(SourceEvent::Change(snap)) = rx.recv().await else {
+        panic!("one snapshot row");
+    };
+    let mut run = Running::start(src);
+    conn.query_drop(format!("INSERT INTO mc_charset.t VALUES (2, {values})"))
+        .await
+        .unwrap();
+    let evs = run.until(|e| is_change_with(e, 2)).await;
+    run.stop().await;
+    let SourceEvent::Change(streamed) = evs.last().unwrap() else {
+        unreachable!()
+    };
+    let (Op::Upsert { doc: a }, Op::Upsert { doc: b }) = (&snap.op, &streamed.op) else {
+        panic!("upserts expected");
+    };
+    let mut a = a.clone();
+    let mut b = b.clone();
+    a.remove("id");
+    b.remove("id");
+    assert_eq!(a, b, "snapshot and binlog disagree");
+    assert_eq!(a["lat"], json!("€ “œ” Ÿ café"));
+    assert_eq!(a["cyr"], json!("Привет, мир"));
+}
+
 /// The GTID set of a checkpoint (GTID mode only).
 fn gtid_set(cp: &Checkpoint) -> GtidSet {
     cp.0["gtid_set"].as_str().unwrap().parse().unwrap()

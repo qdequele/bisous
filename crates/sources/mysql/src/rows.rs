@@ -101,6 +101,9 @@ impl BinlogTable {
         for (col, v) in self.columns.iter().zip(values) {
             let json = binlog_to_json(col, v).map_err(|e| match e {
                 ConvertError::PartialJson(_) => SourceError::Config(e.to_string()),
+                ConvertError::Charset { .. } => {
+                    SourceError::Config(format!("`{}`: {e}", self.collection))
+                }
                 ConvertError::Invalid { .. } => {
                     SourceError::Fatal(format!("`{}`: {e}", self.collection))
                 }
@@ -299,6 +302,18 @@ mod tests {
         let mut nokey = schema();
         nokey.key.clear();
         assert!(BinlogTable::align(&nokey, &types(), None).is_err());
+    }
+
+    #[test]
+    fn undecodable_charset_is_a_config_error_naming_column_and_charset() {
+        let mut s = schema();
+        s.columns[3] = ColumnMeta::new("name", "varchar", "varchar(20)", Some("swe7"), true);
+        let t = BinlogTable::align(&s, &types(), None).unwrap();
+        let err = t.row_to_doc(row(1, 1, 0, "a")).unwrap_err();
+        assert!(
+            matches!(&err, SourceError::Config(m) if m.contains("`name`") && m.contains("`swe7`") && m.contains("shop.items")),
+            "{err:?}"
+        );
     }
 
     #[test]
