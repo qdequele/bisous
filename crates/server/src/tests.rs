@@ -274,6 +274,7 @@ fn locked() -> AuthConfig {
     AuthConfig {
         lab_service_token: Some(LAB.into()),
         admin_api_key: Some(ADMIN.into()),
+        open_mode: false,
     }
 }
 
@@ -369,7 +370,7 @@ async fn wait_for(mut cond: impl AsyncFnMut() -> bool) {
 #[tokio::test]
 async fn auth_matrix() {
     // Open mode: everything is global, no token needed.
-    let open = app(AuthConfig::default());
+    let open = app(AuthConfig::open());
     assert_eq!(
         call(&open.router, "GET", "/syncs", &[], None).await.0,
         StatusCode::OK
@@ -516,7 +517,7 @@ async fn a_tenant_never_reaches_another_tenants_sync() {
 
 #[tokio::test]
 async fn secrets_are_redacted_on_every_response() {
-    let a = app(AuthConfig::default());
+    let a = app(AuthConfig::open());
     let (status, created) = call(&a.router, "POST", "/syncs", &[], Some(sync_body("s"))).await;
     assert_eq!(status, StatusCode::CREATED);
     assert_no_secret(&created);
@@ -547,7 +548,7 @@ async fn secrets_are_redacted_on_every_response() {
 
 #[tokio::test]
 async fn put_keeps_redacted_secrets() {
-    let a = app(AuthConfig::default());
+    let a = app(AuthConfig::open());
     let id = create(&a, &[], "s").await;
     let (_, mut current) = call(&a.router, "GET", &format!("/syncs/{id}"), &[], None).await;
     // Edit a plain field, send the redacted placeholders back.
@@ -665,7 +666,7 @@ async fn put_keeps_redacted_secrets() {
 
 #[tokio::test]
 async fn invalid_specs_are_refused() {
-    let a = app(AuthConfig::default());
+    let a = app(AuthConfig::open());
     let cases: Vec<(Value, StatusCode, &str)> = vec![
         (
             {
@@ -806,7 +807,7 @@ async fn invalid_specs_are_refused() {
 
 #[tokio::test]
 async fn check_and_discover_store_nothing_and_time_out() {
-    let a = app(AuthConfig::default());
+    let a = app(AuthConfig::open());
     let probe = json!({"source": {"kind": "postgres", "config": {"password": "x"}}});
     let (status, body) = call(
         &a.router,
@@ -931,7 +932,7 @@ async fn the_public_policy_refuses_internal_origins_everywhere() {
 #[tokio::test]
 async fn the_state_database_is_refused_even_under_any() {
     let policy = HostPolicy::any().forbid_origin(Endpoint::new("127.0.0.1", 6543));
-    let a = app_full(AuthConfig::default(), Arc::new(MemStore::new()), policy);
+    let a = app_full(AuthConfig::open(), Arc::new(MemStore::new()), policy);
     for host in ["127.0.0.1", "localhost"] {
         let (status, body) = call(
             &a.router,
@@ -959,7 +960,7 @@ async fn the_state_database_is_refused_even_under_any() {
 #[tokio::test]
 async fn every_start_vets_the_origin_again() {
     let store = Arc::new(MemStore::new());
-    let first = app_with(AuthConfig::default(), Arc::clone(&store));
+    let first = app_with(AuthConfig::open(), Arc::clone(&store));
     let mut body = sync_body("s");
     body["source"] = origin("127.0.0.1", 5432);
     let (status, created) = call(&first.router, "POST", "/syncs", &[], Some(body)).await;
@@ -968,7 +969,7 @@ async fn every_start_vets_the_origin_again() {
     first.state.manager.shutdown(Duration::from_secs(5)).await;
 
     // The operator tightens the policy: the stored sync is held at boot.
-    let second = app_full(AuthConfig::default(), store, HostPolicy::public());
+    let second = app_full(AuthConfig::open(), store, HostPolicy::public());
     boot_syncs(&second.state).await.unwrap();
     let uri = format!("/syncs/{id}/status");
     wait_for(async || call(&second.router, "GET", &uri, &[], None).await.1["phase"] == "held")
@@ -1034,7 +1035,7 @@ async fn lab_callers_and_tenant_syncs_get_coarse_errors() {
 /// supervisor for the deleted sync.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn put_racing_delete_never_resurrects_the_sync() {
-    let a = app(AuthConfig::default());
+    let a = app(AuthConfig::open());
     let id = create(&a, &[], "s").await;
     let (_, mut current) = call(&a.router, "GET", &format!("/syncs/{id}"), &[], None).await;
     current["source"]["config"]["rows"] = json!(7);
@@ -1069,7 +1070,7 @@ async fn put_racing_delete_never_resurrects_the_sync() {
 /// running the stored (new) spec.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn resume_racing_put_runs_the_stored_spec() {
-    let a = app(AuthConfig::default());
+    let a = app(AuthConfig::open());
     let id = create(&a, &[], "s").await;
     for round in 0..15u64 {
         let (status, _) = call(&a.router, "POST", &format!("/syncs/{id}/pause"), &[], None).await;
@@ -1132,7 +1133,7 @@ async fn put(a: &App, id: &str, query: &str, body: Value) -> (StatusCode, Value)
 
 #[tokio::test]
 async fn a_new_origin_is_torn_down_with_the_old_spec_and_synced_fresh() {
-    let a = app(AuthConfig::default());
+    let a = app(AuthConfig::open());
     let mut body = sync_body("s");
     body["source"]["config"]["host"] = json!("old-db");
     let (_, created) = call(&a.router, "POST", "/syncs", &[], Some(body.clone())).await;
@@ -1172,7 +1173,7 @@ async fn a_new_origin_is_torn_down_with_the_old_spec_and_synced_fresh() {
 
 #[tokio::test]
 async fn changed_streams_are_backfilled_and_a_rename_only_restarts() {
-    let a = app(AuthConfig::default());
+    let a = app(AuthConfig::open());
     let id = create(&a, &[], "s").await;
     streaming(&a, &id).await;
     assert_eq!(written(&a, &id).await, 3);
@@ -1206,7 +1207,7 @@ async fn changed_streams_are_backfilled_and_a_rename_only_restarts() {
 
 #[tokio::test]
 async fn put_on_a_paused_sync_leaves_it_paused() {
-    let a = app(AuthConfig::default());
+    let a = app(AuthConfig::open());
     let id = create(&a, &[], "s").await;
     streaming(&a, &id).await;
     call(&a.router, "POST", &format!("/syncs/{id}/pause"), &[], None).await;
@@ -1235,7 +1236,7 @@ async fn put_on_a_paused_sync_leaves_it_paused() {
 
 #[tokio::test]
 async fn delete_tears_down_and_keeps_the_sync_when_teardown_fails() {
-    let a = app(AuthConfig::default());
+    let a = app(AuthConfig::open());
     let id = create(&a, &[], "s").await;
     a.probe.teardown_fails.store(true, Ordering::SeqCst);
     let (status, body) = call(&a.router, "DELETE", &format!("/syncs/{id}"), &[], None).await;
@@ -1271,7 +1272,7 @@ async fn delete_tears_down_and_keeps_the_sync_when_teardown_fails() {
 
 #[tokio::test]
 async fn pause_resume_status_and_release() {
-    let a = app(AuthConfig::default());
+    let a = app(AuthConfig::open());
     let id = create(&a, &[], "s").await;
     let status_uri = format!("/syncs/{id}/status");
     wait_for(async || {
@@ -1353,7 +1354,7 @@ async fn pause_resume_status_and_release() {
 
 #[tokio::test]
 async fn dead_letters_are_paged() {
-    let a = app(AuthConfig::default());
+    let a = app(AuthConfig::open());
     let id = create(&a, &[], "s").await;
     let letters: Vec<_> = (0..5)
         .map(|i| meili_connect_core::DeadLetter {
@@ -1403,7 +1404,7 @@ async fn dead_letters_are_paged() {
 #[tokio::test]
 async fn boot_starts_every_sync_but_the_paused_ones() {
     let store = Arc::new(MemStore::new());
-    let first = app_with(AuthConfig::default(), Arc::clone(&store));
+    let first = app_with(AuthConfig::open(), Arc::clone(&store));
     let running = create(&first, &[], "running").await;
     let paused = create(&first, &[], "paused").await;
     call(
@@ -1416,7 +1417,7 @@ async fn boot_starts_every_sync_but_the_paused_ones() {
     .await;
     first.state.manager.shutdown(Duration::from_secs(5)).await;
 
-    let second = app_with(AuthConfig::default(), store);
+    let second = app_with(AuthConfig::open(), store);
     assert_eq!(boot_syncs(&second.state).await.unwrap(), 1);
     let mut ids = second.state.manager.running_ids();
     ids.sort();
@@ -1518,7 +1519,7 @@ fn the_table_lists_every_path_in_lib_rs() {
 
 #[tokio::test]
 async fn every_listed_route_is_mounted_with_its_method() {
-    let a = app(AuthConfig::default());
+    let a = app(AuthConfig::open());
     for r in ROUTES {
         let uri = r
             .path

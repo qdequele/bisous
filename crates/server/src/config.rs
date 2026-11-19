@@ -15,6 +15,9 @@ use thiserror::Error;
 #[error("{0}")]
 pub struct ConfigError(pub String);
 
+/// Variables whose blank value is an error rather than "unset".
+const AUTH_VARS: &[&str] = &["ADMIN_API_KEY", "LAB_SERVICE_TOKEN"];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogFormat {
     Pretty,
@@ -45,6 +48,9 @@ pub struct Config {
     pub secret_key: Option<Secret>,
     pub admin_api_key: Option<Secret>,
     pub lab_service_token: Option<Secret>,
+    /// No management auth: allowed only on a loopback address or with
+    /// `ALLOW_OPEN_MODE=true`.
+    pub open_mode: bool,
     pub lab_events: Option<LabEventsConfig>,
     pub log_format: LogFormat,
     /// `RUST_LOG` syntax; `LOG_LEVEL` is the simple form.
@@ -70,8 +76,16 @@ impl Config {
     }
 
     /// Reads through `get` so tests do not touch the process environment.
-    /// Blank values count as unset.
+    /// Blank values count as unset, except for the auth variables: a blank
+    /// `ADMIN_API_KEY` or `LAB_SERVICE_TOKEN` is an error, never open mode.
     pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
+        for name in AUTH_VARS {
+            if get(name).is_some_and(|v| v.trim().is_empty()) {
+                return Err(ConfigError(format!(
+                    "{name} is set but blank: give it a value or remove it"
+                )));
+            }
+        }
         let get = |k: &str| get(k).filter(|v| !v.trim().is_empty());
 
         let listen_addr = get("LISTEN_ADDR")
@@ -125,6 +139,21 @@ impl Config {
             .unwrap_or_else(|| "info".to_owned());
 
         let lab_service_token = get("LAB_SERVICE_TOKEN").map(Secret::new);
+        let admin_api_key = get("ADMIN_API_KEY").map(Secret::new);
+        let allow_open_mode = match get("ALLOW_OPEN_MODE").as_deref().map(str::trim) {
+            None | Some("false") | Some("0") => false,
+            Some("true") | Some("1") => true,
+            Some(_) => return Err(ConfigError("ALLOW_OPEN_MODE must be true or false".into())),
+        };
+        let open_mode = lab_service_token.is_none() && admin_api_key.is_none();
+        if open_mode && !allow_open_mode && !listen_addr.ip().is_loopback() {
+            return Err(ConfigError(format!(
+                "no management auth is configured and the API would listen on {listen_addr}: \
+                 set ADMIN_API_KEY (or LAB_SERVICE_TOKEN), listen on a loopback address \
+                 (LISTEN_ADDR=127.0.0.1:8080), or set ALLOW_OPEN_MODE=true for local \
+                 development"
+            )));
+        }
         let default_mode = if lab_service_token.is_some() {
             PolicyMode::Public
         } else {
@@ -146,8 +175,9 @@ impl Config {
             listen_addr,
             database_url,
             secret_key,
-            admin_api_key: get("ADMIN_API_KEY").map(Secret::new),
+            admin_api_key,
             lab_service_token,
+            open_mode,
             host_policy,
             lab_events,
             log_format,
@@ -233,23 +263,51 @@ mod tests {
 
     #[test]
     fn defaults_are_standalone_in_memory() {
-        let c = cfg(&[]).unwrap();
+        let c = cfg(&[("ADMIN_API_KEY", "k")]).unwrap();
         assert_eq!(c.listen_addr.to_string(), "0.0.0.0:8080");
+        assert!(!c.open_mode);
         assert!(c.database_url.is_none());
         assert!(c.lab_events.is_none());
-        assert!(c.admin_api_key.is_none() && c.lab_service_token.is_none());
+        assert!(c.lab_service_token.is_none());
         assert_eq!(c.usage_flush_interval, Duration::from_secs(60));
         assert_eq!(c.log_format, LogFormat::Pretty);
     }
 
     #[test]
+    fn open_mode_needs_loopback_or_an_explicit_opt_in() {
+        // No auth on a public address: refused.
+        let err = cfg(&[]).unwrap_err();
+        assert!(err.0.contains("ALLOW_OPEN_MODE"), "{err}");
+        assert!(cfg(&[("LISTEN_ADDR", "0.0.0.0:9000")]).is_err());
+        assert!(cfg(&[("LISTEN_ADDR", "[::]:9000")]).is_err());
+        // Loopback, or the explicit opt-in.
+        assert!(cfg(&[("LISTEN_ADDR", "127.0.0.1:8080")]).unwrap().open_mode);
+        assert!(cfg(&[("LISTEN_ADDR", "[::1]:8080")]).unwrap().open_mode);
+        assert!(cfg(&[("ALLOW_OPEN_MODE", "true")]).unwrap().open_mode);
+        assert!(cfg(&[("ALLOW_OPEN_MODE", "maybe")]).is_err());
+        // Any token: not open.
+        assert!(!cfg(&[("LAB_SERVICE_TOKEN", "t")]).unwrap().open_mode);
+    }
+
+    #[test]
+    fn a_blank_auth_variable_is_an_error_not_open_mode() {
+        for name in ["ADMIN_API_KEY", "LAB_SERVICE_TOKEN"] {
+            for blank in ["", "  "] {
+                let err = cfg(&[(name, blank), ("ALLOW_OPEN_MODE", "true")]).unwrap_err();
+                assert!(err.0.contains(name), "{err}");
+            }
+        }
+    }
+
+    #[test]
     fn database_needs_the_secret_key() {
-        let err = cfg(&[("DATABASE_URL", "postgres://x")]).unwrap_err();
+        let err = cfg(&[("DATABASE_URL", "postgres://x"), ("ADMIN_API_KEY", "k")]).unwrap_err();
         assert!(err.0.contains("CONNECT_SECRET_KEY"));
         assert!(
             cfg(&[
                 ("DATABASE_URL", "postgres://x"),
-                ("CONNECT_SECRET_KEY", "k")
+                ("CONNECT_SECRET_KEY", "k"),
+                ("ADMIN_API_KEY", "k"),
             ])
             .unwrap()
             .database_url
@@ -259,6 +317,11 @@ mod tests {
 
     #[test]
     fn lab_event_variables_go_together() {
+        let cfg = |pairs: &[(&str, &str)]| {
+            let mut all = pairs.to_vec();
+            all.push(("ADMIN_API_KEY", "k"));
+            cfg(&all)
+        };
         assert!(cfg(&[("LAB_URL", "https://lab")]).is_err());
         assert!(cfg(&[("LAB_URL", "https://lab"), ("LAB_INSTANCE_ID", "i")]).is_err());
         let c = cfg(&[
@@ -296,7 +359,7 @@ mod tests {
 
     #[test]
     fn host_policy_defaults_follow_the_lab_token() {
-        assert!(cfg(&[]).unwrap().host_policy.is_any());
+        assert!(cfg(&[("ADMIN_API_KEY", "k")]).unwrap().host_policy.is_any());
         let lab = cfg(&[("LAB_SERVICE_TOKEN", "t")]).unwrap();
         assert_eq!(lab.host_policy.mode_name(), "public");
         let explicit = cfg(&[("LAB_SERVICE_TOKEN", "t"), ("CONNECT_HOST_POLICY", "any")]).unwrap();
@@ -304,11 +367,12 @@ mod tests {
         let list = cfg(&[
             ("CONNECT_HOST_POLICY", "allowlist"),
             ("CONNECT_HOST_ALLOWLIST", "db.internal:5432,10.0.0.0/8"),
+            ("ADMIN_API_KEY", "k"),
         ])
         .unwrap();
         assert_eq!(list.host_policy.mode_name(), "allowlist");
-        assert!(cfg(&[("CONNECT_HOST_POLICY", "allowlist")]).is_err());
-        assert!(cfg(&[("CONNECT_HOST_POLICY", "open")]).is_err());
+        assert!(cfg(&[("CONNECT_HOST_POLICY", "allowlist"), ("ADMIN_API_KEY", "k")]).is_err());
+        assert!(cfg(&[("CONNECT_HOST_POLICY", "open"), ("ADMIN_API_KEY", "k")]).is_err());
     }
 
     #[tokio::test]
@@ -316,6 +380,7 @@ mod tests {
         let c = cfg(&[
             ("DATABASE_URL", "postgres://u:pw@127.0.0.1:6543/connect"),
             ("CONNECT_SECRET_KEY", "k"),
+            ("ADMIN_API_KEY", "k"),
         ])
         .unwrap();
         let refused = c
@@ -354,6 +419,11 @@ mod tests {
 
     #[test]
     fn bad_values_are_refused() {
+        let cfg = |pairs: &[(&str, &str)]| {
+            let mut all = pairs.to_vec();
+            all.push(("ADMIN_API_KEY", "k"));
+            cfg(&all)
+        };
         assert!(cfg(&[("LISTEN_ADDR", "nope")]).is_err());
         assert!(cfg(&[("LOG_FORMAT", "xml")]).is_err());
         assert!(cfg(&[("USAGE_FLUSH_INTERVAL_SECS", "0")]).is_err());

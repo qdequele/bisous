@@ -23,18 +23,20 @@ cp .env.example .env
 echo "CONNECT_SECRET_KEY=$(openssl rand -base64 32)" >> .env
 docker compose up -d --build
 curl localhost:8080/health          # {"status":"ok"}
+export AUTH="Authorization: Bearer dev-admin-key-change-me"
 ```
 
 `compose.yaml` starts the server, its state Postgres, a Meilisearch
 (`localhost:7700`, key `dev-master-key-change-me`) and a demo origin Postgres
 (`localhost:5433`, `wal_level=logical`, a `products` table with 1,000 rows).
-With no `ADMIN_API_KEY` the API is in open mode, so the examples below send no
-token; with one, add `-H "Authorization: Bearer $ADMIN_API_KEY"`.
+Compose publishes every port on `127.0.0.1` only and sets a development
+`ADMIN_API_KEY` (`dev-admin-key-change-me`, change it in `.env`); the
+examples send it.
 
 Sync the demo table (inside compose the services reach each other by name):
 
 ```bash
-curl -s localhost:8080/syncs -H 'Content-Type: application/json' -d '{
+curl -s localhost:8080/syncs -H "$AUTH" -H 'Content-Type: application/json' -d '{
   "name": "products",
   "source": {"kind": "postgres", "config": {"url": "postgres://app:app@origin:5432/app?sslmode=disable"}},
   "destination": {"url": "http://meilisearch:7700", "api_key": "dev-master-key-change-me"},
@@ -49,8 +51,10 @@ docker compose exec origin psql -U app -c "UPDATE products SET name = 'Blue lamp
 curl -s 'localhost:7700/indexes/products/search?q=lamp' -H 'Authorization: Bearer dev-master-key-change-me' | jq '.hits[0]'
 ```
 
-Without Docker: `cargo run -p meili-connect-server` (in-memory store when
-`DATABASE_URL` is unset; nothing survives a restart).
+Without Docker: `LISTEN_ADDR=127.0.0.1:8080 cargo run -p meili-connect-server`
+(in-memory store when `DATABASE_URL` is unset; nothing survives a restart).
+With no `ADMIN_API_KEY` nor `LAB_SERVICE_TOKEN` the API is in open mode, which
+the server only accepts on a loopback address or with `ALLOW_OPEN_MODE=true`.
 
 ## The API by example
 
@@ -63,7 +67,7 @@ the body `{"code": "...", "message": "..."}`.
 |---|---|---|
 | `LAB_SERVICE_TOKEN` | `Authorization: Bearer <token>` **and** `X-Connect-Tenant-Id: <tenant>` | that tenant only |
 | `ADMIN_API_KEY` | `Authorization: Bearer <key>`, optionally `X-Connect-Tenant-Id` | global, or the named tenant |
-| neither | nothing | global (open mode, logged loudly at startup) |
+| neither | nothing | global (open mode: only on a loopback `LISTEN_ADDR` or with `ALLOW_OPEN_MODE=true`, logged loudly) |
 
 Tokens are compared in constant time. A sync of another scope does not exist
 for the caller: every route answers `404`. `/health` is always open.
@@ -192,8 +196,9 @@ Every variable, with defaults, is in [`.env.example`](.env.example).
 | `LISTEN_ADDR` | `0.0.0.0:8080` | HTTP API address. |
 | `DATABASE_URL` | unset | State Postgres. **Unset: in-memory store, nothing survives a restart** (warned at startup). |
 | `CONNECT_SECRET_KEY` | | Base64 32-byte key sealing specs at rest. Required with `DATABASE_URL`. `openssl rand -base64 32`. |
-| `ADMIN_API_KEY` | unset | Standalone admin token. |
-| `LAB_SERVICE_TOKEN` | unset | Lab token; requires `X-Connect-Tenant-Id`. |
+| `ADMIN_API_KEY` | unset | Standalone admin token. Set but blank: startup error. |
+| `ALLOW_OPEN_MODE` | `false` | Without any token the server only starts on a loopback `LISTEN_ADDR`, unless this is `true`. |
+| `LAB_SERVICE_TOKEN` | unset | Lab token; requires `X-Connect-Tenant-Id`. Set but blank: startup error. |
 | `CONNECT_HOST_POLICY` | `public` with `LAB_SERVICE_TOKEN`, else `any` | Which hosts sources and destinations may point at: `public`, `any` or `allowlist`. See [Host policy](#host-policy). |
 | `CONNECT_HOST_ALLOWLIST` | unset | With `allowlist`: comma-separated `host`, `host:port`, IP addresses and CIDRs. |
 | `LAB_URL`, `LAB_INSTANCE_ID`, `LAB_INSTANCE_SECRET` | unset | Lab usage events. All three or none. |

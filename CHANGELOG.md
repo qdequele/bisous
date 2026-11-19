@@ -20,6 +20,11 @@ All notable changes to meili-connect are listed here. The format follows
   changed (new source host, port, URL, user, database or TLS settings, new
   Meilisearch URL): the stored secret would have gone to the new host.
   `422 secret_required` asks for it again.
+- No more open mode by accident: without `ADMIN_API_KEY` or
+  `LAB_SERVICE_TOKEN` the server refuses to start unless it listens on a
+  loopback address or `ALLOW_OPEN_MODE=true`; a blank auth variable is a
+  startup error. `compose.yaml` binds `127.0.0.1` and sets a development
+  `ADMIN_API_KEY`.
 - Errors returned to the Lab and stored for a tenant's sync are reduced to
   their class and a fixed description; non-Meilisearch response bodies are
   never echoed in errors.

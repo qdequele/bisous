@@ -207,6 +207,7 @@ pub async fn run() -> Result<(), String> {
     let auth = AuthConfig {
         lab_service_token: config.lab_service_token.clone(),
         admin_api_key: config.admin_api_key.clone(),
+        open_mode: config.open_mode,
     };
     if auth.is_open() {
         warn!(
