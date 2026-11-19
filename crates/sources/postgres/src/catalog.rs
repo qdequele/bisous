@@ -298,6 +298,19 @@ impl SlotInfo {
     }
 }
 
+/// Whether backend `pid` is a session of ours: this connector's
+/// application name, logged in as the current role.
+pub async fn is_own_backend(sql: &Sql, pid: i32) -> Result<bool, SourceError> {
+    let rows = sql
+        .query(
+            "SELECT 1 FROM pg_stat_activity
+             WHERE pid = $1 AND application_name = $2 AND usename = current_user",
+            &[&pid, &crate::conn::APPLICATION_NAME],
+        )
+        .await?;
+    Ok(!rows.is_empty())
+}
+
 /// Tables (`schema.table`) in a publication, `None` when it does not exist.
 pub async fn publication_tables(
     sql: &Sql,

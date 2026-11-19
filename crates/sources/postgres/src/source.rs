@@ -24,6 +24,8 @@ use crate::pgoutput::{Decoded, Decoder, KeyColumns, Mapped};
 /// Rows per `FETCH` during the snapshot: the most rows held in memory.
 const SNAPSHOT_BATCH: usize = 500;
 const CURSOR: &str = "meili_connect_snapshot";
+/// How many times `teardown` tries to free and drop the slot (250 ms apart).
+const TEARDOWN_ATTEMPTS: usize = 20;
 /// Oldest supported server. `pgwire-replication` always asks pgoutput for
 /// `messages 'true'`, an option pgoutput only knows from Postgres 14: an
 /// older server accepts the slot and the snapshot, then refuses every
@@ -636,12 +638,19 @@ impl Source for PostgresSource {
         let publication = self.settings.publication.clone();
         self.connect().await?;
         let sql = self.db()?;
-        for attempt in 0..20 {
+        for _ in 0..TEARDOWN_ATTEMPTS {
             let Some(slot) = catalog::slot(sql, &slot_name).await? else {
                 break;
             };
             if let Some(pid) = slot.active_pid {
-                // Our own stream that has not noticed yet.
+                // A stream of ours that has not noticed yet: stop it. Never
+                // kill a process we cannot tell is ours.
+                if !catalog::is_own_backend(sql, pid).await? {
+                    return Err(SourceError::Transient(format!(
+                        "replication slot {slot_name} is in use by process {pid}, which is not \
+                         a meili-connect session of this role: stop it, then delete again"
+                    )));
+                }
                 sql.execute("SELECT pg_terminate_backend($1)", &[&pid])
                     .await?;
                 tokio::time::sleep(Duration::from_millis(250)).await;
@@ -651,13 +660,23 @@ impl Source for PostgresSource {
                 .execute("SELECT pg_drop_replication_slot($1)", &[&slot_name])
                 .await
             {
-                Ok(_) => break,
+                Ok(_) => {}
                 // Raced with a reconnect or a concurrent drop: look again.
-                Err(SourceError::Transient(_) | SourceError::Config(_)) if attempt < 19 => {
+                Err(SourceError::Transient(_) | SourceError::Config(_)) => {
                     tokio::time::sleep(Duration::from_millis(250)).await;
                 }
                 Err(e) => return Err(e),
             }
+        }
+        // Only report success for what is actually gone, and keep the
+        // publication while the slot lives: the slot still decodes with it.
+        if let Some(slot) = catalog::slot(sql, &slot_name).await? {
+            return Err(SourceError::Transient(format!(
+                "replication slot {slot_name} could not be dropped: it is still in use{}",
+                slot.active_pid
+                    .map(|p| format!(" by process {p}"))
+                    .unwrap_or_default()
+            )));
         }
         sql.simple(&format!(
             "DROP PUBLICATION IF EXISTS {}",

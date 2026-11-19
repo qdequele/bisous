@@ -724,3 +724,84 @@ async fn servers_older_than_14_are_refused_before_anything_is_created() {
         .get(0);
     assert_eq!((slots, pubs), (0, 0));
 }
+
+/// A stream that grabs the slot back as soon as it loses it, like an engine
+/// still running the sync would.
+fn stubborn_holder(
+    url: &str,
+    sync_id: &str,
+    collection: &str,
+    from: Checkpoint,
+) -> CancellationToken {
+    let stop = CancellationToken::new();
+    let (url, sync_id, collection, s) = (
+        url.to_owned(),
+        sync_id.to_owned(),
+        collection.to_owned(),
+        stop.clone(),
+    );
+    tokio::spawn(async move {
+        while !s.is_cancelled() {
+            let mut src = source(&url, &sync_id, &[&collection]);
+            if src.open(Some(from.clone())).await.is_err() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                continue;
+            }
+            let (tx, mut rx) = mpsc::channel(64);
+            tokio::spawn(async move { while rx.recv().await.is_some() {} });
+            let (_ack, acks) = ack_channel();
+            let _ = src.stream(tx, acks, s.clone()).await;
+        }
+    });
+    stop
+}
+
+#[tokio::test]
+async fn teardown_never_reports_success_while_the_slot_survives() {
+    let Some(url) = url() else { return };
+    let db = admin(&url).await;
+    let table = unique("held");
+    create_items(&db, &table).await;
+    let sync_id = unique("held");
+    let name = format!("meili_connect_{sync_id}");
+    let collection = format!("public.{table}");
+    let mut src = source(&url, &sync_id, &[&collection]);
+    let Opened::Fresh { start } = src.open(None).await.unwrap() else {
+        panic!()
+    };
+    drop(src);
+    let stop = stubborn_holder(&url, &sync_id, &collection, start);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let mut other = source(&url, &sync_id, &[&collection]);
+    let result = other.teardown().await;
+    let count = |q: &'static str| {
+        let db = &db;
+        let name = name.clone();
+        async move { db.query_one(q, &[&name]).await.unwrap().get::<_, i64>(0) }
+    };
+    let slots = count("SELECT count(*) FROM pg_replication_slots WHERE slot_name = $1").await;
+    let pubs = count("SELECT count(*) FROM pg_publication WHERE pubname = $1").await;
+    if slots > 0 {
+        assert!(
+            matches!(result, Err(SourceError::Transient(_))),
+            "slot survived but teardown said {result:?}"
+        );
+        assert_eq!(pubs, 1, "publication dropped while the slot survived");
+    } else {
+        result.unwrap();
+    }
+
+    // Once nothing holds it any more, teardown finishes.
+    stop.cancel();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    other.teardown().await.unwrap();
+    assert_eq!(
+        count("SELECT count(*) FROM pg_replication_slots WHERE slot_name = $1").await,
+        0
+    );
+    assert_eq!(
+        count("SELECT count(*) FROM pg_publication WHERE pubname = $1").await,
+        0
+    );
+}
