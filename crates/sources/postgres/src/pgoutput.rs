@@ -32,6 +32,8 @@ pub struct Column {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Relation {
+    pub schema: String,
+    pub table: String,
     pub collection: String,
     pub columns: Vec<Column>,
     /// Positions of the key columns in `columns`, in key order. `None` when
@@ -55,6 +57,26 @@ pub enum Decoded {
     /// The relation uses types the registry does not know: look them up and
     /// decode the same message again.
     NeedTypes(Vec<Oid>),
+    /// A key-changing UPDATE whose new row lacks unchanged TOAST values
+    /// (no full old row to take them from): emit `events` (the delete of
+    /// the old key), then re-read the row by its new key and upsert it if
+    /// it still exists. A later change covers a row that is gone.
+    Refetch {
+        events: Vec<SourceEvent>,
+        row: RowRef,
+    },
+}
+
+/// A row to re-read by key, with what is needed to build its document.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RowRef {
+    pub schema: String,
+    pub table: String,
+    pub collection: String,
+    pub columns: Vec<Column>,
+    /// Key column names and their values in text form, in key order.
+    pub key_columns: Vec<(Column, String)>,
+    pub key: Vec<Value>,
 }
 
 #[derive(Debug, Default)]
@@ -84,7 +106,7 @@ impl Decoder {
                 expect(r.u8()?, b'N', "insert")?;
                 let new = tuple(&mut r)?;
                 let key = key_of(rel, &new, None, types)?;
-                let (doc, _) = row(rel, &new, types)?;
+                let (doc, _) = row(rel, &new, None, types)?;
                 Ok(Decoded::Events(vec![change(rel, key, Op::Upsert { doc })]))
             }
             b'U' => {
@@ -93,14 +115,16 @@ impl Decoder {
                     return Ok(Decoded::Events(Vec::new()));
                 };
                 let mut kind = r.u8()?;
+                let prev_kind = kind;
                 let mut old = None;
                 if kind == b'K' || kind == b'O' {
                     old = Some(tuple(&mut r)?);
                     kind = r.u8()?;
                 }
+                let old_kind = old.as_ref().map(|_| prev_kind);
                 expect(kind, b'N', "update")?;
                 let new = tuple(&mut r)?;
-                update(rel, old.as_deref(), &new, types).map(Decoded::Events)
+                update(rel, old.as_deref(), old_kind, &new, types)
             }
             b'D' => {
                 let rel = self.rel(r.u32()?)?;
@@ -213,6 +237,8 @@ impl Decoder {
         let previous = self.relations.insert(
             id,
             Relation {
+                schema: schema.to_owned(),
+                table: name.to_owned(),
                 collection: collection.clone(),
                 columns,
                 key_idx,
@@ -244,36 +270,74 @@ fn change(rel: &Relation, key: Vec<Value>, op: Op) -> SourceEvent {
     })
 }
 
-/// UPDATE → Upsert, Patch (unchanged TOAST columns), or Delete(old) +
-/// Upsert/Patch(new) when the key changed.
+/// UPDATE → Upsert, or Patch when unchanged TOAST columns are missing and
+/// the key did not change. A full old row ('O', REPLICA IDENTITY FULL)
+/// supplies the missing values, so the result is always an Upsert. A key
+/// change emits Delete(old) first and never a Patch for the new key: the
+/// new document must be whole, so without a full old row it is re-read.
 fn update(
     rel: &Relation,
     old: Option<&[Cell<'_>]>,
+    old_kind: Option<u8>,
     new: &[Cell<'_>],
     types: &TypeRegistry,
-) -> Result<Vec<SourceEvent>, SourceError> {
+) -> Result<Decoded, SourceError> {
+    let full_old = old.filter(|_| old_kind == Some(b'O'));
     let new_key = key_of(rel, new, old, types)?;
-    let (doc, partial) = row(rel, new, types)?;
-    let op = if partial {
-        Op::Patch {
-            doc,
-            unset: Vec::new(),
-        }
-    } else {
-        Op::Upsert { doc }
-    };
+    let (doc, partial) = row(rel, new, full_old, types)?;
     let mut events = Vec::with_capacity(2);
+    let mut key_changed = false;
     if let Some(old) = old {
         // 'K' carries the old replica identity (sent only when it changed),
         // 'O' the whole old row (REPLICA IDENTITY FULL, sent on every
         // update). Either way, compare keys.
         let old_key = key_of(rel, old, None, types)?;
         if old_key != new_key {
+            key_changed = true;
             events.push(change(rel, old_key, Op::Delete));
         }
     }
-    events.push(change(rel, new_key, op));
-    Ok(events)
+    if !partial {
+        events.push(change(rel, new_key, Op::Upsert { doc }));
+    } else if !key_changed {
+        events.push(change(
+            rel,
+            new_key,
+            Op::Patch {
+                doc,
+                unset: Vec::new(),
+            },
+        ));
+    } else {
+        let idx = rel.key_idx.as_deref().unwrap_or(&[]);
+        let mut key_columns = Vec::with_capacity(idx.len());
+        for &i in idx {
+            let text = match (new.get(i), old.and_then(|o| o.get(i))) {
+                (Some(Cell::Text(t)), _) | (Some(Cell::Unchanged), Some(Cell::Text(t))) => {
+                    (*t).to_owned()
+                }
+                _ => {
+                    return Err(SourceError::Fatal(format!(
+                        "{}: key column '{}' is missing from the replication stream",
+                        rel.collection, rel.columns[i].name
+                    )));
+                }
+            };
+            key_columns.push((rel.columns[i].clone(), text));
+        }
+        return Ok(Decoded::Refetch {
+            events,
+            row: RowRef {
+                schema: rel.schema.clone(),
+                table: rel.table.clone(),
+                collection: rel.collection.clone(),
+                columns: rel.columns.clone(),
+                key_columns,
+                key: new_key,
+            },
+        });
+    }
+    Ok(Decoded::Events(events))
 }
 
 /// The key of a tuple. A key column that is an unchanged TOAST value (only
@@ -319,10 +383,12 @@ fn key_of(
 }
 
 /// (document, partial). `partial` is true when some columns were
-/// unchanged TOAST values and are absent from the document.
+/// unchanged TOAST values, absent from `fallback` too (the full old row,
+/// when there is one), and so absent from the document.
 fn row(
     rel: &Relation,
     cells: &[Cell<'_>],
+    fallback: Option<&[Cell<'_>]>,
     types: &TypeRegistry,
 ) -> Result<(Document, bool), SourceError> {
     if cells.len() != rel.columns.len() {
@@ -335,7 +401,11 @@ fn row(
     }
     let mut doc = Document::new();
     let mut partial = false;
-    for (col, cell) in rel.columns.iter().zip(cells) {
+    for (i, (col, cell)) in rel.columns.iter().zip(cells).enumerate() {
+        let cell = match cell {
+            Cell::Unchanged => fallback.and_then(|f| f.get(i)).unwrap_or(cell),
+            other => other,
+        };
         match cell {
             Cell::Null => {
                 doc.insert(col.name.clone(), Value::Null);
@@ -683,20 +753,73 @@ mod tests {
     }
 
     #[test]
-    fn key_change_with_toast_patch() {
+    fn key_change_with_toast_refetches_never_patches() {
         let (mut d, t) = decoder();
+        let msg = wire::update(
+            1,
+            Some((b'K', &[C::T("7"), C::N, C::N])),
+            &[C::T("8"), C::T("a"), C::U],
+        );
+        let Decoded::Refetch { events, row } = d.decode(&msg, &t).unwrap() else {
+            panic!("expected a refetch")
+        };
+        assert_eq!(events, vec![ch("public.items", vec![json!(7)], Op::Delete)]);
+        assert_eq!(
+            (row.schema.as_str(), row.table.as_str()),
+            ("public", "items")
+        );
+        assert_eq!(row.key, vec![json!(8)]);
+        assert_eq!(row.key_columns.len(), 1);
+        assert_eq!(row.key_columns[0].0.name, "id");
+        assert_eq!(row.key_columns[0].1, "8");
+        assert_eq!(row.columns.len(), 3);
+    }
+
+    #[test]
+    fn full_old_row_fills_unchanged_toast() {
+        let (mut d, t) = decoder();
+        // Key change under REPLICA IDENTITY FULL: the old row has the value.
         let ev = events(
             &mut d,
             &t,
             &wire::update(
                 1,
-                Some((b'K', &[C::T("7"), C::N, C::N])),
+                Some((b'O', &[C::T("7"), C::T("old"), C::T("long")])),
                 &[C::T("8"), C::T("a"), C::U],
             ),
         );
-        assert_eq!(ev[0], ch("public.items", vec![json!(7)], Op::Delete));
-        assert!(
-            matches!(&ev[1], SourceEvent::Change(Change { op: Op::Patch { .. }, key, .. }) if key == &vec![json!(8)])
+        assert_eq!(
+            ev,
+            vec![
+                ch("public.items", vec![json!(7)], Op::Delete),
+                ch(
+                    "public.items",
+                    vec![json!(8)],
+                    Op::Upsert {
+                        doc: doc(json!({"id": 8, "title": "a", "body": "long"}))
+                    }
+                ),
+            ]
+        );
+        // Same key: a whole row too, instead of a Patch.
+        let ev = events(
+            &mut d,
+            &t,
+            &wire::update(
+                1,
+                Some((b'O', &[C::T("8"), C::T("a"), C::T("long")])),
+                &[C::T("8"), C::T("b"), C::U],
+            ),
+        );
+        assert_eq!(
+            ev,
+            vec![ch(
+                "public.items",
+                vec![json!(8)],
+                Op::Upsert {
+                    doc: doc(json!({"id": 8, "title": "b", "body": "long"}))
+                }
+            )]
         );
     }
 

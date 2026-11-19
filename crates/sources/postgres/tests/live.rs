@@ -497,10 +497,19 @@ async fn change_kinds_toast_key_change_truncate_types() {
         }
         other => panic!("expected patch, got {other:?}"),
     }
-    // Key change → Delete(old) + new row.
+    // Key change → Delete(old) + the whole new row, TOASTed column
+    // included: a Patch would land on a document that does not exist.
     assert_eq!(c[2].op, Op::Delete);
     assert_eq!(c[2].key, vec![json!(1)]);
     assert_eq!(c[3].key, vec![json!(2)]);
+    match &c[3].op {
+        Op::Upsert { doc } => {
+            assert_eq!(doc["big"].as_str().map(str::len), Some(100_000));
+            assert_eq!(doc["b"], json!(false));
+            assert_eq!(doc["m"], json!("sad"));
+        }
+        other => panic!("expected upsert, got {other:?}"),
+    }
 
     db.batch_execute(&format!("TRUNCATE {table}"))
         .await
@@ -804,4 +813,71 @@ async fn teardown_never_reports_success_while_the_slot_survives() {
         count("SELECT count(*) FROM pg_publication WHERE pubname = $1").await,
         0
     );
+}
+
+#[tokio::test]
+async fn key_change_with_unchanged_toast_gives_whole_documents() {
+    let Some(url) = url() else { return };
+    let db = admin(&url).await;
+    let def = unique("ktd");
+    let full = unique("ktf");
+    for t in [&def, &full] {
+        db.batch_execute(&format!(
+            "CREATE TABLE {t} (id int4 PRIMARY KEY, n int4, big text);
+             ALTER TABLE {t} ALTER COLUMN big SET STORAGE EXTERNAL;"
+        ))
+        .await
+        .unwrap();
+    }
+    db.batch_execute(&format!("ALTER TABLE {full} REPLICA IDENTITY FULL"))
+        .await
+        .unwrap();
+    let (cd, cf) = (format!("public.{def}"), format!("public.{full}"));
+    let sync_id = unique("kt");
+    let mut src = source(&url, &sync_id, &[&cd, &cf]);
+    let Opened::Fresh { start } = src.open(None).await.unwrap() else {
+        panic!()
+    };
+    let (tx, _rx) = mpsc::channel(4);
+    src.snapshot(tx, CancellationToken::new()).await.unwrap();
+    let mut s = start_stream(src);
+    s.ack.send(Some(start)).unwrap();
+    let mut model = Model::default();
+
+    for t in [&def, &full] {
+        db.batch_execute(&format!(
+            "INSERT INTO {t} VALUES (1, 0, repeat('x', 100000));
+             UPDATE {t} SET id = 2, n = 1 WHERE id = 1;
+             INSERT INTO {t} VALUES (10, 0, repeat('y', 100000));
+             BEGIN; UPDATE {t} SET id = 11 WHERE id = 10; DELETE FROM {t} WHERE id = 11; COMMIT;"
+        ))
+        .await
+        .unwrap();
+    }
+    let ok = pump_until(&mut s.rx, &mut model, Duration::from_secs(30), |m| {
+        m.changes
+            .iter()
+            .filter(|c| c.key == vec![json!(11)] && c.op == Op::Delete)
+            .count()
+            == 2
+    })
+    .await;
+    assert!(ok, "{model:#?}");
+    for c in [&cd, &cf] {
+        let docs = model.table(c);
+        assert_eq!(docs.len(), 1, "{c}: {docs:?}");
+        let doc = &docs["2"];
+        assert_eq!(doc["n"], json!(1), "{c}");
+        assert_eq!(doc["big"].as_str().map(str::len), Some(100_000), "{c}");
+        assert!(
+            model
+                .changes
+                .iter()
+                .filter(|ch| &ch.collection == c)
+                .all(|ch| !matches!(ch.op, Op::Patch { .. })),
+            "{c}: a key change produced a patch"
+        );
+    }
+    let mut src = s.stop().await;
+    src.teardown().await.unwrap();
 }

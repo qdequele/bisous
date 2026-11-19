@@ -2,11 +2,12 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use meili_connect_core::SourceError;
+use meili_connect_core::{Document, SourceError};
 
 use crate::conn::Sql;
 use crate::convert::{self, Oid, TypeRegistry};
 use crate::ident;
+use crate::pgoutput::RowRef;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct TableInfo {
@@ -226,6 +227,81 @@ pub async fn resolve_types(
         registry.insert(oid, convert::TypeKind::Text);
     }
     Ok(())
+}
+
+/// The current row with key `row.key_columns`, as a whole document of the
+/// relation's columns. `None` when the row (or its table, or a key column)
+/// is gone: a later change in the stream covers it.
+pub async fn fetch_row(
+    sql: &Sql,
+    registry: &mut TypeRegistry,
+    row: &RowRef,
+) -> Result<Option<Document>, SourceError> {
+    let qualified = ident::qualified(&row.schema, &row.table);
+    let rows = sql
+        .query(
+            "SELECT a.attname::text, a.atttypid, format_type(a.atttypid, NULL)
+             FROM pg_attribute a
+             WHERE a.attrelid = to_regclass($1) AND a.attnum > 0 AND NOT a.attisdropped",
+            &[&qualified],
+        )
+        .await?;
+    let mut current: HashMap<String, (Oid, String)> = HashMap::with_capacity(rows.len());
+    for r in &rows {
+        current.insert(col(r, 0)?, (col(r, 1)?, col(r, 2)?));
+    }
+    // The relation's columns that still exist, typed as they are now.
+    let columns: Vec<(String, Oid)> = row
+        .columns
+        .iter()
+        .filter_map(|c| current.get(&c.name).map(|(oid, _)| (c.name.clone(), *oid)))
+        .collect();
+    let mut filters = Vec::with_capacity(row.key_columns.len());
+    let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+        Vec::with_capacity(row.key_columns.len());
+    for (i, (column, text)) in row.key_columns.iter().enumerate() {
+        let Some((_, type_name)) = current.get(&column.name) else {
+            return Ok(None);
+        };
+        filters.push(format!(
+            "{} = ${}::text::{type_name}",
+            ident::quote_ident(&column.name),
+            i + 1
+        ));
+        params.push(text);
+    }
+    if columns.is_empty() || filters.is_empty() {
+        return Ok(None);
+    }
+    resolve_types(sql, registry, columns.iter().map(|(_, oid)| *oid)).await?;
+    let select = columns
+        .iter()
+        .map(|(name, _)| format!("{}::text", ident::quote_ident(name)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let query = format!(
+        "SELECT {select} FROM {qualified} WHERE {}",
+        filters.join(" AND ")
+    );
+    let found = match sql.query(&query, &params).await {
+        Ok(found) => found,
+        // Dropped or altered between the catalog read and the query.
+        Err(SourceError::Config(_)) => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let Some(found) = found.first() else {
+        return Ok(None);
+    };
+    let mut doc = Document::new();
+    for (i, (name, oid)) in columns.iter().enumerate() {
+        let value: Option<String> = col(found, i)?;
+        let value = match value {
+            Some(text) => registry.to_json(*oid, &text),
+            None => serde_json::Value::Null,
+        };
+        doc.insert(name.clone(), value);
+    }
+    Ok(Some(doc))
 }
 
 /// A column, without panicking on a type mismatch.

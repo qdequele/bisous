@@ -598,6 +598,21 @@ impl Source for PostgresSource {
                                 })?;
                                 catalog::resolve_types(sql, &mut self.types, oids).await?;
                             }
+                            Decoded::Refetch { mut events, row } => {
+                                let sql = self.sql.as_ref().ok_or_else(|| {
+                                    SourceError::Fatal("postgres connection unavailable".into())
+                                })?;
+                                if let Some(doc) =
+                                    catalog::fetch_row(sql, &mut self.types, &row).await?
+                                {
+                                    events.push(SourceEvent::Change(Change {
+                                        collection: row.collection,
+                                        key: row.key,
+                                        op: Op::Upsert { doc },
+                                    }));
+                                }
+                                break events;
+                            }
                         }
                     };
                     for ev in out {
