@@ -54,6 +54,9 @@ pub enum SupervisorError {
     ShuttingDown,
     #[error(transparent)]
     Store(#[from] StoreError),
+    /// The spec was refused before anything ran (`EngineError::Spec`).
+    #[error(transparent)]
+    Engine(#[from] EngineError),
 }
 
 /// What the supervisor knows about one sync, merged with its saved state.
@@ -119,6 +122,7 @@ impl Supervisor {
     /// that stopped (held, failed, user-stopped) is started again with the
     /// new spec.
     pub fn start(&self, spec: SyncSpec) -> Result<(), SupervisorError> {
+        spec.validate().map_err(EngineError::Spec)?;
         self.launch(spec, Launch::default())
     }
 

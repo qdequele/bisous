@@ -7,7 +7,9 @@ use std::time::Duration;
 
 use common::*;
 use meili_connect_core::{SinkError, SourceError, SyncPhase};
-use meili_connect_engine::{Supervisor, SupervisorConfig, SupervisorError, SyncStatus};
+use meili_connect_engine::{
+    EngineError, Supervisor, SupervisorConfig, SupervisorError, SyncStatus,
+};
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
@@ -284,4 +286,17 @@ async fn shutdown_refuses_new_syncs() {
         s.start(spec()),
         Err(SupervisorError::ShuttingDown)
     ));
+}
+
+#[tokio::test]
+async fn start_validates_the_spec() {
+    let h = Harness::new();
+    let s = supervisor(&h);
+    let mut bad = spec();
+    bad.streams[0].index = "not a uid".into();
+    assert!(matches!(
+        s.start(bad),
+        Err(SupervisorError::Engine(EngineError::Spec(_)))
+    ));
+    assert!(s.sync_ids().is_empty());
 }

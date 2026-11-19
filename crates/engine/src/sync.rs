@@ -93,9 +93,7 @@ pub async fn run_sync(
     options: SyncOptions,
     cancel: CancellationToken,
 ) -> Result<(), EngineError> {
-    if spec.streams.is_empty() {
-        return Err(EngineError::Spec("the sync has no streams".into()));
-    }
+    spec.validate().map_err(EngineError::Spec)?;
     let loaded = match guarded(&cancel, deps.store.load(&spec.id)).await {
         Ok(state) => state,
         Err(Halt::Cancelled) => return Ok(()),
@@ -202,6 +200,9 @@ enum Mode<'a> {
 /// checkpoint is kept.
 struct Batch {
     ops: Vec<Vec<DocOp>>,
+    /// Records the source skipped (`SourceEvent::Skipped`), dead-lettered
+    /// with the batch.
+    skipped: Vec<DeadLetter>,
     docs: usize,
     bytes: usize,
     checkpoint: Option<Checkpoint>,
@@ -212,6 +213,7 @@ impl Batch {
     fn new(indexes: usize) -> Self {
         Self {
             ops: vec![Vec::new(); indexes],
+            skipped: Vec::new(),
             docs: 0,
             bytes: 0,
             checkpoint: None,
@@ -235,6 +237,13 @@ impl Batch {
         if let Some(slot) = self.ops.get_mut(index) {
             slot.push(op);
         }
+        self.touch();
+    }
+
+    fn skip(&mut self, letter: DeadLetter) {
+        self.bytes += letter.document_id.len() + letter.reason.len();
+        self.docs += 1;
+        self.skipped.push(letter);
         self.touch();
     }
 
@@ -379,6 +388,11 @@ impl Runner<'_> {
         let source = if snapshot {
             info!(sync_id = %self.spec.id, shadows = swaps.len(), "snapshot started");
             let source = self.pump(source, &targets, Mode::Snapshot, None).await?;
+            // A source returns `Ok` from a cancelled snapshot: never take
+            // that for a complete one.
+            if self.cancel.is_cancelled() {
+                return Err(Halt::Cancelled);
+            }
             info!(sync_id = %self.spec.id, "snapshot done");
             source
         } else {
@@ -528,6 +542,29 @@ impl Runner<'_> {
             SourceEvent::SchemaChanged { collection } => {
                 debug!(sync_id = %self.spec.id, %collection, "schema changed");
             }
+            SourceEvent::Skipped {
+                collection,
+                position,
+                reason,
+            } => {
+                let index = self
+                    .mapper
+                    .indexes_for(&collection)
+                    .first()
+                    .and_then(|&i| self.live.get(i))
+                    .map_or(collection, |t| t.uid.clone());
+                batch.skip(DeadLetter {
+                    sync_id: self.spec.id.clone(),
+                    index,
+                    document_id: position,
+                    payload: Value::Null,
+                    reason,
+                    created_at: Utc::now(),
+                });
+                if batch.docs >= self.opts.max_docs || batch.bytes >= self.opts.max_bytes {
+                    self.flush(batch, targets, mode).await?;
+                }
+            }
         }
         Ok(())
     }
@@ -544,7 +581,10 @@ impl Runner<'_> {
             return Ok(());
         }
         let Batch {
-            ops, checkpoint, ..
+            ops,
+            skipped,
+            checkpoint,
+            ..
         } = batch.take();
         let ops: Vec<Vec<DocOp>> = ops.into_iter().map(coalesce).collect();
 
@@ -552,8 +592,9 @@ impl Runner<'_> {
             self.mass_delete_guard(&ops, targets).await?;
         }
 
-        let (mut written, mut deleted, mut rejected) = (0u64, 0u64, 0u64);
-        let mut letters = Vec::new();
+        let (mut written, mut deleted) = (0u64, 0u64);
+        let mut rejected = skipped.len() as u64;
+        let mut letters = skipped;
         for (index, ops) in ops.into_iter().enumerate() {
             if ops.is_empty() {
                 continue;
@@ -578,7 +619,7 @@ impl Runner<'_> {
             }
         }
         if !letters.is_empty() {
-            warn!(sync_id = %self.spec.id, count = letters.len(), "documents rejected, dead-lettered");
+            warn!(sync_id = %self.spec.id, count = letters.len(), "documents rejected or skipped, dead-lettered");
             guarded(self.cancel, self.deps.store.push_dead_letters(&letters)).await?;
         }
         if written + deleted + rejected > 0 {

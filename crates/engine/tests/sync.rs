@@ -591,3 +591,56 @@ async fn a_spec_without_streams_is_rejected() {
     let result = finish(spawn(&h, spec, options()).1).await;
     assert!(matches!(result, Err(EngineError::Spec(_))), "{result:?}");
 }
+
+#[tokio::test]
+async fn a_spec_sharing_an_index_is_rejected() {
+    let h = Harness::new();
+    let mut spec = spec();
+    let mut other = spec.streams[0].clone();
+    other.collection = "public.other".into();
+    spec.streams.push(other);
+    let result = finish(spawn(&h, spec, options()).1).await;
+    assert!(matches!(result, Err(EngineError::Spec(_))), "{result:?}");
+    assert!(h.origin.state().opens.is_empty(), "nothing ran");
+}
+
+#[tokio::test]
+async fn skipped_records_are_dead_lettered_and_do_not_block_checkpoints() {
+    let h = Harness::new();
+    let (cancel, handle) = spawn(&h, spec(), options());
+    wait_synced(&h).await;
+
+    h.origin
+        .skipped(COLLECTION, "products/0@17", "undecodable payload");
+    h.origin
+        .skipped("public.unmapped", "unmapped/1@3", "no key");
+    h.origin.tx(vec![upsert(1, json!({}))]);
+    wait_synced(&h).await;
+    assert!(!handle.is_finished());
+    stop(cancel, handle).await;
+
+    let st = h.store.inner();
+    assert_eq!(st.dead.len(), 2, "{:?}", st.dead);
+    assert_eq!(st.dead[0].index, INDEX);
+    assert_eq!(st.dead[0].document_id, "products/0@17");
+    assert_eq!(st.dead[0].payload, json!(null));
+    assert_eq!(st.dead[0].reason, "undecodable payload");
+    assert_eq!(st.dead[1].index, "public.unmapped");
+    assert_eq!(st.progress[SYNC_ID], (1, 0, 2));
+    drop(st);
+    h.assert_acks_sound();
+}
+
+#[tokio::test]
+async fn a_source_may_drop_its_ack_receiver() {
+    let h = Harness::new();
+    h.origin.state().drop_acks = true;
+    let (cancel, handle) = spawn(&h, spec(), options());
+    wait_synced(&h).await;
+    h.origin.tx(vec![upsert(1, json!({}))]);
+    wait_synced(&h).await;
+    h.origin.tx(vec![upsert(2, json!({}))]);
+    wait_synced(&h).await;
+    assert!(!handle.is_finished());
+    stop(cancel, handle).await;
+}
