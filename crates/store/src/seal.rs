@@ -7,8 +7,10 @@
 use base64::Engine as _;
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
+use hmac::{Hmac, Mac};
 use meili_connect_core::{Secret, StoreError, SyncSpec};
 use rand::RngCore;
+use sha2::Sha256;
 
 /// Env var the caller reads the key from.
 pub const SECRET_KEY_ENV: &str = "CONNECT_SECRET_KEY";
@@ -57,6 +59,19 @@ impl SecretKey {
     /// The key as base64, for writing it into `CONNECT_SECRET_KEY`.
     pub fn to_base64(&self) -> Secret {
         Secret::new(base64::engine::general_purpose::STANDARD.encode(self.0))
+    }
+
+    /// A 32-byte key for another use, derived from this one and `label`
+    /// (HMAC-SHA256 under a fixed prefix). Each use has its own label, so
+    /// a derived key is never the sealing key nor another use's key.
+    pub fn derive_subkey(&self, label: &str) -> [u8; KEY_LEN] {
+        let mut mac = match <Hmac<Sha256> as Mac>::new_from_slice(&self.0) {
+            Ok(m) => m,
+            Err(_) => unreachable!("HMAC accepts keys of any length"),
+        };
+        mac.update(b"meili-connect/subkey/v1:");
+        mac.update(label.as_bytes());
+        mac.finalize().into_bytes().into()
     }
 
     fn cipher(&self) -> ChaCha20Poly1305 {
@@ -131,6 +146,16 @@ mod tests {
 
     fn is_fatal(r: Result<Vec<u8>, StoreError>) -> bool {
         matches!(r, Err(StoreError::Fatal(_)))
+    }
+
+    #[test]
+    fn subkeys_are_stable_and_separated_by_label() {
+        let key = SecretKey::from_bytes([7; KEY_LEN]);
+        let a = key.derive_subkey("a");
+        assert_eq!(a, key.derive_subkey("a"));
+        assert_ne!(a, key.derive_subkey("b"));
+        assert_ne!(a, [7; KEY_LEN]);
+        assert_ne!(a, SecretKey::from_bytes([8; KEY_LEN]).derive_subkey("a"));
     }
 
     #[test]

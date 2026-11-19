@@ -7,6 +7,10 @@
 //!   every attempt, so a sync is vetted again on every (re)start, and a
 //!   name that started resolving somewhere forbidden stops the sync
 //!   (`Config` → held).
+//! - For a tenant's sync on a hosted server it also refuses the server's
+//!   own identity (`crate::ambient`) and builds a DynamoDB assume-role
+//!   source with the tenant's external ID (`crate::external_id`), on every
+//!   (re)start: a spec stored with another one is held.
 //! - In coarse mode (syncs of a Lab tenant, calls of the Lab) the errors of
 //!   the source and of the sink are reduced to their class and a fixed
 //!   description: no driver cause chain, nothing a remote server sent. The
@@ -23,6 +27,7 @@ use meili_connect_core::{
 };
 use tokio_util::sync::CancellationToken;
 
+use crate::external_id::Binding;
 use crate::metrics::Metrics;
 
 /// Why a source spec did not pass the policy.
@@ -125,6 +130,7 @@ pub struct GuardedSources {
     coarse: bool,
     metrics: Option<Arc<Metrics>>,
     refuse_ambient: bool,
+    external_id: Option<Binding>,
 }
 
 impl GuardedSources {
@@ -135,7 +141,16 @@ impl GuardedSources {
             coarse,
             metrics: None,
             refuse_ambient: false,
+            external_id: None,
         }
+    }
+
+    /// Build every DynamoDB assume-role source with the tenant's external
+    /// ID (`crate::external_id`); hold, before any connection, one stored
+    /// with another. `None` leaves the spec as it is.
+    pub fn binding_external_id(mut self, binding: Option<Binding>) -> Self {
+        self.external_id = binding;
+        self
     }
 
     /// Refuse, before any connection, a source that would use the
@@ -152,17 +167,34 @@ impl GuardedSources {
         self
     }
 
-    fn wrap(&self, inner: Box<dyn Source>, spec: &SourceSpec, vetted: bool) -> Box<dyn Source> {
-        Box::new(GuardedSource {
+    /// Build the inner source from the spec the binding gives (the spec as
+    /// it is when there is no binding or when it refuses).
+    fn build_wrapped(
+        &self,
+        sync_id: &str,
+        spec: &SourceSpec,
+        streams: &[StreamMapping],
+        vetted: bool,
+    ) -> Result<Box<dyn Source>, SourceError> {
+        let (spec, held) = match &self.external_id {
+            None => (spec.clone(), None),
+            Some(binding) => match crate::external_id::bind(spec, binding) {
+                Ok(bound) => (bound, None),
+                Err(refusal) => (spec.clone(), Some(refusal.held_message())),
+            },
+        };
+        let inner = self.inner.build(sync_id, &spec, streams)?;
+        Ok(Box::new(GuardedSource {
             inner,
             factory: Arc::clone(&self.inner),
             policy: Arc::clone(&self.policy),
-            spec: spec.clone(),
+            spec,
             coarse: self.coarse,
             vetted,
             metrics: self.metrics.clone(),
             refuse_ambient: self.refuse_ambient,
-        })
+            held,
+        }))
     }
 
     /// A source whose endpoints the caller has just vetted.
@@ -172,8 +204,7 @@ impl GuardedSources {
         spec: &SourceSpec,
         streams: &[StreamMapping],
     ) -> Result<Box<dyn Source>, SourceError> {
-        let inner = self.inner.build(sync_id, spec, streams)?;
-        Ok(self.wrap(inner, spec, true))
+        self.build_wrapped(sync_id, spec, streams, true)
     }
 }
 
@@ -187,8 +218,7 @@ impl SourceFactory for GuardedSources {
     ) -> Result<Box<dyn Source>, SourceError> {
         // Building connects to nothing; the first call that may connect
         // vets the endpoints (`build` cannot wait on a DNS lookup).
-        let inner = self.inner.build(sync_id, spec, streams)?;
-        Ok(self.wrap(inner, spec, false))
+        self.build_wrapped(sync_id, spec, streams, false)
     }
 
     async fn endpoints(&self, spec: &SourceSpec) -> Result<Vec<Endpoint>, SourceError> {
@@ -205,6 +235,8 @@ struct GuardedSource {
     vetted: bool,
     metrics: Option<Arc<Metrics>>,
     refuse_ambient: bool,
+    /// Why this source may not connect at all (`crate::external_id`).
+    held: Option<String>,
 }
 
 impl GuardedSource {
@@ -225,6 +257,10 @@ impl GuardedSource {
         {
             // Held: the user must change the credentials.
             return Err(SourceError::Config(why));
+        }
+        if let Some(why) = &self.held {
+            // Held: the role's trust policy must move to the new external ID.
+            return Err(SourceError::Config(why.clone()));
         }
         if self.vetted {
             return Ok(());

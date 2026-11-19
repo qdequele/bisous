@@ -34,6 +34,7 @@ use tracing::{info, warn};
 
 use crate::credits::{CreditCache, OUT_OF_CREDITS};
 use crate::error::ApiError;
+use crate::external_id::{ExternalIds, external_id_binding};
 use crate::guard::{CoarseSink, GuardedSources};
 use crate::metrics::{InstrumentedSink, Metrics};
 use crate::redact::same_origin;
@@ -94,6 +95,8 @@ pub struct ManagerDeps {
     /// Lab mode or a public host policy: tenants may not use the server's
     /// own identity or files.
     pub hosted: bool,
+    /// Derives the external ID of a tenant's DynamoDB roles.
+    pub external_ids: Option<Arc<ExternalIds>>,
     pub cancel: CancellationToken,
 }
 
@@ -115,6 +118,7 @@ pub struct SyncManager {
     credits: Option<Arc<CreditCache>>,
     metrics: Arc<Metrics>,
     hosted: bool,
+    external_ids: Option<Arc<ExternalIds>>,
     /// The tenant of every known tenant-owned sync (for the credit checks).
     tenants: Mutex<HashMap<String, String>>,
     /// Syncs held because their team is out of credits; they resume by
@@ -145,6 +149,7 @@ impl SyncManager {
             credits: deps.credits,
             metrics: deps.metrics,
             hosted: deps.hosted,
+            external_ids: deps.external_ids,
             tenants: Mutex::new(HashMap::new()),
             credit_held: Mutex::new(HashSet::new()),
         }
@@ -191,6 +196,11 @@ impl SyncManager {
             spec.tenant.is_some(),
         )
         .refusing_ambient_identity(self.hosted && spec.tenant.is_some())
+        .binding_external_id(external_id_binding(
+            self.hosted,
+            &self.external_ids,
+            spec.tenant.as_deref(),
+        ))
     }
 
     /// The sink of one sync; coarse errors for a tenant's sync.
