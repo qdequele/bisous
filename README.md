@@ -177,6 +177,8 @@ Every variable, with defaults, is in [`.env.example`](.env.example).
 | `CONNECT_SECRET_KEY` | | Base64 32-byte key sealing specs at rest. Required with `DATABASE_URL`. `openssl rand -base64 32`. |
 | `ADMIN_API_KEY` | unset | Standalone admin token. |
 | `LAB_SERVICE_TOKEN` | unset | Lab token; requires `X-Connect-Tenant-Id`. |
+| `CONNECT_HOST_POLICY` | `public` with `LAB_SERVICE_TOKEN`, else `any` | Which hosts sources and destinations may point at: `public`, `any` or `allowlist`. See [Host policy](#host-policy). |
+| `CONNECT_HOST_ALLOWLIST` | unset | With `allowlist`: comma-separated `host`, `host:port`, IP addresses and CIDRs. |
 | `LAB_URL`, `LAB_INSTANCE_ID`, `LAB_INSTANCE_SECRET` | unset | Lab usage events. All three or none. |
 | `USAGE_FLUSH_INTERVAL_SECS` | `60` | How often counts become usage events. |
 | `LAB_SEND_INTERVAL_SECS` | `2` | How often the outbox is delivered. |
@@ -186,6 +188,41 @@ Every variable, with defaults, is in [`.env.example`](.env.example).
 | `LOG_LEVEL` / `RUST_LOG` | `info` | `RUST_LOG` wins and takes the full filter syntax. |
 
 Specs, checkpoints, document bodies and secrets are never logged.
+
+### Host policy
+
+A sync's source and its Meilisearch destination are addresses the caller
+chooses, and the server connects to them from inside its own network. The
+host policy decides, before any connection, which addresses are allowed:
+
+| `CONNECT_HOST_POLICY` | Allows |
+|---|---|
+| `public` (default with `LAB_SERVICE_TOKEN`) | Names whose **every** resolved address is public, and public literal addresses. Loopback, RFC 1918, CGNAT `100.64/10`, link-local (`169.254.169.254` included), IPv6 ULA `fc00::/7`, the IPv4-mapped and NAT64 forms of these, multicast, broadcast, unspecified and documentation ranges are refused. |
+| `any` (default standalone) | Every host. |
+| `allowlist` | Only the entries of `CONNECT_HOST_ALLOWLIST`: a host name (any address it resolves to, optionally one port) or a network (every resolved address must be in one). |
+
+In every mode the server's own state database (`DATABASE_URL`) is refused as
+a source origin. The policy applies to `check`, `discover`, `POST` and `PUT`
+(`422 host_not_allowed`, naming the host but not what it resolved to), and
+again every time a sync starts or restarts (a refused sync is `held`). The
+Meilisearch client resolves names through the policy and connects only to the
+vetted addresses, uses no proxy and never follows redirects.
+
+Errors reported to the Lab (calls with `LAB_SERVICE_TOKEN`, and the
+`message` / `last_error` of a tenant's sync) are reduced to their class and a
+fixed description; the server log keeps the detail. The standalone admin sees
+detailed errors.
+
+**Residual risk.** Database drivers (Postgres, MySQL, MongoDB, Kafka, the AWS
+SDK) resolve names themselves: between the policy's lookup and the driver's
+connect a DNS rebinding window remains for sources (not for the Meilisearch
+destination, whose connection is pinned to the vetted addresses). Kafka
+brokers advertised in the cluster metadata, and MongoDB replica-set members
+discovered from the seed hosts, are not vetted. DynamoDB with
+`credentials: {"type": "default"}` uses the server's own AWS identity. A
+hosted deployment must therefore also restrict egress at the network level
+(no route to the metadata endpoint, the state database or internal services
+from the connector's network).
 
 ### Usage events (the Lab)
 

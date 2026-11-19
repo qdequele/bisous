@@ -12,8 +12,9 @@ use axum::http::{Method, Request, StatusCode};
 use http_body_util::BodyExt;
 use meili_connect_core::{
     AckReceiver, ApplyReport, Capabilities, Change, CheckReport, CheckStatus, Checkpoint,
-    CollectionInfo, DocOp, EventSender, IndexTarget, MeiliDestination, Op, Opened, Sink, SinkError,
-    Source, SourceError, SourceEvent, SourceFactory, SourceSpec, StreamMapping, SyncPhase,
+    CollectionInfo, DocOp, Endpoint, EventSender, HostPolicy, IndexTarget, MeiliDestination, Op,
+    Opened, Sink, SinkError, Source, SourceError, SourceEvent, SourceFactory, SourceSpec,
+    StreamMapping, SyncPhase,
 };
 use meili_connect_engine::SupervisorConfig;
 use meili_connect_store::{LabOutbox, MemStore, SyncRepository};
@@ -42,14 +43,31 @@ struct Probe {
 struct FakeSources(Arc<Probe>);
 
 /// Config knobs: `invalid` (build fails), `slow` (check/discover hang),
-/// `rows` (snapshot emits that many upserts).
+/// `rows` (snapshot emits that many upserts), `host`/`port` (its endpoint),
+/// `check_error` (check fails with that transient text), `open_error`
+/// (open fails with that configuration text).
 struct FakeSource {
     probe: Arc<Probe>,
     config: Value,
     collection: String,
 }
 
+#[async_trait]
 impl SourceFactory for FakeSources {
+    async fn endpoints(&self, spec: &SourceSpec) -> Result<Vec<Endpoint>, SourceError> {
+        Ok(match spec.config.get("host").and_then(Value::as_str) {
+            Some(host) => vec![Endpoint::new(
+                host,
+                spec.config
+                    .get("port")
+                    .and_then(Value::as_u64)
+                    .and_then(|p| u16::try_from(p).ok())
+                    .unwrap_or(5432),
+            )],
+            None => vec![],
+        })
+    }
+
     fn build(
         &self,
         _sync_id: &str,
@@ -83,6 +101,9 @@ impl Source for FakeSource {
         if self.config.get("slow").is_some() {
             tokio::time::sleep(Duration::from_secs(30)).await;
         }
+        if let Some(e) = self.config.get("check_error").and_then(Value::as_str) {
+            return Err(SourceError::Transient(e.to_owned()));
+        }
         let mut r = CheckReport::default();
         r.push("connect", CheckStatus::Ok, "connected");
         r.push("wal_level", CheckStatus::Failed, "set wal_level to logical");
@@ -102,6 +123,9 @@ impl Source for FakeSource {
     }
 
     async fn open(&mut self, resume: Option<Checkpoint>) -> Result<Opened, SourceError> {
+        if let Some(e) = self.config.get("open_error").and_then(Value::as_str) {
+            return Err(SourceError::Config(e.to_owned()));
+        }
         Ok(match resume {
             Some(_) => Opened::Resumed,
             None => Opened::Fresh {
@@ -200,12 +224,17 @@ struct App {
 }
 
 fn app_with(auth: AuthConfig, store: Arc<MemStore>) -> App {
+    app_full(auth, store, HostPolicy::any())
+}
+
+fn app_full(auth: AuthConfig, store: Arc<MemStore>, policy: HostPolicy) -> App {
     let probe = Arc::new(Probe::default());
     let state = build_state(
         Arc::clone(&store) as Arc<dyn Backend>,
         Wiring {
             sources: Arc::new(FakeSources(Arc::clone(&probe))),
             sinks: fake_sinks(),
+            policy: Arc::new(policy),
             supervisor: SupervisorConfig::default(),
             auth,
             probe_timeout: Duration::from_millis(200),
@@ -744,6 +773,194 @@ async fn check_and_discover_store_nothing_and_time_out() {
     assert_eq!(
         (status, body["code"].as_str()),
         (StatusCode::UNPROCESSABLE_ENTITY, Some("source_config"))
+    );
+}
+
+// ------------------------------------------------------------- host policy
+
+fn origin(host: &str, port: u16) -> Value {
+    json!({"kind": "postgres", "config": {"host": host, "port": port, "rows": 1}})
+}
+
+fn body_with(source: Value, destination: &str, name: &str) -> Value {
+    let mut b = sync_body(name);
+    b["source"] = source;
+    b["destination"]["url"] = json!(destination);
+    b
+}
+
+#[tokio::test]
+async fn the_public_policy_refuses_internal_origins_everywhere() {
+    let a = app_full(locked(), Arc::new(MemStore::new()), HostPolicy::public());
+    for host in [
+        "127.0.0.1",
+        "10.1.2.3",
+        "169.254.169.254",
+        "::1",
+        "localhost",
+    ] {
+        for uri in ["/sources/check", "/sources/discover"] {
+            let (status, body) = call(
+                &a.router,
+                "POST",
+                uri,
+                &lab("t1"),
+                Some(json!({"source": origin(host, 5432)})),
+            )
+            .await;
+            assert_eq!(
+                (status, body["code"].as_str()),
+                (StatusCode::UNPROCESSABLE_ENTITY, Some("host_not_allowed")),
+                "{uri} {host}: {body}"
+            );
+            let msg = body["message"].as_str().unwrap();
+            assert!(msg.contains(host), "{msg}");
+            if host == "localhost" {
+                assert!(!msg.contains("127.0.0.1") && !msg.contains("::1"), "{msg}");
+            }
+        }
+        let (status, body) = call(
+            &a.router,
+            "POST",
+            "/syncs",
+            &lab("t1"),
+            Some(body_with(origin(host, 5432), "https://8.8.8.8", host)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{host}: {body}");
+        assert_eq!(body["code"], "host_not_allowed");
+    }
+    // A Meilisearch destination on loopback is refused too.
+    for dest in [
+        "http://127.0.0.1:7700",
+        "http://localhost:7700",
+        "http://[::1]:7700",
+    ] {
+        let (status, body) = call(
+            &a.router,
+            "POST",
+            "/syncs",
+            &lab("t1"),
+            Some(body_with(origin("8.8.8.8", 5432), dest, "d")),
+        )
+        .await;
+        assert_eq!(
+            (status, body["code"].as_str()),
+            (StatusCode::UNPROCESSABLE_ENTITY, Some("host_not_allowed")),
+            "{dest}: {body}"
+        );
+    }
+    let (_, list) = call(&a.router, "GET", "/syncs", &lab("t1"), None).await;
+    assert_eq!(list["syncs"], json!([]));
+    // A public origin and destination pass.
+    let (status, body) = call(
+        &a.router,
+        "POST",
+        "/sources/check",
+        &lab("t1"),
+        Some(json!({"source": origin("8.8.8.8", 5432)})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+#[tokio::test]
+async fn the_state_database_is_refused_even_under_any() {
+    let policy = HostPolicy::any().forbid_origin(Endpoint::new("127.0.0.1", 6543));
+    let a = app_full(AuthConfig::default(), Arc::new(MemStore::new()), policy);
+    for host in ["127.0.0.1", "localhost"] {
+        let (status, body) = call(
+            &a.router,
+            "POST",
+            "/sources/check",
+            &[],
+            Some(json!({"source": origin(host, 6543)})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{host}: {body}");
+        assert_eq!(body["code"], "host_not_allowed");
+    }
+    // Another port of the same host is a different server.
+    let (status, _) = call(
+        &a.router,
+        "POST",
+        "/sources/check",
+        &[],
+        Some(json!({"source": origin("127.0.0.1", 5432)})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn every_start_vets_the_origin_again() {
+    let store = Arc::new(MemStore::new());
+    let first = app_with(AuthConfig::default(), Arc::clone(&store));
+    let mut body = sync_body("s");
+    body["source"] = origin("127.0.0.1", 5432);
+    let (status, created) = call(&first.router, "POST", "/syncs", &[], Some(body)).await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let id = created["id"].as_str().unwrap().to_owned();
+    first.state.manager.shutdown(Duration::from_secs(5)).await;
+
+    // The operator tightens the policy: the stored sync is held at boot.
+    let second = app_full(AuthConfig::default(), store, HostPolicy::public());
+    boot_syncs(&second.state).await.unwrap();
+    let uri = format!("/syncs/{id}/status");
+    wait_for(async || call(&second.router, "GET", &uri, &[], None).await.1["phase"] == "held")
+        .await;
+    let (_, st) = call(&second.router, "GET", &uri, &[], None).await;
+    assert!(
+        st["message"].as_str().unwrap().contains("not allowed"),
+        "{st}"
+    );
+}
+
+#[tokio::test]
+async fn lab_callers_and_tenant_syncs_get_coarse_errors() {
+    let a = app(locked());
+    let probe = json!({"source": {"kind": "postgres", "config": {
+        "check_error": "connect 10.9.9.9:5432: DRIVER-DETAIL"}}});
+    let (status, body) = call(
+        &a.router,
+        "POST",
+        "/sources/check",
+        &lab("t1"),
+        Some(probe.clone()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert!(!body.to_string().contains("DRIVER-DETAIL"), "{body}");
+    // The operator sees the detail.
+    let (_, body) = call(&a.router, "POST", "/sources/check", &admin(), Some(probe)).await;
+    assert!(body.to_string().contains("DRIVER-DETAIL"), "{body}");
+
+    // Persisted messages of a tenant's sync are coarse too.
+    let mut body = sync_body("held");
+    body["source"]["config"]["open_error"] = json!("relation 10.9.9.9 DRIVER-DETAIL");
+    let (status, created) = call(&a.router, "POST", "/syncs", &lab("t1"), Some(body.clone())).await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let id = created["id"].as_str().unwrap().to_owned();
+    let uri = format!("/syncs/{id}/status");
+    wait_for(async || call(&a.router, "GET", &uri, &lab("t1"), None).await.1["phase"] == "held")
+        .await;
+    let (_, st) = call(&a.router, "GET", &uri, &lab("t1"), None).await;
+    assert!(!st.to_string().contains("DRIVER-DETAIL"), "{st}");
+    assert!(
+        st["message"].as_str().unwrap().contains("configuration"),
+        "{st}"
+    );
+    // A global sync keeps the detail for the operator.
+    let (status, created) = call(&a.router, "POST", "/syncs", &admin(), Some(body)).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let id = created["id"].as_str().unwrap().to_owned();
+    let uri = format!("/syncs/{id}/status");
+    wait_for(async || call(&a.router, "GET", &uri, &admin(), None).await.1["phase"] == "held")
+        .await;
+    let (_, st) = call(&a.router, "GET", &uri, &admin(), None).await;
+    assert!(
+        st["message"].as_str().unwrap().contains("DRIVER-DETAIL"),
+        "{st}"
     );
 }
 

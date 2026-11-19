@@ -8,6 +8,7 @@ pub mod change;
 pub mod checkpoint;
 pub mod doc_id;
 pub mod error;
+pub mod host_policy;
 pub mod secret;
 pub mod sink;
 pub mod source;
@@ -18,6 +19,7 @@ pub use change::{Change, Document, Op, SourceEvent};
 pub use checkpoint::Checkpoint;
 pub use doc_id::document_id;
 pub use error::{SinkError, SourceError, StoreError};
+pub use host_policy::{Endpoint, HostPolicy, HostPolicyError};
 pub use secret::Secret;
 pub use sink::{ApplyReport, DocOp, IndexTarget, RejectedDoc, Sink};
 pub use source::{

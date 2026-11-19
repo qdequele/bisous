@@ -16,8 +16,8 @@ use std::time::Duration;
 
 use chrono::Utc;
 use meili_connect_core::{
-    MeiliDestination, Sink, SinkError, SourceError, SourceFactory, StateStore, StoreError,
-    SyncPhase, SyncSpec, SyncState,
+    HostPolicy, MeiliDestination, Sink, SinkError, SourceError, SourceFactory, StateStore,
+    StoreError, SyncPhase, SyncSpec, SyncState,
 };
 use meili_connect_engine::{
     EngineError, Supervisor, SupervisorConfig, SupervisorError, SyncDeps, SyncStatus,
@@ -26,18 +26,22 @@ use meili_connect_engine::{
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
+use crate::guard::{CoarseSink, GuardedSources};
 use crate::usage::UsageMeter;
 
 /// Builds the sink of one sync from its destination.
 pub type SinkFactory =
     Arc<dyn Fn(&MeiliDestination) -> Result<Arc<dyn Sink>, SinkError> + Send + Sync>;
 
-/// The production sink factory.
-pub fn meili_sinks() -> SinkFactory {
-    Arc::new(|destination: &MeiliDestination| {
+/// The production sink factory: every sink connects through `policy`.
+pub fn meili_sinks(policy: Arc<HostPolicy>) -> SinkFactory {
+    Arc::new(move |destination: &MeiliDestination| {
         let sink = meili_connect_sink::MeiliSink::new(
             destination,
-            meili_connect_sink::SinkOptions::default(),
+            meili_connect_sink::SinkOptions {
+                host_policy: Arc::clone(&policy),
+                ..meili_connect_sink::SinkOptions::default()
+            },
         )?;
         Ok(Arc::new(sink) as Arc<dyn Sink>)
     })
@@ -57,6 +61,7 @@ pub struct SyncManager {
     store: Arc<dyn StateStore>,
     sources: Arc<dyn SourceFactory>,
     sinks: SinkFactory,
+    policy: Arc<HostPolicy>,
     config: SupervisorConfig,
     cancel: CancellationToken,
     meter: Arc<UsageMeter>,
@@ -75,6 +80,7 @@ impl SyncManager {
         store: Arc<dyn StateStore>,
         sources: Arc<dyn SourceFactory>,
         sinks: SinkFactory,
+        policy: Arc<HostPolicy>,
         config: SupervisorConfig,
         meter: Arc<UsageMeter>,
         cancel: CancellationToken,
@@ -83,6 +89,7 @@ impl SyncManager {
             store,
             sources,
             sinks,
+            policy,
             config,
             cancel,
             meter,
@@ -105,10 +112,30 @@ impl SyncManager {
         lock(&self.supervisors).get(sync_id).cloned()
     }
 
+    /// The connectors of one sync, behind the host policy; coarse errors
+    /// for a tenant's sync.
+    fn guarded_sources(&self, spec: &SyncSpec) -> GuardedSources {
+        GuardedSources::new(
+            Arc::clone(&self.sources),
+            Arc::clone(&self.policy),
+            spec.tenant.is_some(),
+        )
+    }
+
+    /// The sink of one sync; coarse errors for a tenant's sync.
+    fn sink(&self, spec: &SyncSpec) -> Result<Arc<dyn Sink>, SinkError> {
+        let sink = (self.sinks)(&spec.destination)?;
+        Ok(if spec.tenant.is_some() {
+            Arc::new(CoarseSink(sink))
+        } else {
+            sink
+        })
+    }
+
     fn new_supervisor(&self, spec: &SyncSpec) -> Result<Arc<Supervisor>, SupervisorError> {
-        let sink = (self.sinks)(&spec.destination).map_err(EngineError::from)?;
+        let sink = self.sink(spec).map_err(EngineError::from)?;
         let deps = SyncDeps {
-            sources: Arc::clone(&self.sources),
+            sources: Arc::new(self.guarded_sources(spec)),
             sink,
             store: Arc::clone(&self.store),
         };
@@ -242,7 +269,7 @@ impl SyncManager {
 
     /// What `Supervisor::remove` does, for a sync no supervisor runs.
     async fn teardown_idle(&self, spec: &SyncSpec) -> Result<(), String> {
-        if let Ok(sink) = (self.sinks)(&spec.destination) {
+        if let Ok(sink) = self.sink(spec) {
             for stream in &spec.streams {
                 let shadow = shadow_index_uid(&stream.index, &spec.id);
                 match tokio::time::timeout(self.teardown_timeout, sink.delete_index(&shadow)).await
@@ -258,7 +285,7 @@ impl SyncManager {
             }
         }
         let mut source = self
-            .sources
+            .guarded_sources(spec)
             .build(&spec.id, &spec.source, &spec.streams)
             .map_err(|e| e.to_string())?;
         match tokio::time::timeout(self.teardown_timeout, source.teardown()).await {

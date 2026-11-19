@@ -386,7 +386,12 @@ components:
             `unauthorized`, `invalid_tenant`, `invalid_request`, `not_found`,
             `conflict`, `source_config`, `source_paused`, `source_unavailable`,
             `source_error`, `source_timeout`, `teardown_failed`,
-            `store_unavailable`, `shutting_down`, `engine`, `internal`.
+            `store_unavailable`, `shutting_down`, `engine`, `internal`,
+            `host_not_allowed` (422: the host policy refuses the source or
+            destination; the message names the host, never what it resolved
+            to). For calls with the Lab token, source and Meilisearch errors
+            carry a fixed description of their class, not the driver's
+            text.
         message: { type: string }
 
     SyncPhase:

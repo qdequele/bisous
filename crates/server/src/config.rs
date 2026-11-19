@@ -7,7 +7,8 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use meili_connect_core::Secret;
+use meili_connect_core::host_policy::{self, PolicyMode};
+use meili_connect_core::{Endpoint, HostPolicy, Secret};
 use thiserror::Error;
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -56,6 +57,11 @@ pub struct Config {
     pub source_probe_timeout: Duration,
     /// Time given to the syncs to stop on SIGTERM.
     pub shutdown_grace: Duration,
+    /// Where sources and destinations may point (`CONNECT_HOST_POLICY`,
+    /// `CONNECT_HOST_ALLOWLIST`). `public` by default when
+    /// `LAB_SERVICE_TOKEN` is set, `any` otherwise. The state database is
+    /// always refused as a source origin.
+    pub host_policy: HostPolicy,
 }
 
 impl Config {
@@ -118,12 +124,31 @@ impl Config {
             .or_else(|| get("LOG_LEVEL"))
             .unwrap_or_else(|| "info".to_owned());
 
+        let lab_service_token = get("LAB_SERVICE_TOKEN").map(Secret::new);
+        let default_mode = if lab_service_token.is_some() {
+            PolicyMode::Public
+        } else {
+            PolicyMode::Any
+        };
+        let mut host_policy = HostPolicy::parse(
+            get(host_policy::MODE_ENV).as_deref(),
+            get(host_policy::ALLOWLIST_ENV).as_deref(),
+            default_mode,
+        )
+        .map_err(ConfigError)?;
+        if let Some(url) = &database_url {
+            for endpoint in state_db_endpoints(url.expose()) {
+                host_policy = host_policy.forbid_origin(endpoint);
+            }
+        }
+
         Ok(Self {
             listen_addr,
             database_url,
             secret_key,
             admin_api_key: get("ADMIN_API_KEY").map(Secret::new),
-            lab_service_token: get("LAB_SERVICE_TOKEN").map(Secret::new),
+            lab_service_token,
+            host_policy,
             lab_events,
             log_format,
             log_filter,
@@ -133,6 +158,45 @@ impl Config {
             shutdown_grace: secs(&get, "SHUTDOWN_GRACE_SECS", 30, 1, 600)?,
         })
     }
+}
+
+/// The servers a libpq URL names: every `host[:port]` of the authority
+/// (comma-separated lists included) and a `host=` query parameter. Unix
+/// socket paths are skipped (a source can never name one).
+pub fn state_db_endpoints(url: &str) -> Vec<Endpoint> {
+    let Some((_, rest)) = url.trim().split_once("://") else {
+        return Vec::new();
+    };
+    let (authority, query) = match rest.split_once('/') {
+        Some((a, path)) => (a, path.split_once('?').map(|(_, q)| q)),
+        None => match rest.split_once('?') {
+            Some((a, q)) => (a, Some(q)),
+            None => (rest, None),
+        },
+    };
+    let hosts = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let mut port_param = None;
+    let mut host_param = None;
+    for pair in query.unwrap_or_default().split('&') {
+        match pair.split_once('=') {
+            Some(("host", v)) => host_param = Some(v.to_owned()),
+            Some(("port", v)) => port_param = v.parse::<u16>().ok(),
+            _ => {}
+        }
+    }
+    let default_port = port_param.unwrap_or(5432);
+    let mut out: Vec<Endpoint> = hosts
+        .split(',')
+        .filter_map(|h| Endpoint::parse(h, default_port))
+        .collect();
+    if let Some(h) = host_param.filter(|h| !h.starts_with('/') && !h.starts_with("%2F")) {
+        out.extend(
+            h.split(',')
+                .filter_map(|h| Endpoint::parse(h, default_port)),
+        );
+    }
+    out.retain(|e| !e.host.is_empty());
+    out
 }
 
 fn secs(
@@ -228,6 +292,64 @@ mod tests {
         ])
         .unwrap();
         assert!(!format!("{c:?}").contains("hunter2"));
+    }
+
+    #[test]
+    fn host_policy_defaults_follow_the_lab_token() {
+        assert!(cfg(&[]).unwrap().host_policy.is_any());
+        let lab = cfg(&[("LAB_SERVICE_TOKEN", "t")]).unwrap();
+        assert_eq!(lab.host_policy.mode_name(), "public");
+        let explicit = cfg(&[("LAB_SERVICE_TOKEN", "t"), ("CONNECT_HOST_POLICY", "any")]).unwrap();
+        assert!(explicit.host_policy.is_any());
+        let list = cfg(&[
+            ("CONNECT_HOST_POLICY", "allowlist"),
+            ("CONNECT_HOST_ALLOWLIST", "db.internal:5432,10.0.0.0/8"),
+        ])
+        .unwrap();
+        assert_eq!(list.host_policy.mode_name(), "allowlist");
+        assert!(cfg(&[("CONNECT_HOST_POLICY", "allowlist")]).is_err());
+        assert!(cfg(&[("CONNECT_HOST_POLICY", "open")]).is_err());
+    }
+
+    #[tokio::test]
+    async fn the_state_database_is_never_an_origin() {
+        let c = cfg(&[
+            ("DATABASE_URL", "postgres://u:pw@127.0.0.1:6543/connect"),
+            ("CONNECT_SECRET_KEY", "k"),
+        ])
+        .unwrap();
+        let refused = c
+            .host_policy
+            .vet_origin(&Endpoint::new("localhost", 6543))
+            .await;
+        assert!(refused.is_err());
+        assert!(
+            c.host_policy
+                .vet_origin(&Endpoint::new("127.0.0.1", 5432))
+                .await
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn state_db_urls_name_their_servers() {
+        assert_eq!(
+            state_db_endpoints("postgres://u:p@db:5433/x?sslmode=disable"),
+            vec![Endpoint::new("db", 5433)]
+        );
+        assert_eq!(
+            state_db_endpoints("postgresql://a,b:6000/x"),
+            vec![Endpoint::new("a", 5432), Endpoint::new("b", 6000)]
+        );
+        assert_eq!(
+            state_db_endpoints("postgres://u@[::1]/x"),
+            vec![Endpoint::new("::1", 5432)]
+        );
+        assert_eq!(
+            state_db_endpoints("postgres:///x?host=pg.internal&port=7000"),
+            vec![Endpoint::new("pg.internal", 7000)]
+        );
+        assert_eq!(state_db_endpoints("postgres:///x?host=/var/run"), vec![]);
     }
 
     #[test]

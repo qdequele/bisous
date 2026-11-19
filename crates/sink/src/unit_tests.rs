@@ -1028,6 +1028,89 @@ async fn connection_refused_is_transient() {
     assert!(!e.to_string().contains(KEY));
 }
 
+fn policed(url: String, policy: HostPolicy) -> Result<MeiliSink, SinkError> {
+    let dest = MeiliDestination {
+        url,
+        api_key: Secret::new(KEY),
+    };
+    MeiliSink::new(
+        &dest,
+        SinkOptions {
+            host_policy: Arc::new(policy),
+            request_retries: 0,
+            ..opts()
+        },
+    )
+}
+
+#[tokio::test]
+async fn a_restrictive_policy_refuses_internal_destinations() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"numberOfDocuments": 1})))
+        .mount(&server)
+        .await;
+    let port = server.address().port();
+    // A literal address is refused when the sink is built.
+    for url in [
+        format!("http://127.0.0.1:{port}"),
+        "http://169.254.169.254".to_owned(),
+        "http://[::1]:7700".to_owned(),
+        "http://10.0.0.1:7700".to_owned(),
+    ] {
+        let e = policed(url.clone(), HostPolicy::public()).unwrap_err();
+        assert!(matches!(e, SinkError::Config(_)), "{url}: {e:?}");
+    }
+    // A name is resolved through the policy at connect time: `localhost`
+    // never reaches the server.
+    let s = policed(format!("http://localhost:{port}"), HostPolicy::public()).unwrap();
+    let e = s.document_count("x").await.unwrap_err();
+    assert!(matches!(e, SinkError::Transient(_)), "{e:?}");
+    assert!(server.received_requests().await.unwrap().is_empty());
+    // The same sink under `any` gets through.
+    let s = policed(format!("http://localhost:{port}"), HostPolicy::any()).unwrap();
+    assert_eq!(s.document_count("x").await.unwrap(), Some(1));
+}
+
+#[tokio::test]
+async fn redirects_are_not_followed() {
+    let elsewhere = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"numberOfDocuments": 1})))
+        .mount(&elsewhere)
+        .await;
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(
+            ResponseTemplate::new(307)
+                .insert_header("location", format!("{}/indexes/x/stats", elsewhere.uri())),
+        )
+        .mount(&server)
+        .await;
+    let s = sink(&server, opts());
+    assert!(s.document_count("x").await.is_err());
+    assert!(elsewhere.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_body_that_is_not_a_meilisearch_error_is_never_echoed() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(
+            ResponseTemplate::new(403)
+                .set_body_string("<html>instance-id: i-0123 ami-SECRETBODY</html>"),
+        )
+        .mount(&server)
+        .await;
+    let e = sink(&server, opts()).document_count("x").await.unwrap_err();
+    let msg = e.to_string();
+    assert!(msg.contains("403"), "{msg}");
+    assert!(
+        !msg.contains("SECRETBODY") && !msg.contains("html"),
+        "{msg}"
+    );
+}
+
 #[test]
 fn bad_urls_are_config_errors() {
     for url in ["not a url", "ftp://host", "mailto:x@y"] {

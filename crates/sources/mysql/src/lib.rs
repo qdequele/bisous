@@ -25,6 +25,7 @@
 mod config;
 mod convert;
 mod ddl;
+mod endpoints;
 mod error;
 mod gtid;
 mod position;

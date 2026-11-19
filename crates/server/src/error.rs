@@ -45,6 +45,15 @@ impl ApiError {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", message)
     }
 
+    /// A source or destination the host policy refuses.
+    pub fn host_not_allowed(message: impl Into<String>) -> Self {
+        Self::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "host_not_allowed",
+            message,
+        )
+    }
+
     pub fn sync_not_found(id: &str) -> Self {
         Self::not_found(format!("sync {id} not found"))
     }

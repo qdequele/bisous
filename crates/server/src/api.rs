@@ -15,8 +15,9 @@ use meili_connect_store::{DeadLetterPage, StoredSync};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::auth::Scope;
+use crate::auth::{Principal, Scope};
 use crate::error::{ApiError, source_error};
+use crate::guard::{VetError, coarse_source_error, vet_destination, vet_source};
 use crate::manager::RemoveError;
 use crate::redact::{REDACTED, contains_redacted, redact_spec, restore_redacted};
 use crate::state::AppState;
@@ -60,11 +61,37 @@ fn probe_request(input: Result<Json<Value>, JsonRejection>) -> ApiResult<ProbeRe
     serde_json::from_value(value).map_err(|e| ApiError::invalid(e.to_string()))
 }
 
-fn probe_source(state: &AppState, req: &ProbeRequest) -> ApiResult<Box<dyn Source>> {
+/// Builds the source (its config errors are the connector's own words),
+/// then vets its endpoints against the host policy.
+async fn probe_source(
+    state: &AppState,
+    req: &ProbeRequest,
+    coarse: bool,
+) -> ApiResult<Box<dyn Source>> {
+    let sources = state.sources(coarse);
     state
-        .sources
+        .registry
         .build(PROBE_ID, &req.source, &req.streams)
+        .map_err(|e| source_error(&e))?;
+    vet(state, &req.source, coarse).await?;
+    sources
+        .build_vetted(PROBE_ID, &req.source, &req.streams)
         .map_err(|e| source_error(&e))
+}
+
+/// Every endpoint of the source passes the host policy.
+async fn vet(state: &AppState, source: &SourceSpec, coarse: bool) -> ApiResult<()> {
+    match vet_source(&*state.registry, &state.policy, source).await {
+        Ok(_) => Ok(()),
+        Err(VetError::Policy(e)) => Err(ApiError::host_not_allowed(e.to_string())),
+        Err(VetError::Source(e)) if coarse => Err(source_error(&coarse_source_error(e))),
+        Err(VetError::Source(e)) => Err(source_error(&e)),
+    }
+}
+
+/// Lab callers get coarse source and sink errors.
+fn coarse(scope: &Scope) -> bool {
+    scope.principal == Principal::Lab
 }
 
 fn probe_timeout(state: &AppState) -> ApiError {
@@ -80,15 +107,16 @@ fn probe_timeout(state: &AppState) -> ApiError {
 
 pub async fn check_source(
     State(state): State<AppState>,
-    _scope: Scope,
+    scope: Scope,
     input: Result<Json<Value>, JsonRejection>,
 ) -> ApiResult<Json<Value>> {
     let req = probe_request(input)?;
-    let mut source = probe_source(&state, &req)?;
-    let report = tokio::time::timeout(state.probe_timeout, source.check())
-        .await
-        .map_err(|_| probe_timeout(&state))?
-        .map_err(|e| source_error(&e))?;
+    let report = tokio::time::timeout(state.probe_timeout, async {
+        let mut source = probe_source(&state, &req, coarse(&scope)).await?;
+        source.check().await.map_err(|e| source_error(&e))
+    })
+    .await
+    .map_err(|_| probe_timeout(&state))??;
     Ok(Json(json!({
         "passed": report.passed(),
         "items": report.items,
@@ -97,15 +125,16 @@ pub async fn check_source(
 
 pub async fn discover_source(
     State(state): State<AppState>,
-    _scope: Scope,
+    scope: Scope,
     input: Result<Json<Value>, JsonRejection>,
 ) -> ApiResult<Json<Value>> {
     let req = probe_request(input)?;
-    let mut source = probe_source(&state, &req)?;
-    let collections = tokio::time::timeout(state.probe_timeout, source.discover())
-        .await
-        .map_err(|_| probe_timeout(&state))?
-        .map_err(|e| source_error(&e))?;
+    let collections = tokio::time::timeout(state.probe_timeout, async {
+        let mut source = probe_source(&state, &req, coarse(&scope)).await?;
+        source.discover().await.map_err(|e| source_error(&e))
+    })
+    .await
+    .map_err(|_| probe_timeout(&state))??;
     Ok(Json(json!({ "collections": collections })))
 }
 
@@ -152,8 +181,18 @@ impl SyncInput {
 }
 
 /// `SyncSpec::validate` plus what the server needs: a name, a
-/// Meilisearch URL, a source config its connector accepts.
-fn validate(state: &AppState, spec: &SyncSpec) -> ApiResult<()> {
+/// Meilisearch URL, a source config its connector accepts, and a source and
+/// a destination the host policy allows (resolved now, so a refusal is
+/// immediate; vetted again on every start).
+async fn validate(state: &AppState, spec: &SyncSpec, coarse: bool) -> ApiResult<()> {
+    validate_shape(state, spec)?;
+    vet_destination(&state.policy, spec.destination.url.trim())
+        .await
+        .map_err(ApiError::host_not_allowed)?;
+    vet(state, &spec.source, coarse).await
+}
+
+fn validate_shape(state: &AppState, spec: &SyncSpec) -> ApiResult<()> {
     if spec.name.is_empty() || spec.name.len() > MAX_NAME_LEN {
         return Err(ApiError::invalid(format!(
             "name must be 1 to {MAX_NAME_LEN} characters"
@@ -168,7 +207,7 @@ fn validate(state: &AppState, spec: &SyncSpec) -> ApiResult<()> {
     // Builds the source without connecting: the connector checks its
     // config shape and the mappings.
     state
-        .sources
+        .registry
         .build(&spec.id, &spec.source, &spec.streams)
         .map_err(|e| source_error(&e))?;
     Ok(())
@@ -217,7 +256,7 @@ pub async fn create_sync(
         serde_json::from_value(value).map_err(|e| ApiError::invalid(e.to_string()))?;
     let id = uuid::Uuid::now_v7().to_string();
     let spec = input.into_spec(id, scope.tenant.clone());
-    validate(&state, &spec)?;
+    validate(&state, &spec, coarse(&scope)).await?;
     let stored = state.repo().create_sync(scope.tenant(), &spec).await?;
     state.manager.run(spec).await?;
     tracing::info!(sync_id = %stored.spec.id, tenant = ?scope.tenant(), "sync created");
@@ -252,7 +291,7 @@ pub async fn update_sync(
     let input: SyncInput =
         serde_json::from_value(value).map_err(|e| ApiError::invalid(e.to_string()))?;
     let spec = input.into_spec(current.spec.id.clone(), current.spec.tenant.clone());
-    validate(&state, &spec)?;
+    validate(&state, &spec, coarse(&scope)).await?;
     let stored = state.repo().update_sync(scope.tenant(), &spec).await?;
     state.manager.run(spec).await?;
     tracing::info!(sync_id = %id, "sync updated and restarted");

@@ -7,6 +7,7 @@ pub mod api;
 pub mod auth;
 pub mod config;
 pub mod error;
+pub mod guard;
 pub mod lab;
 pub mod manager;
 pub mod redact;
@@ -22,7 +23,7 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::routing::{get, post};
-use meili_connect_core::{SourceFactory, StateStore, SyncPhase};
+use meili_connect_core::{HostPolicy, SourceFactory, StateStore, SyncPhase};
 use meili_connect_engine::SupervisorConfig;
 use meili_connect_store::{MemStore, PgStore, SecretKey};
 use tokio_util::sync::CancellationToken;
@@ -66,6 +67,7 @@ pub fn router(state: AppState) -> Router {
 pub struct Wiring {
     pub sources: Arc<dyn SourceFactory>,
     pub sinks: SinkFactory,
+    pub policy: Arc<HostPolicy>,
     pub supervisor: SupervisorConfig,
     pub auth: AuthConfig,
     pub probe_timeout: std::time::Duration,
@@ -88,6 +90,7 @@ pub fn build_state(
         engine_store,
         Arc::clone(&wiring.sources),
         Arc::clone(&wiring.sinks),
+        Arc::clone(&wiring.policy),
         wiring.supervisor,
         meter,
         cancel,
@@ -95,8 +98,9 @@ pub fn build_state(
     AppState {
         backend,
         manager,
-        sources: wiring.sources,
+        registry: wiring.sources,
         sinks: wiring.sinks,
+        policy: wiring.policy,
         auth: wiring.auth,
         probe_timeout: wiring.probe_timeout,
         lab_events: wiring.lab_events,
@@ -209,12 +213,23 @@ pub async fn run() -> Result<(), String> {
         );
     }
 
+    let policy = Arc::new(config.host_policy.clone());
+    if policy.is_any() && config.lab_service_token.is_some() {
+        warn!(
+            "CONNECT_HOST_POLICY=any with LAB_SERVICE_TOKEN set: tenants can point syncs at \
+             internal addresses (metadata endpoint, private networks). Use `public` or \
+             `allowlist` for a hosted deployment"
+        );
+    }
+    info!(host_policy = policy.mode_name(), "host policy");
+
     let cancel = CancellationToken::new();
     let state = build_state(
         Arc::clone(&backend),
         Wiring {
             sources: Arc::new(SourceRegistry::new()),
-            sinks: meili_sinks(),
+            sinks: meili_sinks(Arc::clone(&policy)),
+            policy,
             supervisor: SupervisorConfig::default(),
             auth,
             probe_timeout: config.source_probe_timeout,
