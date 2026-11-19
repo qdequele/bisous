@@ -1,1 +1,616 @@
 //! Meilisearch writer: batching, task tracking, poison-document bisection, index swap.
+//!
+//! [`MeiliSink`] implements [`meili_connect_core::Sink`] over the Meilisearch
+//! HTTP API. See `docs/ARCHITECTURE.md`, "Meilisearch writes".
+
+mod client;
+
+use std::time::Duration;
+
+use async_trait::async_trait;
+use meili_connect_core::{
+    ApplyReport, DocOp, Document, IndexTarget, MeiliDestination, RejectedDoc, Sink, SinkError,
+};
+use reqwest::{Method, StatusCode};
+use serde::Deserialize;
+use serde::ser::{Serialize, SerializeMap, Serializer};
+use serde_json::json;
+
+use client::{Client, DocFailure, Payload, TaskStatus, classify_doc_failure, map_api_error};
+
+/// Meilisearch's default `http_payload_size_limit` is 100 MiB; stay under.
+pub const DEFAULT_MAX_PAYLOAD_BYTES: usize = 90 * 1024 * 1024;
+
+/// Tunables of [`MeiliSink`].
+#[derive(Debug, Clone)]
+pub struct SinkOptions {
+    /// Upper bound of one request body before compression. Runs are split
+    /// to fit; a single document over it is rejected.
+    pub max_payload_bytes: usize,
+    /// First delay between two `GET /tasks/{uid}`; doubled up to
+    /// `max_poll_interval`.
+    pub poll_interval: Duration,
+    pub max_poll_interval: Duration,
+    /// How long to wait for one task before giving up with a transient
+    /// error (the engine then replays the batch).
+    pub task_timeout: Duration,
+    /// Timeout of one HTTP request, body included.
+    pub request_timeout: Duration,
+    pub connect_timeout: Duration,
+    /// Send document payloads with `Content-Encoding: gzip`.
+    pub gzip: bool,
+}
+
+impl Default for SinkOptions {
+    fn default() -> Self {
+        Self {
+            max_payload_bytes: DEFAULT_MAX_PAYLOAD_BYTES,
+            poll_interval: Duration::from_millis(50),
+            max_poll_interval: Duration::from_secs(1),
+            task_timeout: Duration::from_secs(15 * 60),
+            request_timeout: Duration::from_secs(120),
+            connect_timeout: Duration::from_secs(10),
+            gzip: true,
+        }
+    }
+}
+
+/// The Meilisearch [`Sink`].
+pub struct MeiliSink {
+    client: Client,
+}
+
+impl std::fmt::Debug for MeiliSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MeiliSink")
+            .field("options", &self.client.opts)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Replace,
+    Merge,
+    Delete,
+}
+
+impl Kind {
+    fn of(op: &DocOp) -> Self {
+        match op {
+            DocOp::Replace { .. } => Kind::Replace,
+            DocOp::Merge { .. } => Kind::Merge,
+            DocOp::Delete { .. } => Kind::Delete,
+        }
+    }
+}
+
+/// Splits `ops` into maximal runs of one kind, in order.
+fn runs(ops: &[DocOp]) -> Vec<(Kind, std::ops::Range<usize>)> {
+    let mut out: Vec<(Kind, std::ops::Range<usize>)> = Vec::new();
+    for (i, op) in ops.iter().enumerate() {
+        let kind = Kind::of(op);
+        match out.last_mut() {
+            Some((k, r)) if *k == kind => r.end = i + 1,
+            _ => out.push((kind, i..i + 1)),
+        }
+    }
+    out
+}
+
+/// A document with its id injected under `primary_key` and `unset` fields
+/// written as `null`, serialized without cloning the body.
+struct DocLine<'a> {
+    primary_key: &'a str,
+    id: &'a str,
+    doc: &'a Document,
+    unset: &'a [String],
+}
+
+impl Serialize for DocLine<'_> {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let mut map = s.serialize_map(None)?;
+        map.serialize_entry(self.primary_key, self.id)?;
+        for (k, v) in self.doc {
+            if k != self.primary_key {
+                map.serialize_entry(k, v)?;
+            }
+        }
+        for (i, field) in self.unset.iter().enumerate() {
+            if field != self.primary_key
+                && !self.doc.contains_key(field)
+                && !self.unset[..i].contains(field)
+            {
+                map.serialize_entry(field, &serde_json::Value::Null)?;
+            }
+        }
+        map.end()
+    }
+}
+
+/// The wire form of one op: an NDJSON line, or a JSON string for deletes.
+fn encode_op(op: &DocOp, primary_key: &str) -> Result<Vec<u8>, SinkError> {
+    let res = match op {
+        DocOp::Replace { id, doc } => serde_json::to_vec(&DocLine {
+            primary_key,
+            id,
+            doc,
+            unset: &[],
+        }),
+        DocOp::Merge { id, doc, unset } => serde_json::to_vec(&DocLine {
+            primary_key,
+            id,
+            doc,
+            unset,
+        }),
+        DocOp::Delete { id } => serde_json::to_vec(id),
+    };
+    res.map_err(|e| SinkError::Fatal(format!("cannot serialize document: {e}")))
+}
+
+/// Bytes a delete-batch array adds around its items (`[` and `]`).
+const ARRAY_OVERHEAD: usize = 2;
+
+enum WriteOutcome {
+    Written,
+    /// Meilisearch refused the payload in a way bisection can narrow down.
+    Refused {
+        reason: String,
+        embedding: bool,
+    },
+}
+
+/// The ops of one run currently being written, with their wire form.
+struct Chunk {
+    /// Index into the run of each line.
+    idx: Vec<usize>,
+    lines: Vec<Vec<u8>>,
+    bytes: usize,
+}
+
+impl Chunk {
+    fn new() -> Self {
+        Self {
+            idx: Vec::new(),
+            lines: Vec::new(),
+            bytes: 0,
+        }
+    }
+}
+
+/// Rejections and successes of one run, before the embedding check.
+#[derive(Default)]
+struct RunTally {
+    ok: u64,
+    rejected: Vec<(usize, String, bool)>,
+}
+
+impl MeiliSink {
+    pub fn new(destination: &MeiliDestination, options: SinkOptions) -> Result<Self, SinkError> {
+        Ok(Self {
+            client: Client::new(destination, options)?,
+        })
+    }
+
+    fn limit(&self, kind: Kind) -> usize {
+        match kind {
+            Kind::Delete => self
+                .client
+                .opts
+                .max_payload_bytes
+                .saturating_sub(ARRAY_OVERHEAD),
+            _ => self.client.opts.max_payload_bytes,
+        }
+    }
+
+    async fn apply_run(
+        &self,
+        target: &IndexTarget,
+        kind: Kind,
+        run: &[DocOp],
+        report: &mut ApplyReport,
+    ) -> Result<(), SinkError> {
+        let limit = self.limit(kind);
+        let mut tally = RunTally::default();
+        let mut chunk = Chunk::new();
+        for (i, op) in run.iter().enumerate() {
+            let line = encode_op(op, &target.primary_key)?;
+            // One separator per line (newline or comma).
+            let cost = line.len() + 1;
+            if cost > limit {
+                tally.rejected.push((
+                    i,
+                    format!(
+                        "document is {} bytes, over the payload limit of {} bytes",
+                        line.len(),
+                        self.client.opts.max_payload_bytes
+                    ),
+                    false,
+                ));
+                continue;
+            }
+            if chunk.bytes + cost > limit {
+                let full = std::mem::replace(&mut chunk, Chunk::new());
+                self.write_bisect(target, kind, full, &mut tally).await?;
+            }
+            chunk.idx.push(i);
+            chunk.lines.push(line);
+            chunk.bytes += cost;
+        }
+        if !chunk.lines.is_empty() {
+            self.write_bisect(target, kind, chunk, &mut tally).await?;
+        }
+
+        if tally.ok == 0
+            && !tally.rejected.is_empty()
+            && tally.rejected.iter().all(|(_, _, embedding)| *embedding)
+        {
+            let reason = tally
+                .rejected
+                .first()
+                .map(|(_, r, _)| r.clone())
+                .unwrap_or_default();
+            return Err(SinkError::Transient(format!(
+                "embedder failed for every document of the batch: {reason}"
+            )));
+        }
+        match kind {
+            Kind::Delete => report.deleted += tally.ok,
+            _ => report.written += tally.ok,
+        }
+        if !tally.rejected.is_empty() {
+            tracing::warn!(
+                index = %target.uid,
+                rejected = tally.rejected.len(),
+                "Meilisearch rejected documents"
+            );
+        }
+        for (i, reason, _) in tally.rejected {
+            if let Some(op) = run.get(i) {
+                report.rejected.push(RejectedDoc {
+                    op: op.clone(),
+                    reason,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Writes a chunk; on refusal, halves it until each refused document is
+    /// isolated. Left halves go first so the run keeps its order.
+    async fn write_bisect(
+        &self,
+        target: &IndexTarget,
+        kind: Kind,
+        chunk: Chunk,
+        tally: &mut RunTally,
+    ) -> Result<(), SinkError> {
+        let mut stack = vec![(0usize, chunk.lines.len())];
+        while let Some((a, b)) = stack.pop() {
+            match self.write_once(target, kind, &chunk.lines[a..b]).await? {
+                WriteOutcome::Written => tally.ok += (b - a) as u64,
+                WriteOutcome::Refused { reason, embedding } => {
+                    if b - a == 1 {
+                        tally.rejected.push((chunk.idx[a], reason, embedding));
+                    } else {
+                        let mid = a + (b - a) / 2;
+                        tracing::debug!(index = %target.uid, size = b - a, "bisecting refused payload");
+                        stack.push((mid, b));
+                        stack.push((a, mid));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// One request + its task.
+    async fn write_once(
+        &self,
+        target: &IndexTarget,
+        kind: Kind,
+        lines: &[Vec<u8>],
+    ) -> Result<WriteOutcome, SinkError> {
+        let size: usize = lines.iter().map(|l| l.len() + 1).sum();
+        let mut body = Vec::with_capacity(size + ARRAY_OVERHEAD);
+        let (method, content_type) = match kind {
+            Kind::Delete => {
+                body.push(b'[');
+                for (i, l) in lines.iter().enumerate() {
+                    if i > 0 {
+                        body.push(b',');
+                    }
+                    body.extend_from_slice(l);
+                }
+                body.push(b']');
+                (Method::POST, "application/json")
+            }
+            Kind::Replace | Kind::Merge => {
+                for l in lines {
+                    body.extend_from_slice(l);
+                    body.push(b'\n');
+                }
+                let m = if kind == Kind::Replace {
+                    Method::POST
+                } else {
+                    Method::PUT
+                };
+                (m, "application/x-ndjson")
+            }
+        };
+        let payload = Some(Payload::Raw { body, content_type });
+        let enqueued = match kind {
+            Kind::Delete => {
+                self.client
+                    .enqueue(
+                        method,
+                        &["indexes", &target.uid, "documents", "delete-batch"],
+                        &[],
+                        payload,
+                    )
+                    .await?
+            }
+            _ => {
+                self.client
+                    .enqueue(
+                        method,
+                        &["indexes", &target.uid, "documents"],
+                        &[("primaryKey", target.primary_key.as_str())],
+                        payload,
+                    )
+                    .await?
+            }
+        };
+        let uid = match enqueued {
+            Ok(uid) => uid,
+            Err(api) if api.status == StatusCode::PAYLOAD_TOO_LARGE => {
+                return Ok(WriteOutcome::Refused {
+                    reason: format!("over the instance's payload limit: {}", api.error),
+                    embedding: false,
+                });
+            }
+            Err(api) => return Err(map_api_error("writing documents", &api)),
+        };
+        let task = self.client.wait_task(uid).await?;
+        tracing::debug!(index = %target.uid, task = task.uid, docs = lines.len(), status = ?task.status, "document task finished");
+        match task.status {
+            TaskStatus::Succeeded => Ok(WriteOutcome::Written),
+            TaskStatus::Canceled => Err(SinkError::Transient(format!(
+                "task {uid} was canceled by another client"
+            ))),
+            _ => {
+                let error = task.error.unwrap_or_default();
+                if kind == Kind::Delete && error.code == "index_not_found" {
+                    // Nothing to delete from an index that does not exist.
+                    return Ok(WriteOutcome::Written);
+                }
+                match classify_doc_failure(&error) {
+                    DocFailure::PerDocument(reason) => Ok(WriteOutcome::Refused {
+                        reason,
+                        embedding: false,
+                    }),
+                    DocFailure::Embedding(reason) => Ok(WriteOutcome::Refused {
+                        reason,
+                        embedding: true,
+                    }),
+                    DocFailure::Global(e) => Err(e),
+                }
+            }
+        }
+    }
+
+    /// Enqueue + wait; a failed task is mapped with `map_task_error`, except
+    /// codes in `ok_codes`, which count as success.
+    async fn index_task(
+        &self,
+        context: &str,
+        method: Method,
+        segments: &[&str],
+        payload: Option<Payload>,
+        ok_codes: &[&str],
+    ) -> Result<(), SinkError> {
+        let task = self
+            .client
+            .run_task(context, method, segments, payload)
+            .await?;
+        match task.status {
+            TaskStatus::Succeeded => Ok(()),
+            TaskStatus::Canceled => Err(SinkError::Transient(format!(
+                "{context}: task {} was canceled by another client",
+                task.uid
+            ))),
+            _ => {
+                let error = task.error.unwrap_or_default();
+                if ok_codes.contains(&error.code.as_str()) {
+                    Ok(())
+                } else {
+                    Err(client::map_task_error(context, &error))
+                }
+            }
+        }
+    }
+
+    /// `GET /indexes/{uid}` → `Some(primaryKey)`, `None` when missing.
+    async fn index_primary_key(&self, uid: &str) -> Result<Option<Option<String>>, SinkError> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct IndexInfo {
+            primary_key: Option<String>,
+        }
+        match self
+            .client
+            .call(Method::GET, &["indexes", uid], &[], None)
+            .await?
+        {
+            Ok(body) => {
+                let info: IndexInfo = serde_json::from_slice(&body).map_err(|e| {
+                    SinkError::Fatal(format!("unexpected index from Meilisearch: {e}"))
+                })?;
+                Ok(Some(info.primary_key))
+            }
+            Err(api) if api.status == StatusCode::NOT_FOUND => Ok(None),
+            Err(api) => Err(map_api_error("reading index", &api)),
+        }
+    }
+}
+
+#[async_trait]
+impl Sink for MeiliSink {
+    async fn ensure_index(&self, target: &IndexTarget) -> Result<(), SinkError> {
+        let uid = target.uid.as_str();
+        let pk = target.primary_key.as_str();
+        // Two rounds: a concurrent creation between GET and POST is re-read.
+        for _ in 0..2 {
+            match self.index_primary_key(uid).await? {
+                Some(Some(existing)) if existing == pk => return Ok(()),
+                Some(Some(existing)) => {
+                    return Err(SinkError::Config(format!(
+                        "index `{uid}` exists with primary key `{existing}`, expected `{pk}`"
+                    )));
+                }
+                Some(None) => {
+                    // Created without a primary key (e.g. by a settings
+                    // update): set it.
+                    return self
+                        .index_task(
+                            "setting index primary key",
+                            Method::PATCH,
+                            &["indexes", uid],
+                            Some(Payload::Json(json!({ "primaryKey": pk }))),
+                            &[],
+                        )
+                        .await;
+                }
+                None => {
+                    let task = self
+                        .client
+                        .run_task(
+                            "creating index",
+                            Method::POST,
+                            &["indexes"],
+                            Some(Payload::Json(json!({ "uid": uid, "primaryKey": pk }))),
+                        )
+                        .await?;
+                    match task.status {
+                        TaskStatus::Succeeded => return Ok(()),
+                        TaskStatus::Failed
+                            if task
+                                .error
+                                .as_ref()
+                                .is_some_and(|e| e.code == "index_already_exists") =>
+                        {
+                            continue;
+                        }
+                        TaskStatus::Canceled => {
+                            return Err(SinkError::Transient(format!(
+                                "creating index: task {} was canceled",
+                                task.uid
+                            )));
+                        }
+                        _ => {
+                            let error = task.error.unwrap_or_default();
+                            return Err(client::map_task_error("creating index", &error));
+                        }
+                    }
+                }
+            }
+        }
+        Err(SinkError::Transient(format!(
+            "index `{uid}` is being created concurrently"
+        )))
+    }
+
+    async fn apply(&self, target: &IndexTarget, ops: Vec<DocOp>) -> Result<ApplyReport, SinkError> {
+        let mut report = ApplyReport::default();
+        for (kind, range) in runs(&ops) {
+            self.apply_run(target, kind, &ops[range], &mut report)
+                .await?;
+        }
+        Ok(report)
+    }
+
+    async fn swap(&self, a: &str, b: &str) -> Result<(), SinkError> {
+        self.index_task(
+            "swapping indexes",
+            Method::POST,
+            &["swap-indexes"],
+            Some(Payload::Json(json!([{ "indexes": [a, b] }]))),
+            &[],
+        )
+        .await
+    }
+
+    async fn delete_index(&self, uid: &str) -> Result<(), SinkError> {
+        let enqueued = self
+            .client
+            .enqueue(Method::DELETE, &["indexes", uid], &[], None)
+            .await?;
+        let task_uid = match enqueued {
+            Ok(t) => t,
+            Err(api) if api.status == StatusCode::NOT_FOUND => return Ok(()),
+            Err(api) => return Err(map_api_error("deleting index", &api)),
+        };
+        let task = self.client.wait_task(task_uid).await?;
+        match task.status {
+            TaskStatus::Succeeded => Ok(()),
+            TaskStatus::Canceled => Err(SinkError::Transient(format!(
+                "deleting index: task {task_uid} was canceled"
+            ))),
+            _ => {
+                let error = task.error.unwrap_or_default();
+                if error.code == "index_not_found" {
+                    Ok(())
+                } else {
+                    Err(client::map_task_error("deleting index", &error))
+                }
+            }
+        }
+    }
+
+    async fn copy_settings(&self, from: &str, to: &str) -> Result<(), SinkError> {
+        let settings = match self
+            .client
+            .call(Method::GET, &["indexes", from, "settings"], &[], None)
+            .await?
+        {
+            Ok(body) => serde_json::from_slice::<serde_json::Value>(&body).map_err(|e| {
+                SinkError::Fatal(format!("unexpected settings from Meilisearch: {e}"))
+            })?,
+            Err(api) if api.status == StatusCode::NOT_FOUND => return Ok(()),
+            Err(api) => return Err(map_api_error("reading settings", &api)),
+        };
+        self.index_task(
+            "copying settings",
+            Method::PATCH,
+            &["indexes", to, "settings"],
+            Some(Payload::Json(settings)),
+            &[],
+        )
+        .await
+    }
+
+    async fn document_count(&self, uid: &str) -> Result<Option<u64>, SinkError> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Stats {
+            number_of_documents: u64,
+        }
+        match self
+            .client
+            .call(Method::GET, &["indexes", uid, "stats"], &[], None)
+            .await?
+        {
+            Ok(body) => {
+                let stats: Stats = serde_json::from_slice(&body).map_err(|e| {
+                    SinkError::Fatal(format!("unexpected stats from Meilisearch: {e}"))
+                })?;
+                Ok(Some(stats.number_of_documents))
+            }
+            Err(api) if api.status == StatusCode::NOT_FOUND => Ok(None),
+            Err(api) => Err(map_api_error("reading index stats", &api)),
+        }
+    }
+}
+
+#[cfg(test)]
+mod unit_tests;
