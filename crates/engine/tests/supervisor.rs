@@ -328,3 +328,47 @@ async fn endless_position_loss_holds_the_sync() {
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(h.origin.state().snapshots, 4, "no further resync");
 }
+
+fn sink_faults(h: &Harness, n: usize) {
+    let mut st = h.sink.state();
+    for _ in 0..n {
+        st.apply_faults
+            .push_back(SinkError::Transient("embedder unavailable".into()));
+    }
+}
+
+#[tokio::test]
+async fn a_batch_that_keeps_failing_transiently_holds_the_sync() {
+    let h = Harness::new();
+    h.origin.seed(vec![upsert(1, json!({}))]);
+    sink_faults(&h, 50);
+    let s = supervisor(&h);
+    s.start(spec()).expect("start");
+    wait_status(&s, "held", |st| !st.running && st.phase == SyncPhase::Held).await;
+    let st = status(&s).await;
+    assert!(
+        st.message
+            .as_deref()
+            .is_some_and(|m| m.contains("embedder unavailable")),
+        "{st:?}"
+    );
+    assert_eq!(st.consecutive_failures, 10);
+    assert_eq!(h.sink.state().apply_faults.len(), 40);
+}
+
+#[tokio::test]
+async fn progress_resets_the_transient_sink_count() {
+    let h = Harness::new();
+    h.origin.seed(vec![upsert(1, json!({}))]);
+    sink_faults(&h, 9);
+    let s = supervisor(&h);
+    s.start(spec()).expect("start");
+    wait_status(&s, "streaming", streaming).await;
+    wait_for("doc 1", 5, || h.sink.docs(INDEX).len() == 1).await;
+
+    sink_faults(&h, 9);
+    h.origin.tx(vec![upsert(2, json!({}))]);
+    wait_for("doc 2", 5, || h.sink.docs(INDEX).len() == 2).await;
+    wait_status(&s, "streaming", streaming).await;
+    s.shutdown().await;
+}

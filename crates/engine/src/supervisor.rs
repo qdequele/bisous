@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use chrono::Utc;
-use meili_connect_core::{Checkpoint, StoreError, SyncPhase, SyncSpec, SyncState};
+use meili_connect_core::{Checkpoint, SinkError, StoreError, SyncPhase, SyncSpec, SyncState};
 use thiserror::Error;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
@@ -34,6 +34,10 @@ pub struct SupervisorConfig {
     /// held: the origin's retention is then shorter than a snapshot. A
     /// resync stops counting once the sync streamed for `healthy_after`.
     pub max_consecutive_resyncs: u32,
+    /// `SinkError::Transient` failures allowed in a row while the saved
+    /// checkpoint does not move (the same batch keeps failing) before the
+    /// sync is held with the sink's message. `0` disables the bound.
+    pub max_sink_transient_failures: u32,
 }
 
 impl Default for SupervisorConfig {
@@ -45,6 +49,7 @@ impl Default for SupervisorConfig {
             healthy_after: Duration::from_secs(120),
             paused_retry: Duration::from_secs(60),
             max_consecutive_resyncs: 3,
+            max_sink_transient_failures: 10,
         }
     }
 }
@@ -345,6 +350,7 @@ async fn supervise(
     let mut failures: u32 = 0;
     // Shared by every attempt, so the resync budget spans them.
     let monitor = RunMonitor::new(config.max_consecutive_resyncs, config.healthy_after);
+    let mut stuck = StuckSink::default();
     info!(%sync_id, "sync supervised");
 
     loop {
@@ -375,8 +381,25 @@ async fn supervise(
             )),
             Err(e) => e,
         };
-        let reaction = error.reaction();
-        let message = error.to_string();
+        let mut reaction = error.reaction();
+        let mut message = error.to_string();
+        let sink_transient = matches!(error, EngineError::Sink(SinkError::Transient(_)));
+        let position = deps
+            .store
+            .load(&sync_id)
+            .await
+            .map(|state| state.and_then(|s| s.checkpoint));
+        let repeats = stuck.observe(position.ok(), sink_transient);
+        if sink_transient
+            && config.max_sink_transient_failures > 0
+            && repeats >= config.max_sink_transient_failures
+        {
+            reaction = Reaction::Hold;
+            message = format!(
+                "{message} (failed {repeats} times in a row on the same batch; fix the cause, \
+                 then restart the sync)"
+            );
+        }
         failures = failures.saturating_add(1);
         {
             let mut info = lock(&info);
@@ -433,6 +456,35 @@ async fn supervise(
     info!(%sync_id, "sync no longer supervised");
 }
 
+/// Consecutive `SinkError::Transient` failures at one saved checkpoint.
+#[derive(Debug, Default)]
+struct StuckSink {
+    /// The saved checkpoint the count refers to (`Some(None)`: no
+    /// checkpoint yet, during the first snapshot).
+    at: Option<Option<Checkpoint>>,
+    count: u32,
+}
+
+impl StuckSink {
+    /// Records one failed run; `position` is the saved checkpoint after it
+    /// (`None` when the store could not tell). Returns the count.
+    fn observe(&mut self, position: Option<Option<Checkpoint>>, sink_transient: bool) -> u32 {
+        if let Some(position) = position
+            && self.at.as_ref() != Some(&position)
+        {
+            // Progress (or a first observation): start over.
+            self.at = Some(position);
+            self.count = 0;
+        }
+        if sink_transient {
+            self.count = self.count.saturating_add(1);
+        } else {
+            self.count = 0;
+        }
+        self.count
+    }
+}
+
 fn report(result: Result<(), StoreError>, sync_id: &str) {
     if let Err(e) = result {
         warn!(sync_id, error = %e, "could not persist the sync phase");
@@ -454,6 +506,22 @@ mod tests {
             assert!(d >= exp / 2, "{failures}: {d:?} < half of {exp:?}");
             assert!(d <= max);
         }
+    }
+
+    #[test]
+    fn stuck_sink_counts_only_at_one_checkpoint() {
+        let at = |n: u64| Some(Some(Checkpoint(serde_json::json!(n))));
+        let mut stuck = StuckSink::default();
+        assert_eq!(stuck.observe(at(1), true), 1);
+        assert_eq!(stuck.observe(at(1), true), 2);
+        assert_eq!(
+            stuck.observe(None, true),
+            3,
+            "unknown position keeps counting"
+        );
+        assert_eq!(stuck.observe(at(2), true), 1, "progress resets");
+        assert_eq!(stuck.observe(at(2), false), 0, "another error resets");
+        assert_eq!(stuck.observe(Some(None), true), 1);
     }
 
     #[test]
