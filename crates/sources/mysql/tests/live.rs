@@ -950,6 +950,11 @@ async fn create_table_select_rows_precede_its_checkpoint() {
     let mut src = source(&url, "mc_cts", &["copy"], "cts-sync");
     src.open(None).await.unwrap();
     let mut run = Running::start(src);
+    // The stream is live (it read the table's schema) before the DROP.
+    conn.query_drop("INSERT INTO mc_cts.copy VALUES (0, 'live')")
+        .await
+        .unwrap();
+    run.until(|e| is_change_with(e, 0)).await;
     conn.query_drop("DROP TABLE mc_cts.copy").await.unwrap();
     conn.query_drop("CREATE TABLE mc_cts.copy (PRIMARY KEY (id)) SELECT id, v FROM mc_cts.src")
         .await

@@ -749,7 +749,11 @@ pub(crate) async fn run(
                         .get(&key)
                         .is_none_or(|s| s.columns.len() != count);
                     if stale {
-                        if let Some(s) = load_table(&mut meta, &key.0, &key.1).await? {
+                        let Some(loaded) = or_cancel(&cancel, load_settled(&mut meta, &key)).await
+                        else {
+                            return Ok(());
+                        };
+                        if let Some(s) = loaded? {
                             st.schemas.insert(key.clone(), s);
                         }
                         out.push(SourceEvent::SchemaChanged {
@@ -801,6 +805,31 @@ pub(crate) async fn run(
             return Ok(());
         }
     }
+}
+
+/// A table's schema as of a table map with `count` columns. The binlog
+/// event can reach us before the DDL that created the table is visible in
+/// `information_schema` (binlog flush precedes the data dictionary commit),
+/// so a missing or keyless table is re-read for a short, bounded while
+/// before the current answer is taken. (A column count that differs is not
+/// retried: replaying events from before an `ALTER` is normal.)
+async fn load_settled(
+    meta: &mut Conn,
+    key: &(String, String),
+) -> Result<Option<TableSchema>, SourceError> {
+    const TRIES: u32 = 20;
+    const PAUSE: Duration = Duration::from_millis(50);
+    let mut found = None;
+    for attempt in 0..TRIES {
+        found = load_table(meta, &key.0, &key.1).await?;
+        if found.as_ref().is_some_and(|s| !s.key.is_empty()) {
+            break;
+        }
+        if attempt + 1 < TRIES {
+            tokio::time::sleep(PAUSE).await;
+        }
+    }
+    Ok(found)
 }
 
 fn align(schema: &TableSchema, tme: &TableMapEvent<'_>) -> Result<BinlogTable, SourceError> {
