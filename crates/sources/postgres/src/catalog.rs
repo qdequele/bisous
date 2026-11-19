@@ -9,6 +9,11 @@ use crate::convert::{self, Oid, TypeRegistry};
 use crate::ident;
 use crate::pgoutput::RowRef;
 
+/// Why a table with inheritance children cannot be synced.
+pub const INHERITANCE: &str = "other tables inherit from it: their rows would be read by the \
+     snapshot but their changes are published under their own names, so they would never be \
+     updated or deleted. Map each table separately (declarative partitioning is supported)";
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct TableInfo {
     pub schema: String,
@@ -23,6 +28,11 @@ pub struct TableInfo {
     pub columns: Vec<ColumnInfo>,
     pub can_select: bool,
     pub is_owner: bool,
+    pub oid: u32,
+    /// A plain table with inheritance children (not partitions): a SELECT
+    /// reads their rows, but their changes are published under their own
+    /// names.
+    pub has_inheritance_children: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -110,7 +120,9 @@ pub async fn tables(
                 {pk}, {ri},
                 {names}, {oids}, {types}, {notnull},
                 has_table_privilege(c.oid, 'SELECT'),
-                pg_has_role(c.relowner, 'USAGE')
+                pg_has_role(c.relowner, 'USAGE'),
+                c.oid,
+                c.relkind = 'r' AND EXISTS (SELECT 1 FROM pg_inherits h WHERE h.inhparent = c.oid)
          FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
          WHERE c.relkind IN ('r', 'p') AND {where_clause}
          ORDER BY 1, 2",
@@ -158,6 +170,8 @@ pub async fn tables(
             columns,
             can_select: col(&row, 11)?,
             is_owner: col(&row, 12)?,
+            oid: col(&row, 13)?,
+            has_inheritance_children: col(&row, 14)?,
         });
     }
     Ok(out)

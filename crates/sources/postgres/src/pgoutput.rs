@@ -18,6 +18,9 @@ use crate::convert::{Oid, TypeRegistry};
 pub struct Mapped {
     pub name: String,
     pub key: Vec<String>,
+    /// The table's OID when it was opened: the same relation under another
+    /// name is a rename.
+    pub oid: u32,
 }
 
 /// Mapped tables by canonical `schema.table`. Tables absent from the map
@@ -83,13 +86,20 @@ pub struct RowRef {
 pub struct Decoder {
     relations: HashMap<u32, Relation>,
     keys: KeyColumns,
+    /// Mapped tables by OID → canonical name.
+    by_oid: HashMap<u32, String>,
 }
 
 impl Decoder {
     pub fn new(keys: KeyColumns) -> Self {
+        let by_oid = keys
+            .iter()
+            .map(|(canonical, m)| (m.oid, canonical.clone()))
+            .collect();
         Self {
             relations: HashMap::new(),
             keys,
+            by_oid,
         }
     }
 
@@ -201,6 +211,14 @@ impl Decoder {
             namespace
         };
         let canonical = format!("{schema}.{name}");
+        if let Some(expected) = self.by_oid.get(&id)
+            && expected != &canonical
+        {
+            return Err(SourceError::Config(format!(
+                "table {expected} was renamed to {canonical}: its changes can no longer be \
+                 matched to the mapping; map the new name (a resync follows)"
+            )));
+        }
         let mapped = self.keys.get(&canonical);
         let collection = mapped.map_or_else(|| canonical.clone(), |m| m.name.clone());
 
@@ -607,6 +625,7 @@ mod tests {
             Mapped {
                 name: "public.items".into(),
                 key: vec!["id".into()],
+                oid: 1,
             },
         );
         keys.insert(
@@ -614,6 +633,7 @@ mod tests {
             Mapped {
                 name: "pairs".into(),
                 key: vec!["b".into(), "a".into()],
+                oid: 2,
             },
         );
         let mut d = Decoder::new(keys);
@@ -895,6 +915,19 @@ mod tests {
         assert!(
             matches!(&ev[0], SourceEvent::Change(c) if matches!(&c.op, Op::Upsert { doc } if doc.len() == 2))
         );
+    }
+
+    #[test]
+    fn mapped_relation_under_another_name_is_a_rename() {
+        let (mut d, t) = decoder();
+        let renamed = wire::relation(1, "public", "items_v2", &[("id", INT4, true)]);
+        assert!(matches!(
+            d.decode(&renamed, &t),
+            Err(SourceError::Config(m)) if m.contains("renamed")
+        ));
+        // A relation we never mapped, under that name: ignored.
+        let other = wire::relation(7, "public", "items_v2", &[("id", INT4, true)]);
+        assert_eq!(d.decode(&other, &t).unwrap(), Decoded::Events(vec![]));
     }
 
     #[test]

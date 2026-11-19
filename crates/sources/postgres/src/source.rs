@@ -174,6 +174,12 @@ impl PostgresSource {
                 .iter()
                 .find(|f| f.schema == t.schema && f.table == t.table)
                 .ok_or_else(|| SourceError::Config(format!("table {canonical} does not exist")))?;
+            if info.has_inheritance_children {
+                return Err(SourceError::Config(format!(
+                    "table {canonical}: {}",
+                    catalog::INHERITANCE
+                )));
+            }
             let key = info.key().ok_or_else(|| {
                 SourceError::Config(format!(
                     "table {canonical} has no primary key or usable REPLICA IDENTITY: \
@@ -185,6 +191,7 @@ impl PostgresSource {
                 Mapped {
                     name: t.name.clone(),
                     key,
+                    oid: info.oid,
                 },
             );
         }

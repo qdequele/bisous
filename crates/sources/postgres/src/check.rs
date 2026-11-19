@@ -242,6 +242,9 @@ pub async fn run(src: &mut PostgresSource) -> Result<CheckReport, SourceError> {
                     .to_owned(),
             ),
         }
+        if info.has_inheritance_children {
+            problems.push(catalog::INHERITANCE.to_owned());
+        }
         if !info.can_select {
             problems.push("the role cannot SELECT from it".to_owned());
         }

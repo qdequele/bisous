@@ -998,6 +998,109 @@ async fn snapshot_survives_role_timeouts_under_back_pressure() {
 }
 
 #[tokio::test]
+async fn inheritance_is_refused_partitions_stream_under_the_root() {
+    let Some(url) = url() else { return };
+    let db = admin(&url).await;
+    let parent = unique("inh");
+    let part = unique("part");
+    db.batch_execute(&format!(
+        "CREATE TABLE {parent} (id int8 PRIMARY KEY, n int4, body text);
+         CREATE TABLE {parent}_child () INHERITS ({parent});
+         CREATE TABLE {part} (id int8 PRIMARY KEY, n int4, body text) PARTITION BY RANGE (id);
+         CREATE TABLE {part}_a PARTITION OF {part} FOR VALUES FROM (0) TO (100);
+         CREATE TABLE {part}_b PARTITION OF {part} FOR VALUES FROM (100) TO (200);
+         INSERT INTO {part} VALUES (1, 1, 'a'), (150, 1, 'b');"
+    ))
+    .await
+    .unwrap();
+
+    let mut src = source(&url, &unique("inh"), &[&format!("public.{parent}")]);
+    let report = src.check().await.unwrap();
+    let item = report
+        .items
+        .iter()
+        .find(|i| i.name == format!("table public.{parent}"))
+        .unwrap();
+    assert_eq!(item.status, CheckStatus::Failed, "{report:#?}");
+    assert!(item.message.contains("inherit"), "{}", item.message);
+    let err = src.open(None).await.unwrap_err();
+    assert!(matches!(err, SourceError::Config(_)), "{err:?}");
+
+    let collection = format!("public.{part}");
+    let sync_id = unique("part");
+    let mut src = source(&url, &sync_id, &[&collection]);
+    assert!(src.check().await.unwrap().passed());
+    let Opened::Fresh { start } = src.open(None).await.unwrap() else {
+        panic!()
+    };
+    let via_root: bool = db
+        .query_one(
+            "SELECT pubviaroot FROM pg_publication WHERE pubname = $1",
+            &[&format!("meili_connect_{sync_id}")],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert!(via_root);
+    let mut model = Model::default();
+    let (tx, mut rx) = mpsc::channel(16);
+    src.snapshot(tx, CancellationToken::new()).await.unwrap();
+    while let Some(ev) = rx.recv().await {
+        model.apply(ev);
+    }
+    assert_eq!(model.table(&collection).len(), 2);
+    let mut s = start_stream(src);
+    s.ack.send(Some(start)).unwrap();
+    db.batch_execute(&format!(
+        "INSERT INTO {part} VALUES (2, 2, 'c'), (151, 2, 'd'); UPDATE {part}_b SET n = 9 WHERE id = 150;"
+    ))
+    .await
+    .unwrap();
+    let ok = pump_until(&mut s.rx, &mut model, Duration::from_secs(30), |m| {
+        m.table(&collection).len() == 4 && m.table(&collection)["150"]["n"] == json!(9)
+    })
+    .await;
+    assert!(ok, "{model:#?}");
+    let mut src = s.stop().await;
+    src.teardown().await.unwrap();
+}
+
+#[tokio::test]
+async fn renaming_a_mapped_table_mid_stream_is_a_config_error() {
+    let Some(url) = url() else { return };
+    let db = admin(&url).await;
+    let table = unique("ren");
+    create_items(&db, &table).await;
+    let sync_id = unique("ren");
+    let mut src = source(&url, &sync_id, &[&format!("public.{table}")]);
+    let Opened::Fresh { start } = src.open(None).await.unwrap() else {
+        panic!()
+    };
+    let (tx, _rx) = mpsc::channel(4);
+    src.snapshot(tx, CancellationToken::new()).await.unwrap();
+    let mut s = start_stream(src);
+    s.ack.send(Some(start)).unwrap();
+    let mut model = Model::default();
+    db.batch_execute(&format!(
+        "INSERT INTO {table} VALUES (1, 1, 'a');
+         ALTER TABLE {table} RENAME TO {table}_new;
+         INSERT INTO {table}_new VALUES (2, 2, 'b');"
+    ))
+    .await
+    .unwrap();
+    pump_until(&mut s.rx, &mut model, Duration::from_secs(10), |_| false).await;
+    let (mut src, result) = tokio::time::timeout(Duration::from_secs(20), s.task)
+        .await
+        .expect("the stream stops by itself")
+        .unwrap();
+    assert!(
+        matches!(&result, Err(SourceError::Config(m)) if m.contains("renamed")),
+        "{result:?}"
+    );
+    src.teardown().await.unwrap();
+}
+
+#[tokio::test]
 async fn covering_indexes_key_on_their_key_columns_only() {
     let Some(url) = url() else { return };
     let db = admin(&url).await;
