@@ -1,1 +1,155 @@
 //! Kafka source: JSON, Debezium envelopes, tombstones.
+//!
+//! One sync is one consumer with a manual partition assignment at the
+//! offsets of the checkpoint saved by the engine
+//! (`{topic: {partition: next_offset}}`). No consumer-group rebalancing: the
+//! positions are deterministic and owned by our store. Acknowledged offsets
+//! are also committed to the broker under `meili-connect-<sync_id>`, purely
+//! so the user's tooling can watch the lag.
+
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
+pub mod checkpoint;
+mod client;
+pub mod config;
+pub mod decode;
+mod source;
+
+use meili_connect_core::{
+    Source, SourceError, SourceFactory, SourceKind, SourceSpec, StreamMapping,
+};
+
+pub use config::{Format, KafkaConfig, StartFrom};
+pub use source::{KafkaSource, RECORD_KEY};
+
+/// Builds [`KafkaSource`]s. Topics are the `collection` of each mapping.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct KafkaSourceFactory;
+
+impl SourceFactory for KafkaSourceFactory {
+    fn build(
+        &self,
+        sync_id: &str,
+        spec: &SourceSpec,
+        streams: &[StreamMapping],
+    ) -> Result<Box<dyn Source>, SourceError> {
+        Ok(Box::new(build_source(sync_id, spec, streams)?))
+    }
+}
+
+/// Same as [`KafkaSourceFactory::build`], with the concrete type (gives
+/// access to [`KafkaSource::skipped_records`]).
+pub fn build_source(
+    sync_id: &str,
+    spec: &SourceSpec,
+    streams: &[StreamMapping],
+) -> Result<KafkaSource, SourceError> {
+    if spec.kind != SourceKind::Kafka {
+        return Err(SourceError::Config(format!(
+            "the kafka connector cannot build a `{}` source",
+            spec.kind.as_str()
+        )));
+    }
+    if sync_id.is_empty() {
+        return Err(SourceError::Config("sync id must not be empty".to_owned()));
+    }
+    let config = KafkaConfig::from_value(&spec.config)?;
+    let mut topics: Vec<String> = Vec::new();
+    for s in streams {
+        if !is_valid_topic(&s.collection) {
+            return Err(SourceError::Config(format!(
+                "`{}` is not a valid Kafka topic name",
+                s.collection
+            )));
+        }
+        if !topics.contains(&s.collection) {
+            topics.push(s.collection.clone());
+        }
+    }
+    if topics.is_empty() {
+        return Err(SourceError::Config(
+            "a kafka sync needs at least one topic mapping".to_owned(),
+        ));
+    }
+    topics.sort();
+    Ok(KafkaSource::new(sync_id, config, topics))
+}
+
+fn is_valid_topic(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 249
+        && name != "."
+        && name != ".."
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn mapping(collection: &str) -> StreamMapping {
+        serde_json::from_value(json!({"collection": collection, "index": "idx"})).unwrap()
+    }
+
+    fn spec(config: serde_json::Value) -> SourceSpec {
+        SourceSpec {
+            kind: SourceKind::Kafka,
+            config,
+        }
+    }
+
+    #[test]
+    fn builds_with_deduplicated_topics() {
+        let s = build_source(
+            "s1",
+            &spec(json!({"bootstrap_servers": ["b:9092"]})),
+            &[mapping("b"), mapping("a"), mapping("b")],
+        )
+        .unwrap();
+        assert_eq!(s.topics(), ["a", "b"]);
+        let caps = s.capabilities();
+        assert!(!caps.snapshot && !caps.patches);
+        assert_eq!(s.skipped_records(), 0);
+    }
+
+    #[test]
+    fn rejects_wrong_kind_bad_topics_and_no_mapping() {
+        let ok = json!({"bootstrap_servers": ["b:9092"]});
+        let wrong = SourceSpec {
+            kind: SourceKind::Postgres,
+            config: ok.clone(),
+        };
+        assert!(matches!(
+            KafkaSourceFactory.build("s", &wrong, &[mapping("a")]),
+            Err(SourceError::Config(_))
+        ));
+        assert!(matches!(
+            KafkaSourceFactory.build("s", &spec(ok.clone()), &[mapping("public.users x")]),
+            Err(SourceError::Config(_))
+        ));
+        assert!(matches!(
+            KafkaSourceFactory.build("s", &spec(ok), &[]),
+            Err(SourceError::Config(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn stream_before_open_is_fatal() {
+        let mut s = KafkaSourceFactory
+            .build(
+                "s",
+                &spec(json!({"bootstrap_servers": ["b:9092"]})),
+                &[mapping("a")],
+            )
+            .unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let (_ack_tx, ack_rx) = meili_connect_core::ack_channel();
+        let r = s
+            .stream(tx, ack_rx, tokio_util::sync::CancellationToken::new())
+            .await;
+        assert!(matches!(r, Err(SourceError::Fatal(_))));
+    }
+}
