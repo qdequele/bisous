@@ -175,6 +175,7 @@ impl Config {
             }
         }
 
+        let shutdown_grace = secs(&get, "SHUTDOWN_GRACE_SECS", 30, 1, 600)?;
         Ok(Self {
             listen_addr,
             database_url,
@@ -189,8 +190,9 @@ impl Config {
             usage_flush_interval: secs(&get, "USAGE_FLUSH_INTERVAL_SECS", 60, 1, 3600)?,
             lab_send_interval: secs(&get, "LAB_SEND_INTERVAL_SECS", 2, 1, 300)?,
             source_probe_timeout: secs(&get, "SOURCE_PROBE_TIMEOUT_SECS", 30, 1, 600)?,
-            shutdown_grace: secs(&get, "SHUTDOWN_GRACE_SECS", 30, 1, 600)?,
+            shutdown_grace,
             limits: Limits {
+                stop_grace: shutdown_grace,
                 max_syncs_per_tenant: num(&get, "MAX_SYNCS_PER_TENANT", 20, 1, 1_000_000)?,
                 probe_concurrency: usize::try_from(num(&get, "PROBE_CONCURRENCY", 16, 1, 1024)?)
                     .unwrap_or(16),
@@ -491,6 +493,7 @@ mod tests {
                 request_timeout: Duration::from_secs(30),
                 dead_letters_max_per_sync: 100,
                 outbox_max_pending: 1000,
+                stop_grace: Duration::from_secs(30),
             }
         );
         assert_eq!(cfg(&[]).unwrap().limits, Limits::default());

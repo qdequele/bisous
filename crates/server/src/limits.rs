@@ -33,6 +33,9 @@ pub struct Limits {
     /// Unsent Lab events beyond which usage stays counted in memory instead
     /// of being enqueued (`LAB_OUTBOX_MAX_PENDING`).
     pub outbox_max_pending: u64,
+    /// Longest wait for one sync to stop on pause, update or delete
+    /// (`SHUTDOWN_GRACE_SECS`).
+    pub stop_grace: Duration,
 }
 
 impl Default for Limits {
@@ -44,6 +47,7 @@ impl Default for Limits {
             request_timeout: Duration::from_secs(180),
             dead_letters_max_per_sync: 10_000,
             outbox_max_pending: 100_000,
+            stop_grace: Duration::from_secs(30),
         }
     }
 }

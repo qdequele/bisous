@@ -69,6 +69,10 @@ All notable changes to meili-connect are listed here. The format follows
   the whole scope: it is listed (and returned by `GET /syncs/{id}`) flagged
   `unreadable`, refuses changes with `409 sync_unreadable`, and can be
   deleted with `?force=true`.
+- Stopping one sync (update, pause, delete) waits at most
+  `SHUTDOWN_GRACE_SECS` while holding its lock; a sync that does not stop is
+  abandoned (it is already cancelled) instead of blocking every later call on
+  it.
 - `POST /syncs` is all or nothing: a sync that cannot be started is removed
   again and the error returned, instead of being kept and started
   unannounced at the next boot.

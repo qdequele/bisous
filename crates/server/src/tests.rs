@@ -169,6 +169,10 @@ impl Source for FakeSource {
         _acks: AckReceiver,
         cancel: CancellationToken,
     ) -> Result<(), SourceError> {
+        if self.config.get("stubborn").is_some() {
+            // Ignores cancellation: only an abort stops it.
+            std::future::pending::<()>().await;
+        }
         cancel.cancelled().await;
         Ok(())
     }
@@ -1302,6 +1306,47 @@ async fn dead_letters_overflow_is_reported() {
     )
     .await;
     assert_eq!(page["items"].as_array().unwrap().len(), 2);
+}
+
+// ------------------------------------------------------------- stopping
+
+/// A sync that does not stop holds its lock at most the grace period:
+/// update, pause and delete answer instead of waiting for it.
+#[tokio::test]
+async fn a_sync_that_does_not_stop_is_abandoned_after_the_grace() {
+    let a = app_limits(
+        AuthConfig::open(),
+        Limits {
+            stop_grace: Duration::from_millis(200),
+            ..Limits::default()
+        },
+        Duration::from_millis(200),
+    );
+    let mut body = sync_body("s");
+    body["source"]["config"]["stubborn"] = json!(true);
+    let (_, created) = call(&a.router, "POST", "/syncs", &[], Some(body)).await;
+    let id = created["id"].as_str().unwrap().to_owned();
+    streaming(&a, &id).await;
+    let (_, mut current) = call(&a.router, "GET", &format!("/syncs/{id}"), &[], None).await;
+    current["name"] = json!("renamed");
+    for (method, uri, body) in [
+        ("PUT", format!("/syncs/{id}"), Some(current)),
+        ("POST", format!("/syncs/{id}/pause"), None),
+    ] {
+        streaming(&a, &id).await;
+        let started = std::time::Instant::now();
+        let (status, resp) = call(&a.router, method, &uri, &[], body).await;
+        assert_eq!(status, StatusCode::OK, "{method} {uri}: {resp}");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{method} {uri} took {:?}",
+            started.elapsed()
+        );
+        if method == "POST" {
+            assert_eq!(resp["phase"], "paused");
+        }
+        call(&a.router, "POST", &format!("/syncs/{id}/resume"), &[], None).await;
+    }
 }
 
 // ------------------------------------------------------------- unreadable rows

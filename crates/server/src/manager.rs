@@ -84,6 +84,8 @@ pub struct ManagerDeps {
     pub lab_events: bool,
     /// Syncs one tenant may own.
     pub max_syncs_per_tenant: u64,
+    /// Longest wait for one sync to stop.
+    pub stop_grace: Duration,
     pub cancel: CancellationToken,
 }
 
@@ -98,6 +100,7 @@ pub struct SyncManager {
     meter: Arc<UsageMeter>,
     lab_events: bool,
     max_syncs_per_tenant: u64,
+    stop_grace: Duration,
     /// Time limit of a teardown run outside a supervisor.
     teardown_timeout: Duration,
     supervisors: Mutex<HashMap<String, Arc<Supervisor>>>,
@@ -121,6 +124,7 @@ impl SyncManager {
             meter: deps.meter,
             lab_events: deps.lab_events,
             max_syncs_per_tenant: deps.max_syncs_per_tenant,
+            stop_grace: deps.stop_grace,
             teardown_timeout: Duration::from_secs(60),
             supervisors: Mutex::new(HashMap::new()),
             ops: Mutex::new(HashMap::new()),
@@ -194,10 +198,25 @@ impl SyncManager {
     }
 
     /// Stop the sync's current supervisor, if any, leaving its phase.
+    ///
+    /// Bounded by `stop_grace`: the per-sync lock is held meanwhile, so a
+    /// sync that does not stop must not block every later call on it. Past
+    /// the grace the wait is aborted and the old loop abandoned: it is
+    /// cancelled already and ends at its next await point (the engine aborts
+    /// a source that does not stop within its own grace).
     async fn retire(&self, sync_id: &str) {
         let old = lock(&self.supervisors).remove(sync_id);
         if let Some(old) = old {
-            old.shutdown().await;
+            let wait = tokio::spawn(async move { old.shutdown().await });
+            let abort = wait.abort_handle();
+            if tokio::time::timeout(self.stop_grace, wait).await.is_err() {
+                abort.abort();
+                warn!(
+                    sync_id,
+                    grace = ?self.stop_grace,
+                    "the sync did not stop within the grace period; it is abandoned"
+                );
+            }
         }
     }
 
@@ -411,9 +430,11 @@ impl SyncManager {
         let _op = self.serialize(id).await;
         self.row(tenant, id).await?;
         if let Some(sup) = self.supervisor(id) {
-            match sup.stop(id).await {
-                Ok(()) | Err(SupervisorError::NotFound(_)) => {}
-                Err(e) => return Err(e.into()),
+            match tokio::time::timeout(self.stop_grace, sup.stop(id)).await {
+                Ok(Ok(())) | Ok(Err(SupervisorError::NotFound(_))) => {}
+                Ok(Err(e)) => return Err(e.into()),
+                // Did not stop in time: abandon it (bounded as well).
+                Err(_) => self.retire(id).await,
             }
         }
         persist_phase(&*self.store, id, SyncPhase::Paused, None).await?;

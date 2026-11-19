@@ -103,6 +103,7 @@ pub fn build_state(
         meter,
         lab_events: wiring.lab_events,
         max_syncs_per_tenant: wiring.limits.max_syncs_per_tenant,
+        stop_grace: wiring.limits.stop_grace,
         cancel,
     }));
     AppState {
