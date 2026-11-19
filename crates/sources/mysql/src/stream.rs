@@ -29,6 +29,8 @@ const QUIET_CHECKPOINT_EVERY: Duration = Duration::from_secs(1);
 const SHORT_RETENTION_SECS: u64 = 3 * 24 * 3600;
 
 const HEARTBEAT_LOG_EVENT_V2: u8 = 0x29;
+/// MariaDB's GTID event: starts every MariaDB binlog group.
+const MARIADB_GTID_EVENT: u8 = 0xa2;
 
 pub(crate) async fn check(src: &mut MysqlSource) -> Result<CheckReport, SourceError> {
     let mut report = CheckReport::default();
@@ -274,13 +276,42 @@ async fn check_privileges(conn: &mut Conn, report: &mut CheckReport) -> Result<(
 }
 
 /// Mutable state of one `stream` call.
+///
+/// A binlog *group* is everything logged under one GTID (or anonymous
+/// GTID). A position enters the checkpoint only once its group has been
+/// completely emitted:
+///
+/// - at `XID` or `Query(COMMIT)` for a `BEGIN … COMMIT` transaction;
+/// - at `XA_PREPARE_LOG_EVENT` for an `XA START … XA END` group (see
+///   below);
+/// - for a group made of queries outside any transaction (DDL, `GRANT`,
+///   `XA COMMIT 'x'`…), when something proves the group ended: the next
+///   GTID or anonymous GTID, a rotate, or a server heartbeat (sent only
+///   when the server has nothing left to send). A single query is not
+///   proof: atomic `CREATE TABLE … SELECT` can log its rows after the DDL
+///   under the same GTID.
+///
+/// XA transactions: the rows are logged at `XA PREPARE`, but the outcome
+/// (`XA COMMIT` or `XA ROLLBACK`) comes later, in another group, possibly
+/// never. Applying the rows at prepare would index data that may be rolled
+/// back; holding them until the outcome would buffer without bound. So an
+/// XA transaction that touches a mapped table fails the stream with
+/// `SourceError::Config`; one that touches only unmapped tables is skipped
+/// and its GTID checkpointed at its prepare. The later `XA COMMIT` /
+/// `XA ROLLBACK` is a lone-query group like any other.
 struct StreamState {
     position: Position,
     /// Last position handed to the engine.
     emitted: Position,
     last_emit: Instant,
     pending_gtid: Option<(String, Option<String>, u64)>,
+    /// Inside `BEGIN …` or `XA START …`.
     in_txn: bool,
+    /// Inside `XA START … XA_PREPARE`.
+    in_xa: bool,
+    /// The current group logged a query outside a transaction; it ends at
+    /// the next proof of a group boundary.
+    lone: bool,
     txn_had_changes: bool,
     file: String,
     offset: u64,
@@ -290,8 +321,32 @@ struct StreamState {
     by_id: HashMap<u64, Option<BinlogTable>>,
 }
 
+/// "A group was committed: emit a checkpoint (forced when the group
+/// carried changes)."
+type Closed = Option<bool>;
+
 impl StreamState {
-    fn commit(&mut self) {
+    fn new(start: Position, mapped: HashSet<(String, String)>) -> Self {
+        Self {
+            emitted: start.clone(),
+            position: start,
+            last_emit: Instant::now(),
+            pending_gtid: None,
+            in_txn: false,
+            in_xa: false,
+            lone: false,
+            txn_had_changes: false,
+            file: String::new(),
+            offset: 0,
+            mapped,
+            schemas: HashMap::new(),
+            by_id: HashMap::new(),
+        }
+    }
+
+    /// Adds the current group to the position; `offset` is the end of its
+    /// last event (file positions).
+    fn commit(&mut self, offset: u64) -> Closed {
         if let Some((uuid, tag, gno)) = self.pending_gtid.take()
             && let Position::Gtid(set) = &mut self.position
         {
@@ -301,9 +356,101 @@ impl StreamState {
             && !self.file.is_empty()
         {
             file.clone_from(&self.file);
-            *pos = self.offset;
+            *pos = offset;
         }
         self.in_txn = false;
+        self.in_xa = false;
+        self.lone = false;
+        Some(std::mem::take(&mut self.txn_had_changes))
+    }
+
+    /// The previous group ended (`prev_offset`: the end of its last event).
+    fn close_lone(&mut self, prev_offset: u64) -> Closed {
+        if self.lone && !self.in_txn {
+            self.commit(prev_offset)
+        } else {
+            None
+        }
+    }
+
+    /// GTID, anonymous GTID or MariaDB GTID: a new group starts.
+    fn group_start(
+        &mut self,
+        gtid: Option<(String, Option<String>, u64)>,
+        prev_offset: u64,
+    ) -> Closed {
+        let closed = self.close_lone(prev_offset);
+        if self.in_txn {
+            // The previous group never ended. Leaving its GTID out of the
+            // checkpoint is safe: a resume replays it.
+            tracing::warn!("binlog group without an end; its position is not checkpointed");
+            self.in_txn = false;
+            self.in_xa = false;
+        }
+        self.pending_gtid = gtid;
+        self.lone = false;
+        self.txn_had_changes = false;
+        closed
+    }
+
+    fn query(&mut self, kind: &QueryKind) -> Closed {
+        match kind {
+            QueryKind::Begin => {
+                self.in_txn = true;
+                None
+            }
+            QueryKind::XaStart => {
+                self.in_txn = true;
+                self.in_xa = true;
+                None
+            }
+            QueryKind::Commit => self.commit(self.offset),
+            QueryKind::Ddl(_) | QueryKind::Other => {
+                if !self.in_txn {
+                    self.lone = true;
+                }
+                None
+            }
+        }
+    }
+
+    fn xid(&mut self) -> Closed {
+        self.commit(self.offset)
+    }
+
+    /// `XA_PREPARE_LOG_EVENT` (two-phase prepare or one-phase commit) ends
+    /// the `XA START` group. It only touched unmapped tables (a mapped one
+    /// fails the stream at its table map), so nothing is lost either way.
+    fn xa_prepare(&mut self) -> Closed {
+        self.commit(self.offset)
+    }
+
+    fn rotate(&mut self, file: String, pos: u64, prev_offset: u64) -> Closed {
+        let closed = self.close_lone(prev_offset);
+        self.file = file;
+        self.offset = pos;
+        if !self.in_txn
+            && let Position::File { .. } = self.position
+        {
+            self.commit(pos);
+        }
+        closed
+    }
+
+    fn heartbeat(&mut self, prev_offset: u64) -> Closed {
+        self.close_lone(prev_offset)
+    }
+
+    /// Refuses a mapped table inside an XA transaction (see the type docs).
+    fn check_xa(&self, key: &(String, String)) -> Result<(), SourceError> {
+        if self.in_xa && self.mapped.contains(key) {
+            return Err(SourceError::Config(format!(
+                "XA transactions on mapped tables are not supported: an XA transaction \
+                 wrote to `{}.{}`",
+                key.0, key.1
+            )));
+        }
+        Ok(())
     }
 
     /// The checkpoint to emit now, if any.
@@ -383,19 +530,8 @@ pub(crate) async fn run(
         "mysql binlog stream started"
     );
 
-    let mut st = StreamState {
-        emitted: start.clone(),
-        position: start,
-        last_emit: Instant::now(),
-        pending_gtid: None,
-        in_txn: false,
-        txn_had_changes: false,
-        file: String::new(),
-        offset: 0,
-        mapped: src.tables.iter().cloned().collect(),
-        schemas,
-        by_id: HashMap::new(),
-    };
+    let mut st = StreamState::new(start, src.tables.iter().cloned().collect());
+    st.schemas = schemas;
     let mut idle = tokio::time::interval(HEARTBEAT);
     idle.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -423,12 +559,25 @@ pub(crate) async fn run(
             Some(Ok(ev)) => ev,
         };
         let header = event.header();
+        // End of the previous event: where a group closed by this event
+        // ended.
+        let prev_offset = st.offset;
         if header.log_pos() != 0 {
             st.offset = u64::from(header.log_pos());
         }
         let raw_type = header.event_type_raw();
-        if raw_type == EventType::HEARTBEAT_EVENT as u8 || raw_type == HEARTBEAT_LOG_EVENT_V2 {
-            if let Some(p) = st.checkpoint_due(true)
+        let is_heartbeat =
+            raw_type == EventType::HEARTBEAT_EVENT as u8 || raw_type == HEARTBEAT_LOG_EVENT_V2;
+        if is_heartbeat || raw_type == MARIADB_GTID_EVENT {
+            let force = if is_heartbeat {
+                // The server is idle: whatever was pending ended.
+                st.heartbeat(prev_offset);
+                Some(true)
+            } else {
+                st.group_start(None, prev_offset)
+            };
+            if let Some(force) = force
+                && let Some(p) = st.checkpoint_due(force)
                 && !send(
                     &events,
                     &cancel,
@@ -464,79 +613,63 @@ pub(crate) async fn run(
         };
 
         let mut out: Vec<SourceEvent> = Vec::new();
-        let mut committed = false;
+        let mut closed: Closed = None;
         match data {
             EventData::RotateEvent(r) => {
-                st.file = r.name().into_owned();
-                st.offset = r.position();
-                if !st.in_txn
-                    && let Position::File { .. } = st.position
-                {
-                    st.commit();
-                }
+                closed = st.rotate(r.name().into_owned(), r.position(), prev_offset);
             }
             EventData::GtidEvent(g) => {
                 let uuid = uuid::Uuid::from_bytes(g.sid()).hyphenated().to_string();
                 let tag = g.tag().map(|t| t.as_str().to_owned());
-                st.pending_gtid = Some((uuid, tag, g.gno()));
-                st.txn_had_changes = false;
+                closed = st.group_start(Some((uuid, tag, g.gno())), prev_offset);
             }
+            EventData::AnonymousGtidEvent(_) => {
+                closed = st.group_start(None, prev_offset);
+            }
+            EventData::XaPrepareLogEvent(_) => closed = st.xa_prepare(),
             EventData::QueryEvent(q) => {
                 let schema = q.schema().into_owned();
-                match classify(&q.query(), &schema) {
-                    QueryKind::Begin => {
-                        st.in_txn = true;
-                        st.txn_had_changes = false;
-                    }
-                    QueryKind::Commit => committed = true,
-                    QueryKind::Ddl(ddl) => {
-                        for (db, table) in ddl.tables {
-                            let key = (db.clone(), table.clone());
-                            if !st.mapped.contains(&key) {
-                                continue;
-                            }
-                            let collection = format!("{db}.{table}");
-                            st.by_id.retain(|_, t| {
-                                t.as_ref().is_none_or(|t| t.collection != collection)
-                            });
-                            match ddl.kind {
-                                DdlKind::Truncate | DdlKind::Drop => {
-                                    out.push(SourceEvent::Truncate {
-                                        collection: collection.clone(),
-                                    });
-                                }
-                                DdlKind::Alter => {}
-                            }
-                            match load_table(&mut meta, &db, &table).await? {
-                                Some(s) => {
-                                    st.schemas.insert(key, s);
-                                }
-                                None => {
-                                    st.schemas.remove(&key);
-                                }
-                            }
-                            if ddl.kind == DdlKind::Alter {
-                                out.push(SourceEvent::SchemaChanged { collection });
-                            }
-                            st.txn_had_changes = true;
+                let kind = classify(&q.query(), &schema);
+                if let QueryKind::Ddl(ddl) = &kind {
+                    for (db, table) in &ddl.tables {
+                        let key = (db.clone(), table.clone());
+                        if !st.mapped.contains(&key) {
+                            continue;
                         }
-                        if !st.in_txn {
-                            committed = true;
+                        let collection = format!("{db}.{table}");
+                        st.by_id
+                            .retain(|_, t| t.as_ref().is_none_or(|t| t.collection != collection));
+                        match ddl.kind {
+                            DdlKind::Truncate | DdlKind::Drop => {
+                                out.push(SourceEvent::Truncate {
+                                    collection: collection.clone(),
+                                });
+                            }
+                            DdlKind::Alter => {}
                         }
-                    }
-                    QueryKind::Other => {
-                        if !st.in_txn {
-                            committed = true;
+                        match load_table(&mut meta, db, table).await? {
+                            Some(s) => {
+                                st.schemas.insert(key, s);
+                            }
+                            None => {
+                                st.schemas.remove(&key);
+                            }
                         }
+                        if ddl.kind == DdlKind::Alter {
+                            out.push(SourceEvent::SchemaChanged { collection });
+                        }
+                        st.txn_had_changes = true;
                     }
                 }
+                closed = st.query(&kind);
             }
-            EventData::XidEvent(_) => committed = true,
+            EventData::XidEvent(_) => closed = st.xid(),
             EventData::TableMapEvent(tme) => {
                 let key = (
                     tme.database_name().into_owned(),
                     tme.table_name().into_owned(),
                 );
+                st.check_xa(&key)?;
                 if !st.mapped.contains(&key) {
                     st.by_id.insert(tme.table_id(), None);
                 } else {
@@ -583,19 +716,16 @@ pub(crate) async fn run(
                 return Ok(());
             }
         }
-        if committed {
-            st.commit();
-            let force = std::mem::take(&mut st.txn_had_changes);
-            if let Some(p) = st.checkpoint_due(force)
-                && !send(
-                    &events,
-                    &cancel,
-                    SourceEvent::Checkpoint(p.to_checkpoint()?),
-                )
-                .await
-            {
-                return Ok(());
-            }
+        if let Some(force) = closed
+            && let Some(p) = st.checkpoint_due(force)
+            && !send(
+                &events,
+                &cancel,
+                SourceEvent::Checkpoint(p.to_checkpoint()?),
+            )
+            .await
+        {
+            return Ok(());
         }
     }
 }
@@ -670,42 +800,161 @@ mod tests {
     }
 
     fn state(position: Position) -> StreamState {
-        StreamState {
-            emitted: position.clone(),
-            position,
-            last_emit: Instant::now(),
-            pending_gtid: None,
-            in_txn: false,
-            txn_had_changes: false,
-            file: String::new(),
-            offset: 0,
-            mapped: HashSet::new(),
-            schemas: HashMap::new(),
-            by_id: HashMap::new(),
+        StreamState::new(position, HashSet::new())
+    }
+
+    const UUID: &str = "3e11fa47-71ca-11e1-9e33-c80aa9429562";
+
+    fn gtid(gno: u64) -> Option<(String, Option<String>, u64)> {
+        Some((UUID.into(), None, gno))
+    }
+
+    fn gtid_state() -> StreamState {
+        state(Position::Gtid(format!("{UUID}:1-7").parse().unwrap()))
+    }
+
+    fn set_of(st: &StreamState) -> String {
+        match &st.position {
+            Position::Gtid(set) => set.to_string(),
+            Position::File { .. } => panic!("gtid expected"),
         }
+    }
+
+    fn q(sql: &str) -> QueryKind {
+        classify(sql, "x")
     }
 
     #[test]
     fn gtid_commit_accumulates_and_checkpoints() {
-        let uuid = "3e11fa47-71ca-11e1-9e33-c80aa9429562";
-        let start: GtidSet = format!("{uuid}:1-5").parse().unwrap();
+        let start: GtidSet = format!("{UUID}:1-5").parse().unwrap();
         let mut st = state(Position::Gtid(start));
         assert_eq!(st.checkpoint_due(true), None, "nothing moved");
 
-        st.pending_gtid = Some((uuid.into(), None, 6));
-        st.in_txn = true;
+        st.group_start(gtid(6), 0);
+        st.query(&q("BEGIN"));
         assert_eq!(st.checkpoint_due(true), None, "inside a transaction");
-        st.commit();
+        assert_eq!(st.xid(), Some(false));
         let Some(Position::Gtid(set)) = st.checkpoint_due(true) else {
             panic!("expected a gtid checkpoint");
         };
-        assert_eq!(set.to_string(), format!("{uuid}:1-6"));
+        assert_eq!(set.to_string(), format!("{UUID}:1-6"));
 
         // Unforced checkpoints are throttled.
-        st.pending_gtid = Some((uuid.into(), None, 7));
-        st.commit();
+        st.group_start(gtid(7), 0);
+        st.query(&q("BEGIN"));
+        st.query(&q("COMMIT"));
         assert_eq!(st.checkpoint_due(false), None);
         assert!(st.checkpoint_due(true).is_some());
+    }
+
+    /// Observed on MySQL 8.4: GTID 8, Query(XA START), Table_map,
+    /// Write_rows, Query(XA END), XA_prepare; then GTID 9, Query(XA COMMIT).
+    #[test]
+    fn xa_group_is_checkpointed_at_prepare_not_at_xa_start() {
+        let mut st = gtid_state();
+        assert_eq!(st.group_start(gtid(8), 100), None);
+        assert_eq!(st.query(&q("XA START X'61',X'',1")), None);
+        assert_eq!(set_of(&st), format!("{UUID}:1-7"), "rows not emitted yet");
+        assert_eq!(st.query(&q("XA END X'61',X'',1")), None);
+        assert_eq!(set_of(&st), format!("{UUID}:1-7"));
+        assert_eq!(st.checkpoint_due(true), None);
+        assert!(st.xa_prepare().is_some());
+        assert_eq!(set_of(&st), format!("{UUID}:1-8"));
+        // XA COMMIT / XA ROLLBACK: a group of one query that ends itself.
+        assert_eq!(st.group_start(gtid(9), 200), None);
+        assert_eq!(st.query(&q("XA ROLLBACK X'61',X'',1")), Some(false));
+        assert_eq!(set_of(&st), format!("{UUID}:1-9"));
+    }
+
+    #[test]
+    fn mapped_tables_are_refused_inside_xa_only() {
+        let mut st = gtid_state();
+        st.mapped.insert(("shop".into(), "items".into()));
+        let mapped = ("shop".to_owned(), "items".to_owned());
+        let other = ("shop".to_owned(), "log".to_owned());
+        st.group_start(gtid(8), 0);
+        st.query(&q("BEGIN"));
+        assert!(st.check_xa(&mapped).is_ok());
+        st.xid();
+        st.group_start(gtid(9), 0);
+        st.query(&q("XA START 'a'"));
+        assert!(st.check_xa(&other).is_ok());
+        let err = st.check_xa(&mapped).unwrap_err();
+        assert!(
+            matches!(&err, SourceError::Config(m) if m.contains("XA transactions on mapped tables are not supported")),
+            "{err:?}"
+        );
+        // A prepare ends the XA group.
+        st.xa_prepare();
+        assert!(st.check_xa(&mapped).is_ok());
+    }
+
+    /// A DDL followed by rows under one GTID, without BEGIN: the GTID is
+    /// only checkpointed once the group has ended.
+    #[test]
+    fn lone_query_group_waits_for_the_next_group() {
+        let mut st = gtid_state();
+        st.group_start(gtid(8), 0);
+        assert_eq!(st.query(&q("CREATE TABLE x.u (id INT PRIMARY KEY)")), None);
+        assert_eq!(set_of(&st), format!("{UUID}:1-7"), "rows may still follow");
+        assert_eq!(st.checkpoint_due(true), None);
+        assert_eq!(st.group_start(gtid(9), 0), Some(false));
+        assert_eq!(set_of(&st), format!("{UUID}:1-8"));
+        assert!(st.checkpoint_due(true).is_some());
+
+        // A heartbeat (the server is idle) or a rotate also proves the end.
+        st.query(&q("CREATE USER u"));
+        assert_eq!(set_of(&st), format!("{UUID}:1-8"));
+        assert_eq!(st.heartbeat(0), Some(false));
+        assert_eq!(set_of(&st), format!("{UUID}:1-9"));
+        st.group_start(gtid(10), 0);
+        st.query(&q("DROP TABLE x.u"));
+        assert_eq!(set_of(&st), format!("{UUID}:1-9"));
+        st.rotate("binlog.000009".into(), 4, 0);
+        assert_eq!(set_of(&st), format!("{UUID}:1-10"));
+        // An anonymous GTID too.
+        st.group_start(gtid(11), 0);
+        st.query(&q("GRANT SELECT ON x.* TO u"));
+        st.group_start(None, 0);
+        assert_eq!(set_of(&st), format!("{UUID}:1-11"));
+    }
+
+    #[test]
+    fn create_select_as_logged_by_mysql_8_4() {
+        // GTID, BEGIN, Query(CREATE TABLE … START TRANSACTION), Table_map,
+        // Write_rows, Xid.
+        let mut st = gtid_state();
+        st.group_start(gtid(8), 0);
+        st.query(&q("BEGIN"));
+        st.query(&q(
+            "CREATE TABLE `x`.`u` (`id` int NOT NULL) START TRANSACTION",
+        ));
+        assert_eq!(set_of(&st), format!("{UUID}:1-7"));
+        st.txn_had_changes = true;
+        assert_eq!(st.xid(), Some(true));
+        assert_eq!(set_of(&st), format!("{UUID}:1-8"));
+    }
+
+    #[test]
+    fn file_position_of_a_lone_group_is_the_end_of_its_last_event() {
+        let mut st = state(Position::File {
+            file: "binlog.000001".into(),
+            pos: 4,
+        });
+        st.file = "binlog.000001".into();
+        st.group_start(None, 200);
+        st.offset = 400;
+        st.query(&q("ALTER TABLE t ADD c INT"));
+        // The next anonymous GTID event ends at 470.
+        st.offset = 470;
+        st.group_start(None, 400);
+        assert_eq!(
+            st.position,
+            Position::File {
+                file: "binlog.000001".into(),
+                pos: 400
+            }
+        );
     }
 
     #[test]
@@ -716,7 +965,7 @@ mod tests {
         });
         st.file = "binlog.000002".into();
         st.offset = 900;
-        st.commit();
+        st.xid();
         assert_eq!(
             st.checkpoint_due(true),
             Some(Position::File {

@@ -22,6 +22,9 @@ pub struct Ddl {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QueryKind {
     Begin,
+    /// `XA START` / `XA BEGIN`: an XA transaction begins. It ends with an
+    /// `XA_PREPARE_LOG_EVENT` (two-phase or one-phase), not with a `COMMIT`.
+    XaStart,
     /// `COMMIT` / `ROLLBACK` / `XA COMMIT`: transaction end.
     Commit,
     Ddl(Ddl),
@@ -46,6 +49,7 @@ pub fn classify(query: &str, default_db: &str) -> QueryKind {
                 QueryKind::Commit
             }
         }
+        "XA" if matches!(upper(1).as_deref(), Some("START" | "BEGIN")) => QueryKind::XaStart,
         "XA" if matches!(upper(1).as_deref(), Some("COMMIT" | "ROLLBACK")) => QueryKind::Commit,
         "TRUNCATE" => {
             let mut i = 1;
@@ -290,6 +294,11 @@ mod tests {
         assert_eq!(classify("ROLLBACK", "x"), QueryKind::Commit);
         assert_eq!(classify("ROLLBACK TO SAVEPOINT a", "x"), QueryKind::Other);
         assert_eq!(classify("XA COMMIT 'x'", "x"), QueryKind::Commit);
+        assert_eq!(classify("XA ROLLBACK X'62',X'',1", "x"), QueryKind::Commit);
+        // As the binlog writes them (MySQL 8.4).
+        assert_eq!(classify("XA START X'61',X'',1", "x"), QueryKind::XaStart);
+        assert_eq!(classify("xa begin 'a'", "x"), QueryKind::XaStart);
+        assert_eq!(classify("XA END X'61',X'',1", "x"), QueryKind::Other);
         assert_eq!(classify("SAVEPOINT a", "x"), QueryKind::Other);
         assert_eq!(classify("", "x"), QueryKind::Other);
     }

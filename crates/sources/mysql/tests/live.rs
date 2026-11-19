@@ -19,7 +19,7 @@ use meili_connect_core::{
     Checkpoint, Op, Opened, Source, SourceError, SourceEvent, SourceKind, SourceSpec,
     StreamMapping, ack_channel,
 };
-use meili_connect_source_mysql::MysqlSource;
+use meili_connect_source_mysql::{GtidSet, MysqlSource};
 use mysql_async::prelude::Queryable;
 use mysql_async::{Conn, Opts};
 use serde_json::{Value, json};
@@ -679,4 +679,161 @@ async fn snapshot_honours_cancellation() {
         .expect("snapshot did not honour cancellation")
         .unwrap();
     assert!(res.is_ok(), "{res:?}");
+}
+
+/// The GTID set of a checkpoint (GTID mode only).
+fn gtid_set(cp: &Checkpoint) -> GtidSet {
+    cp.0["gtid_set"].as_str().unwrap().parse().unwrap()
+}
+
+async fn gtid_executed(conn: &mut Conn) -> GtidSet {
+    let s: String = conn
+        .query_first("SELECT @@GLOBAL.gtid_executed")
+        .await
+        .unwrap()
+        .unwrap();
+    s.replace(['\n', ' '], "").parse().unwrap()
+}
+
+/// MySQL 8.4 logs an XA transaction as two groups:
+/// `GTID n, Query(XA START), Table_map, Rows, Query(XA END), XA_prepare`
+/// then `GTID n+1, Query(XA COMMIT | XA ROLLBACK)`; `XA COMMIT … ONE PHASE`
+/// is one group ending in an `XA_prepare` event with the one-phase flag.
+/// XA on unmapped tables is skipped with its position checkpointed; XA on
+/// a mapped table stops the stream with a configuration error before any
+/// of its rows are emitted.
+#[tokio::test]
+async fn xa_transactions() {
+    let Some(url) = url() else { return };
+    let _g = SERIAL.lock().await;
+    let mut conn = admin(&url).await;
+    if !gtid_on(&mut conn).await {
+        eprintln!("gtid_mode is not ON: skipping");
+        return;
+    }
+    fresh_db(&mut conn, "mc_xa").await;
+    conn.query_drop("CREATE TABLE mc_xa.items (id INT PRIMARY KEY, v VARCHAR(10))")
+        .await
+        .unwrap();
+    conn.query_drop("CREATE TABLE mc_xa.other (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    let mut src = source(&url, "mc_xa", &["items"], "xa-sync");
+    src.open(None).await.unwrap();
+    let mut run = Running::start(src);
+
+    for sql in [
+        "XA START 'a'; INSERT INTO mc_xa.other VALUES (1); XA END 'a'; XA PREPARE 'a'; XA COMMIT 'a'",
+        "XA START 'b'; INSERT INTO mc_xa.other VALUES (2); XA END 'b'; XA PREPARE 'b'; XA ROLLBACK 'b'",
+        "XA START 'c'; INSERT INTO mc_xa.other VALUES (3); XA END 'c'; XA COMMIT 'c' ONE PHASE",
+        "INSERT INTO mc_xa.items VALUES (1, 'plain')",
+    ] {
+        conn.query_drop(sql).await.unwrap();
+    }
+    let executed = gtid_executed(&mut conn).await;
+    let evs = run
+        .until(|e| matches!(e, SourceEvent::Checkpoint(c) if gtid_set(c) == executed))
+        .await;
+    let changes: Vec<_> = evs
+        .iter()
+        .filter_map(|e| match e {
+            SourceEvent::Change(c) => Some((c.collection.clone(), c.key.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        changes,
+        vec![("mc_xa.items".to_owned(), vec![json!(1)])],
+        "unmapped XA transactions are skipped"
+    );
+
+    // XA on a mapped table: refused before its rows are emitted, and its
+    // GTID never reaches a checkpoint.
+    let before = gtid_executed(&mut conn).await;
+    conn.query_drop(
+        "XA START 'd'; INSERT INTO mc_xa.items VALUES (2, 'xa'); XA END 'd'; XA PREPARE 'd'",
+    )
+    .await
+    .unwrap();
+    let rest = tokio::time::timeout(Duration::from_secs(30), async {
+        let mut seen = Vec::new();
+        while let Some(ev) = run.rx.recv().await {
+            seen.push(ev);
+        }
+        seen
+    })
+    .await
+    .expect("the stream did not stop");
+    for ev in &rest {
+        match ev {
+            SourceEvent::Change(c) => panic!("XA row emitted: {c:?}"),
+            SourceEvent::Checkpoint(c) => assert!(before.contains_set(&gtid_set(c))),
+            _ => {}
+        }
+    }
+    let err = run.task.await.unwrap().unwrap_err();
+    assert!(
+        matches!(&err, SourceError::Config(m) if m.contains("XA transactions on mapped tables are not supported")),
+        "{err:?}"
+    );
+    conn.query_drop("XA ROLLBACK 'd'").await.unwrap();
+}
+
+/// MySQL 8.4 logs `CREATE TABLE … SELECT` as one group:
+/// `GTID, Query(BEGIN), Query(CREATE TABLE … START TRANSACTION),
+/// Table_map, Write_rows, Xid`. Its rows are emitted before any checkpoint
+/// that covers its GTID.
+#[tokio::test]
+async fn create_table_select_rows_precede_its_checkpoint() {
+    let Some(url) = url() else { return };
+    let _g = SERIAL.lock().await;
+    let mut conn = admin(&url).await;
+    if !gtid_on(&mut conn).await {
+        eprintln!("gtid_mode is not ON: skipping");
+        return;
+    }
+    fresh_db(&mut conn, "mc_cts").await;
+    conn.query_drop("CREATE TABLE mc_cts.src (id INT PRIMARY KEY, v VARCHAR(10))")
+        .await
+        .unwrap();
+    conn.query_drop("INSERT INTO mc_cts.src VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+        .await
+        .unwrap();
+    conn.query_drop("CREATE TABLE mc_cts.copy (id INT PRIMARY KEY, v VARCHAR(10))")
+        .await
+        .unwrap();
+    let mut src = source(&url, "mc_cts", &["copy"], "cts-sync");
+    src.open(None).await.unwrap();
+    let mut run = Running::start(src);
+    conn.query_drop("DROP TABLE mc_cts.copy").await.unwrap();
+    conn.query_drop("CREATE TABLE mc_cts.copy (PRIMARY KEY (id)) SELECT id, v FROM mc_cts.src")
+        .await
+        .unwrap();
+    let executed = gtid_executed(&mut conn).await;
+    let evs = run
+        .until(|e| matches!(e, SourceEvent::Checkpoint(c) if gtid_set(c) == executed))
+        .await;
+    run.stop().await;
+    let last_row = evs
+        .iter()
+        .rposition(|e| matches!(e, SourceEvent::Change(_)))
+        .expect("rows of CREATE … SELECT");
+    let first_covering = evs
+        .iter()
+        .position(|e| matches!(e, SourceEvent::Checkpoint(c) if gtid_set(c) == executed))
+        .unwrap();
+    assert!(first_covering > last_row, "{evs:#?}");
+    let keys: Vec<_> = evs
+        .iter()
+        .filter_map(|e| match e {
+            SourceEvent::Change(c) if matches!(c.op, Op::Upsert { .. }) => Some(c.key.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(keys, vec![vec![json!(1)], vec![json!(2)], vec![json!(3)]]);
+    assert!(
+        evs.iter().any(
+            |e| matches!(e, SourceEvent::Truncate { collection } if collection == "mc_cts.copy")
+        )
+    );
 }
