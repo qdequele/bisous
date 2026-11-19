@@ -114,7 +114,8 @@ jobs:
           cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
       - name: Smoke test
         run: |
-          docker run -d --name smoke -p 8080:8080 meili-connect:ci
+          # No auth is configured here, so the server only starts with the explicit opt-in.
+          docker run -d --name smoke -p 8080:8080 -e ALLOW_OPEN_MODE=true meili-connect:ci
           for _ in $(seq 1 30); do
             if curl -sf localhost:8080/health; then docker rm -f smoke; exit 0; fi
             sleep 1
