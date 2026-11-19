@@ -286,6 +286,7 @@ name = "meili-connect-engine"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "chrono",
  "meili-connect-core",
  "serde",
  "serde_json",
