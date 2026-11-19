@@ -136,9 +136,13 @@ pub(crate) struct ServerInfo {
 }
 
 pub(crate) async fn global_var(conn: &mut Conn, name: &str) -> Result<Option<String>, SourceError> {
-    // SHOW VARIABLES never fails on an unknown name (MariaDB lacks some).
+    // SHOW VARIABLES never fails on an unknown name (MariaDB lacks some),
+    // but it cannot be prepared: `name` is always one of our constants.
+    if !name.bytes().all(|b| b.is_ascii_lowercase() || b == b'_') {
+        return Err(SourceError::Fatal(format!("bad variable name {name}")));
+    }
     let row: Option<(String, Option<String>)> = conn
-        .exec_first("SHOW GLOBAL VARIABLES LIKE ?", (name,))
+        .query_first(format!("SHOW GLOBAL VARIABLES LIKE '{name}'"))
         .await
         .map_err(map_err)?;
     Ok(row.and_then(|(_, v)| v))
