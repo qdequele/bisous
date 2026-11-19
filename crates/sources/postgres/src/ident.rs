@@ -77,10 +77,18 @@ pub fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
-/// `'literal'` with embedded quotes doubled. Only used for values we built
-/// or validated (names, LSNs): user data always goes through parameters.
+/// `'literal'` with embedded quotes doubled, or `E'...'` with backslashes
+/// doubled too when there are any, so the result reads the same whatever
+/// `standard_conforming_strings` is. Only used for values we built or
+/// validated (names, LSNs, markers): user data always goes through
+/// parameters.
 pub fn quote_literal(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
+    let quoted = value.replace('\'', "''");
+    if value.contains('\\') {
+        format!("E'{}'", quoted.replace('\\', "\\\\"))
+    } else {
+        format!("'{quoted}'")
+    }
 }
 
 /// `schema.table` → (`schema`, `table`). A name without a dot is in
@@ -142,6 +150,7 @@ mod tests {
     fn quoting() {
         assert_eq!(quote_ident("a\"b"), "\"a\"\"b\"");
         assert_eq!(quote_literal("it's"), "'it''s'");
+        assert_eq!(quote_literal("a\\'b"), "E'a\\\\''b'");
         assert_eq!(qualified("public", "t"), "\"public\".\"t\"");
         assert_eq!(split_collection("s.t.u"), ("s", "t.u"));
         assert_eq!(split_collection("t"), ("public", "t"));

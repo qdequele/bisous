@@ -187,6 +187,28 @@ impl PostgresSource {
         Ok(found)
     }
 
+    /// What exists under our slot and publication names, and whether each
+    /// is ours. A publication is ours when its comment is our marker. A slot
+    /// is ours when it is a pgoutput slot of this database and either has
+    /// the name derived from the sync id or is paired with a publication of
+    /// ours.
+    pub(crate) async fn ownership(&mut self) -> Result<Ownership, SourceError> {
+        self.connect().await?;
+        let sql = self.db()?;
+        let marker = catalog::marker(&self.settings.sync_id);
+        let publication = catalog::publication_comment(sql, &self.settings.publication)
+            .await?
+            .map(|comment| comment.as_deref() == Some(marker.as_str()));
+        let slot = catalog::slot(sql, &self.settings.slot).await?.map(|slot| {
+            let ours = slot.plugin.as_deref() == Some("pgoutput")
+                && slot.database.as_deref() == Some(self.settings.conn.database.as_str())
+                && (self.settings.slot == ident::default_name(&self.settings.sync_id)
+                    || publication == Some(true));
+            (slot, ours)
+        });
+        Ok(Ownership { publication, slot })
+    }
+
     async fn warm_types(&mut self, tables: &[TableInfo]) -> Result<(), SourceError> {
         let oids: Vec<u32> = tables
             .iter()
@@ -257,15 +279,20 @@ impl PostgresSource {
         self.connect().await?;
         let version = self.version;
         let supabase = self.supabase();
+        let marker = catalog::marker(&self.settings.sync_id);
+        // Never adopt what another sync or another tool owns: check both
+        // names before creating or changing anything.
+        let owned = self.ownership().await?;
+        owned.refuse_foreign(&self.settings)?;
         let sql = self.db()?;
 
         // The publication must exist before the slot's start point, or
         // decoding fails on changes it cannot see the publication for.
-        catalog::ensure_publication(sql, version, &publication, &list).await?;
+        catalog::ensure_publication(sql, &publication, &marker, &list).await?;
 
         // A slot left by an interrupted first sync: its exported snapshot is
         // gone, so start over with a new one.
-        if let Some(existing) = catalog::slot(sql, &slot_name).await? {
+        if let Some((existing, _)) = owned.slot {
             if let Some(pid) = existing.active_pid {
                 return Err(SourceError::Transient(format!(
                     "replication slot {slot_name} is in use by process {pid}"
@@ -435,6 +462,46 @@ impl PostgresSource {
         }
         sql.simple("COMMIT").await?;
         Ok(true)
+    }
+}
+
+/// See [`PostgresSource::ownership`]. `None`: nothing by that name.
+pub(crate) struct Ownership {
+    pub(crate) publication: Option<bool>,
+    pub(crate) slot: Option<(catalog::SlotInfo, bool)>,
+}
+
+impl Ownership {
+    /// A Config error naming the first object that exists without being
+    /// ours.
+    pub(crate) fn refuse_foreign(&self, settings: &Settings) -> Result<(), SourceError> {
+        if let Some(message) = self.foreign_publication(settings) {
+            return Err(SourceError::Config(message));
+        }
+        if let Some(message) = self.foreign_slot(settings) {
+            return Err(SourceError::Config(message));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn foreign_publication(&self, settings: &Settings) -> Option<String> {
+        (self.publication == Some(false)).then(|| {
+            format!(
+                "publication {} already exists and was not created by this sync: the name is \
+                 taken, pick another publication_name (it is never changed or dropped)",
+                settings.publication
+            )
+        })
+    }
+
+    pub(crate) fn foreign_slot(&self, settings: &Settings) -> Option<String> {
+        matches!(self.slot, Some((_, false))).then(|| {
+            format!(
+                "replication slot {} already exists and was not created by this sync: the name \
+                 is taken, pick another slot_name (it is never reused or dropped)",
+                settings.slot
+            )
+        })
     }
 }
 
@@ -652,8 +719,20 @@ impl Source for PostgresSource {
         let slot_name = self.settings.slot.clone();
         let publication = self.settings.publication.clone();
         self.connect().await?;
+        let owned = self.ownership().await?;
         let sql = self.db()?;
+        let drop_slot = match &owned.slot {
+            Some((_, true)) => true,
+            Some((_, false)) => {
+                tracing::warn!(slot = %slot_name, "replication slot not created by this sync: left alone");
+                false
+            }
+            None => false,
+        };
         for _ in 0..TEARDOWN_ATTEMPTS {
+            if !drop_slot {
+                break;
+            }
             let Some(slot) = catalog::slot(sql, &slot_name).await? else {
                 break;
             };
@@ -685,7 +764,7 @@ impl Source for PostgresSource {
         }
         // Only report success for what is actually gone, and keep the
         // publication while the slot lives: the slot still decodes with it.
-        if let Some(slot) = catalog::slot(sql, &slot_name).await? {
+        if drop_slot && let Some(slot) = catalog::slot(sql, &slot_name).await? {
             return Err(SourceError::Transient(format!(
                 "replication slot {slot_name} could not be dropped: it is still in use{}",
                 slot.active_pid
@@ -693,11 +772,19 @@ impl Source for PostgresSource {
                     .unwrap_or_default()
             )));
         }
-        sql.simple(&format!(
-            "DROP PUBLICATION IF EXISTS {}",
-            ident::quote_ident(&publication)
-        ))
-        .await?;
+        match owned.publication {
+            Some(true) => {
+                sql.simple(&format!(
+                    "DROP PUBLICATION IF EXISTS {}",
+                    ident::quote_ident(&publication)
+                ))
+                .await?;
+            }
+            Some(false) => {
+                tracing::warn!(%publication, "publication not created by this sync: left alone");
+            }
+            None => {}
+        }
         tracing::info!(slot = %slot_name, %publication, "dropped replication slot and publication");
         Ok(())
     }

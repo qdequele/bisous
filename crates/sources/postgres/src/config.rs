@@ -85,6 +85,8 @@ pub struct Settings {
     pub conn: ConnParams,
     pub slot: String,
     pub publication: String,
+    /// The sync these objects belong to: their ownership marker.
+    pub sync_id: String,
 }
 
 impl PostgresConfig {
@@ -183,6 +185,7 @@ impl PostgresConfig {
             },
             slot,
             publication,
+            sync_id: sync_id.to_owned(),
         })
     }
 }

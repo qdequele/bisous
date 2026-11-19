@@ -56,9 +56,18 @@ async fn admin(url: &str) -> tokio_postgres::Client {
 }
 
 fn source(url: &str, sync_id: &str, tables: &[&str]) -> Box<dyn Source> {
+    source_with(url, sync_id, tables, json!({}))
+}
+
+/// `extra` is merged into the config (`slot_name`, `publication_name`).
+fn source_with(url: &str, sync_id: &str, tables: &[&str], extra: Value) -> Box<dyn Source> {
+    let mut config = json!({ "url": url });
+    if let (Some(c), Some(e)) = (config.as_object_mut(), extra.as_object()) {
+        c.extend(e.clone());
+    }
     let spec = SourceSpec {
         kind: SourceKind::Postgres,
-        config: json!({ "url": url }),
+        config,
     };
     let streams: Vec<StreamMapping> = tables
         .iter()
@@ -813,6 +822,116 @@ async fn teardown_never_reports_success_while_the_slot_survives() {
         count("SELECT count(*) FROM pg_publication WHERE pubname = $1").await,
         0
     );
+}
+
+#[tokio::test]
+async fn names_taken_by_others_are_never_adopted_or_dropped() {
+    let Some(url) = url() else { return };
+    let db = admin(&url).await;
+    let table = unique("own");
+    let other = unique("own_other");
+    create_items(&db, &table).await;
+    create_items(&db, &other).await;
+    let collection = format!("public.{table}");
+    let foreign_pub = unique("foreign_pub");
+    let foreign_slot = unique("foreign_slot");
+    db.batch_execute(&format!(
+        "CREATE PUBLICATION {foreign_pub} FOR TABLE {other}"
+    ))
+    .await
+    .unwrap();
+    db.execute(
+        "SELECT pg_create_logical_replication_slot($1, 'pgoutput')",
+        &[&foreign_slot],
+    )
+    .await
+    .unwrap();
+    let pub_tables = || async {
+        db.query(
+            "SELECT tablename::text FROM pg_publication_tables WHERE pubname = $1",
+            &[&foreign_pub],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.get::<_, String>(0))
+        .collect::<Vec<_>>()
+    };
+    let slot_exists = || async {
+        db.query_one(
+            "SELECT count(*) FROM pg_replication_slots WHERE slot_name = $1",
+            &[&foreign_slot],
+        )
+        .await
+        .unwrap()
+        .get::<_, i64>(0)
+            == 1
+    };
+
+    for extra in [
+        json!({ "publication_name": foreign_pub }),
+        json!({ "slot_name": foreign_slot }),
+    ] {
+        let sync_id = unique("own");
+        let mut src = source_with(&url, &sync_id, &[&collection], extra.clone());
+        let report = src.check().await.unwrap();
+        assert!(!report.passed(), "{extra}: {report:#?}");
+        let err = src.open(None).await.unwrap_err();
+        assert!(
+            matches!(&err, SourceError::Config(m) if m.contains("taken")),
+            "{extra}: {err:?}"
+        );
+        src.teardown().await.unwrap();
+        assert_eq!(pub_tables().await, vec![other.clone()], "{extra}");
+        assert!(slot_exists().await, "{extra}");
+    }
+
+    // What we create carries our marker; a later open adopts it again.
+    let sync_id = unique("own");
+    let name = format!("meili_connect_{sync_id}");
+    let mut src = source(&url, &sync_id, &[&collection]);
+    assert!(matches!(
+        src.open(None).await.unwrap(),
+        Opened::Fresh { .. }
+    ));
+    drop(src);
+    let comment: Option<String> = db
+        .query_one(
+            "SELECT obj_description(oid, 'pg_publication') FROM pg_publication WHERE pubname = $1",
+            &[&name],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(comment, Some(format!("meili-connect:{sync_id}")));
+    let mut src = source(&url, &sync_id, &[&collection]);
+    assert!(matches!(
+        src.open(None).await.unwrap(),
+        Opened::Fresh { .. }
+    ));
+    src.teardown().await.unwrap();
+
+    // A publication of ours paired with a slot name override: adopted.
+    let sync_id = unique("own");
+    let slot = unique("own_slot");
+    let mut src = source_with(&url, &sync_id, &[&collection], json!({ "slot_name": slot }));
+    assert!(matches!(
+        src.open(None).await.unwrap(),
+        Opened::Fresh { .. }
+    ));
+    drop(src);
+    let mut src = source_with(&url, &sync_id, &[&collection], json!({ "slot_name": slot }));
+    assert!(matches!(
+        src.open(None).await.unwrap(),
+        Opened::Fresh { .. }
+    ));
+    src.teardown().await.unwrap();
+
+    db.batch_execute(&format!(
+        "DROP PUBLICATION {foreign_pub}; SELECT pg_drop_replication_slot('{foreign_slot}');"
+    ))
+    .await
+    .unwrap();
 }
 
 #[tokio::test]

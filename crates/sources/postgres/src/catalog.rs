@@ -412,12 +412,36 @@ pub async fn publication_tables(
         .map(Some)
 }
 
-/// Create the publication for exactly `tables`, or reset an existing one
-/// to exactly them.
+/// The comment that marks a publication as created by `sync_id`.
+pub fn marker(sync_id: &str) -> String {
+    format!("meili-connect:{sync_id}")
+}
+
+/// The publication's comment: `None` when it does not exist, `Some(None)`
+/// when it has no comment.
+pub async fn publication_comment(
+    sql: &Sql,
+    name: &str,
+) -> Result<Option<Option<String>>, SourceError> {
+    let rows = sql
+        .query(
+            "SELECT obj_description(oid, 'pg_publication') FROM pg_publication WHERE pubname = $1",
+            &[&name],
+        )
+        .await?;
+    rows.first()
+        .map(|r| col::<Option<String>>(r, 0))
+        .transpose()
+}
+
+/// Create the publication for exactly `tables` and mark it as ours, or
+/// reset an existing one (the caller checked it carries our marker) to
+/// exactly them. Partition changes are published under the partitioned
+/// table's name, the one the user mapped.
 pub async fn ensure_publication(
     sql: &Sql,
-    version: i32,
     name: &str,
+    marker: &str,
     tables: &[(String, String)],
 ) -> Result<(), SourceError> {
     let list = tables
@@ -426,28 +450,21 @@ pub async fn ensure_publication(
         .collect::<Vec<_>>()
         .join(", ");
     let quoted = ident::quote_ident(name);
-    let exists = publication_tables(sql, name).await?.is_some();
-    if exists {
-        sql.simple(&format!("ALTER PUBLICATION {quoted} SET TABLE {list}"))
-            .await?;
-        if version >= 130_000 {
-            sql.simple(&format!(
-                "ALTER PUBLICATION {quoted} SET (publish_via_partition_root = true)"
-            ))
-            .await?;
-        }
+    let exists = publication_comment(sql, name).await?.is_some();
+    // One simple query is one implicit transaction: never a publication
+    // without its marker.
+    let statements = if exists {
+        format!(
+            "ALTER PUBLICATION {quoted} SET TABLE {list};
+             ALTER PUBLICATION {quoted} SET (publish_via_partition_root = true)"
+        )
     } else {
-        // Partition changes are published under the partitioned table's
-        // name, the one the user mapped (13+).
-        let with = if version >= 130_000 {
-            " WITH (publish_via_partition_root = true)"
-        } else {
-            ""
-        };
-        sql.simple(&format!(
-            "CREATE PUBLICATION {quoted} FOR TABLE {list}{with}"
-        ))
-        .await?;
-    }
+        format!(
+            "CREATE PUBLICATION {quoted} FOR TABLE {list} WITH (publish_via_partition_root = true);
+             COMMENT ON PUBLICATION {quoted} IS {}",
+            ident::quote_literal(marker)
+        )
+    };
+    sql.simple(&statements).await?;
     Ok(())
 }
