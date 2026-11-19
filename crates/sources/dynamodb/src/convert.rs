@@ -208,6 +208,7 @@ pub fn record_to_change(
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use aws_sdk_dynamodb::types::AttributeValue as Av;

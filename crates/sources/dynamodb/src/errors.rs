@@ -167,6 +167,7 @@ pub fn to_source_error(class: ErrClass, msg: String) -> SourceError {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
