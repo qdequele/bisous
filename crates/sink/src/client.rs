@@ -2,8 +2,9 @@
 //! polling. Never logs the API key (sent as a sensitive header) nor request
 //! bodies.
 
+use std::hash::{BuildHasher as _, Hasher as _};
 use std::io::Write as _;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use meili_connect_core::{MeiliDestination, SinkError};
@@ -284,6 +285,18 @@ async fn gzip(body: Vec<u8>) -> Result<Vec<u8>, SinkError> {
     out.map_err(|e| SinkError::Fatal(format!("gzip failed: {e}")))
 }
 
+/// A delay drawn uniformly in `[d/2, d]`, so the retries of many clients
+/// spread out.
+pub(crate) fn jitter(d: Duration) -> Duration {
+    // A fresh RandomState is randomly keyed: enough randomness for this.
+    let r = std::collections::hash_map::RandomState::new()
+        .build_hasher()
+        .finish();
+    let half = d / 2;
+    let span = u64::try_from((d - half).as_nanos()).unwrap_or(u64::MAX);
+    half + Duration::from_nanos(r % span.saturating_add(1))
+}
+
 fn is_config_code(code: &str) -> bool {
     code.starts_with("index_primary_key_")
         || matches!(
@@ -325,9 +338,9 @@ pub(crate) enum DocFailure {
     PerDocument(String),
     /// Could be one document or an outage: `vector_embedding_error` (bad
     /// document or embedder down) and `internal` (Meilisearch reports some
-    /// malformed fields, e.g. a non-object `_vectors`, as internal errors).
-    /// Bisected like a per-document error, but turned into a transient error
-    /// when no document of the run got through.
+    /// malformed documents, e.g. a non-object `_vectors`, as internal
+    /// errors). Bisected like a per-document error; an isolated document is
+    /// resent, and rejected only when it is provably at fault.
     Suspect(String),
     /// Not the documents' fault.
     Global(SinkError),
@@ -349,7 +362,6 @@ pub(crate) fn classify_doc_failure(error: &MeiliError) -> DocFailure {
                 "index_not_found"
                     | "index_already_exists"
                     | "index_creation_failed"
-                    | "malformed_payload"
                     | "payload_too_large"
             ) {
                 DocFailure::Global(SinkError::Fatal(msg()))

@@ -265,6 +265,80 @@ async fn index_operations() {
     s.delete_index(&live_ix.uid).await.unwrap();
 }
 
+async fn patch_settings(l: &Live, index: &str, settings: Value) {
+    let resp = reqwest::Client::new()
+        .patch(format!("{}/indexes/{index}/settings", l.url))
+        .bearer_auth(&l.key)
+        .json(&settings)
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "{}", resp.text().await.unwrap());
+    let task: Value = resp.json().await.unwrap();
+    wait_task(l, task["taskUid"].as_u64().unwrap()).await;
+}
+
+/// Documents Meilisearch refuses for good are rejected, including those it
+/// reports as `internal` or `vector_embedding_error`; good ones are written.
+#[tokio::test]
+async fn poison_vectors_are_rejected() {
+    let Some(l) = live() else { return };
+    let s = sink(
+        &l,
+        SinkOptions {
+            suspect_backoff: Duration::from_millis(10),
+            ..opts()
+        },
+    );
+    let target = IndexTarget {
+        uid: uid("vectors"),
+        primary_key: "id".into(),
+    };
+    s.ensure_index(&target).await.unwrap();
+    patch_settings(
+        &l,
+        &target.uid,
+        json!({"embedders": {"up": {"source": "userProvided", "dimensions": 3}}}),
+    )
+    .await;
+
+    // Alone in its run: `internal` from Meilisearch.
+    let report = s
+        .apply(&target, vec![replace("alone", json!({"_vectors": "x"}))])
+        .await
+        .unwrap();
+    assert_eq!(report.rejected.len(), 1, "{report:?}");
+
+    let mut deep = json!(1);
+    for _ in 0..200 {
+        deep = json!([deep]);
+    }
+    let good = |i: u32| replace(&format!("g{i}"), json!({"_vectors": {"up": [1, 2, 3]}}));
+    let ops = vec![
+        good(0),
+        replace("str", json!({"_vectors": "not an object"})),
+        good(1),
+        replace("arr", json!({"_vectors": [1, 2, 3]})),
+        replace("dims", json!({"_vectors": {"up": [1, 2]}})),
+        good(2),
+        replace("type", json!({"_vectors": {"up": "x"}})),
+        replace("none", json!({"title": "no vectors"})),
+        replace("deep", json!({"_vectors": {"up": [1, 2, 3]}, "x": deep})),
+        good(3),
+    ];
+    let report = s.apply(&target, ops).await.unwrap();
+    let mut rejected: Vec<&str> = report.rejected.iter().map(|r| r.op.id()).collect();
+    rejected.sort();
+    assert_eq!(
+        rejected,
+        vec!["arr", "deep", "dims", "none", "str", "type"],
+        "{report:?}"
+    );
+    assert_eq!(report.written, 4);
+    assert_eq!(s.document_count(&target.uid).await.unwrap(), Some(4));
+    s.delete_index(&target.uid).await.unwrap();
+}
+
 #[tokio::test]
 async fn delete_all_documents_keeps_settings() {
     let Some(l) = live() else { return };

@@ -20,6 +20,7 @@ fn opts() -> SinkOptions {
         task_timeout: Duration::from_secs(5),
         request_timeout: Duration::from_secs(5),
         gzip: false,
+        suspect_backoff: Duration::from_millis(1),
         ..SinkOptions::default()
     }
 }
@@ -80,11 +81,16 @@ struct FakeState {
     processing_polls: usize,
     polls: usize,
     gzip_seen: bool,
+    /// Times each document id was sent.
+    attempts: std::collections::HashMap<String, usize>,
 }
 
-/// A small in-memory Meilisearch: documents with `"bad": true` make their
-/// task fail with `invalid_document_id`, with `"embed": "fail"` with
-/// `vector_embedding_error`.
+/// A small in-memory Meilisearch. A document makes its task fail with:
+/// `"bad": true` → `invalid_document_id`; `"embed": "fail"` →
+/// `vector_embedding_error`; `"flaky": n` → `vector_embedding_error` the
+/// first `n` times it is sent; `"internal": true` or a non-object
+/// `_vectors` → `internal`; `"needs_vectors": true` without `_vectors.up`
+/// → `vector_embedding_error`.
 #[derive(Clone, Default)]
 struct Fake(Arc<Mutex<FakeState>>);
 
@@ -166,20 +172,48 @@ impl Respond for Fake {
                 .collect();
             ("documents", docs)
         };
-        let failure = items.iter().find_map(|d| {
+        let mut failures = Vec::new();
+        for d in &items {
+            let id = d.get("id").map(Value::to_string).unwrap_or_default();
+            let attempt = {
+                let n = st.attempts.entry(id).or_default();
+                *n += 1;
+                *n
+            };
+            let flaky = d.get("flaky").and_then(Value::as_u64).unwrap_or(0);
+            let vectors = d.get("_vectors");
             if d.get("bad") == Some(&json!(true)) {
-                Some(("invalid_document_id", format!("bad document {}", d["id"])))
-            } else if d.get("embed") == Some(&json!("fail")) {
-                Some(("vector_embedding_error", "embedder down".to_owned()))
-            } else {
-                None
+                failures.push((
+                    "invalid_document_id",
+                    "invalid_request",
+                    format!("bad document {}", d["id"]),
+                ));
+            } else if d.get("embed") == Some(&json!("fail")) || attempt as u64 <= flaky {
+                failures.push((
+                    "vector_embedding_error",
+                    "invalid_request",
+                    "embedder down".to_owned(),
+                ));
+            } else if d.get("internal") == Some(&json!(true))
+                || vectors.is_some_and(|v| !v.is_object() && !v.is_null())
+            {
+                failures.push(("internal", "internal", "invalid type".to_owned()));
+            } else if d.get("needs_vectors") == Some(&json!(true))
+                && vectors.and_then(|v| v.get("up")).is_none()
+            {
+                failures.push((
+                    "vector_embedding_error",
+                    "invalid_request",
+                    "no vectors provided".to_owned(),
+                ));
             }
-        });
+        }
+        let failure = failures.into_iter().next();
         let uid = st.tasks.len();
         let task = match &failure {
             None => json!({"uid": uid, "status": "succeeded"}),
-            Some((code, msg)) => json!({"uid": uid, "status": "failed",
-                "error": {"message": msg, "code": code, "type": "invalid_request", "link": ""}}),
+            Some((code, kind, msg)) => json!({"uid": uid, "status": "failed",
+                "error": {"message": msg, "code": code, "type": kind, "link": ""}}),
         };
         st.tasks.push(task);
         st.calls.push(Call {
@@ -254,6 +288,20 @@ fn classification() {
         classify_doc_failure(&e("vector_embedding_error", "invalid_request")),
         DocFailure::Suspect(_)
     ));
+    for code in [
+        "malformed_payload",
+        "invalid_vectors_type",
+        "max_fields_limit_exceeded",
+        "missing_document_id",
+    ] {
+        assert!(
+            matches!(
+                classify_doc_failure(&e(code, "invalid_request")),
+                DocFailure::PerDocument(_)
+            ),
+            "{code}"
+        );
+    }
     assert!(matches!(
         classify_doc_failure(&e(
             "index_primary_key_multiple_candidates_found",
@@ -456,27 +504,181 @@ async fn payload_too_large_from_server_is_bisected() {
     assert!(report.rejected[0].reason.contains("payload_too_large"));
 }
 
+async fn mount_embedders(server: &MockServer, embedders: Value) {
+    Mock::given(method("GET"))
+        .and(path("/indexes/movies/settings/embedders"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(embedders))
+        .mount(server)
+        .await;
+}
+
 #[tokio::test]
-async fn embedder_outage_is_transient_but_one_bad_embedding_is_rejected() {
+async fn embedder_outage_is_transient() {
     let server = MockServer::start().await;
     let fake = Fake::default();
     fake.mount(&server).await;
+    mount_embedders(&server, json!({})).await;
     let s = sink(&server, opts());
     let all_fail: Vec<DocOp> = (0..4)
         .map(|i| replace(&i.to_string(), json!({"embed": "fail"})))
         .collect();
     let e = s.apply(&target(), all_fail).await.unwrap_err();
     assert!(matches!(e, SinkError::Transient(_)), "{e:?}");
+}
 
+#[tokio::test]
+async fn a_document_that_keeps_failing_with_an_embedder_error_is_never_rejected() {
+    // Others got through, but nothing proves this one is at fault: the
+    // embedder may be failing on it only. Rejecting it would dead-letter a
+    // good document and advance the checkpoint past it.
+    let server = MockServer::start().await;
+    let fake = Fake::default();
+    fake.mount(&server).await;
+    mount_embedders(&server, json!({"remote": {"source": "rest"}})).await;
+    let s = sink(&server, opts());
     let one_fails: Vec<DocOp> = (0..4)
         .map(|i| {
             let v = if i == 2 { "fail" } else { "ok" };
             replace(&i.to_string(), json!({"embed": v}))
         })
         .collect();
-    let report = s.apply(&target(), one_fails).await.unwrap();
-    assert_eq!(report.written, 3);
-    assert_eq!(report.rejected[0].op.id(), "2");
+    let e = s.apply(&target(), one_fails).await.unwrap_err();
+    assert!(
+        matches!(&e, SinkError::Transient(m) if m.contains("`2`")),
+        "{e:?}"
+    );
+    // Sent three times by bisection (4 → 2 → 1), then `suspect_retries`
+    // more times.
+    assert_eq!(fake.0.lock().unwrap().attempts["\"2\""], 3 + 3);
+}
+
+#[tokio::test]
+async fn intermittent_embedder_failures_are_retried_not_rejected() {
+    let server = MockServer::start().await;
+    let fake = Fake::default();
+    fake.mount(&server).await;
+    let s = sink(&server, opts());
+    // Doc 5 fails the first 4 times it is sent: in the full batch, its
+    // half, its quarter, then once isolated; it succeeds on a retry.
+    let ops: Vec<DocOp> = (0..8)
+        .map(|i| {
+            let flaky = if i == 5 { 4 } else { 0 };
+            replace(&i.to_string(), json!({"flaky": flaky}))
+        })
+        .collect();
+    let report = s.apply(&target(), ops).await.unwrap();
+    assert_eq!(report.written, 8);
+    assert!(report.rejected.is_empty(), "{report:?}");
+    let mut ids = fake.succeeded_ids();
+    ids.sort();
+    assert_eq!(ids, ["0", "1", "2", "3", "4", "5", "6", "7"]);
+}
+
+#[tokio::test]
+async fn internal_error_on_a_lone_document_is_transient() {
+    let server = MockServer::start().await;
+    let fake = Fake::default();
+    fake.mount(&server).await;
+    let s = sink(&server, opts());
+    let e = s
+        .apply(&target(), vec![replace("1", json!({"internal": true}))])
+        .await
+        .unwrap_err();
+    assert!(matches!(e, SinkError::Transient(_)), "{e:?}");
+    assert_eq!(fake.calls().len(), 4);
+}
+
+#[tokio::test]
+async fn malformed_vectors_are_rejected_even_alone() {
+    // Meilisearch reports a non-object `_vectors` as `internal`; the
+    // document itself shows it can never succeed.
+    let server = MockServer::start().await;
+    let fake = Fake::default();
+    fake.mount(&server).await;
+    let s = sink(&server, opts());
+    let report = s
+        .apply(
+            &target(),
+            vec![replace("v", json!({"_vectors": [1.0, 2.0]}))],
+        )
+        .await
+        .unwrap();
+    assert_eq!(report.written, 0);
+    assert_eq!(report.rejected.len(), 1);
+    assert!(
+        report.rejected[0]
+            .reason
+            .contains("`_vectors` must be an object")
+    );
+    // No pointless retries.
+    assert_eq!(fake.calls().len(), 1);
+
+    let ops = vec![
+        replace("a", json!({})),
+        replace("v", json!({"_vectors": "x"})),
+        replace("b", json!({})),
+    ];
+    let report = s.apply(&target(), ops).await.unwrap();
+    assert_eq!(report.written, 2);
+    assert_eq!(report.rejected[0].op.id(), "v");
+}
+
+#[tokio::test]
+async fn missing_user_provided_vectors_are_rejected() {
+    let server = MockServer::start().await;
+    let fake = Fake::default();
+    fake.mount(&server).await;
+    mount_embedders(
+        &server,
+        json!({"up": {"source": "userProvided", "dimensions": 3}}),
+    )
+    .await;
+    let s = sink(&server, opts());
+    let ops = vec![
+        replace(
+            "ok",
+            json!({"needs_vectors": true, "_vectors": {"up": [1, 2, 3]}}),
+        ),
+        replace("none", json!({"needs_vectors": true})),
+    ];
+    let report = s.apply(&target(), ops).await.unwrap();
+    assert_eq!(report.written, 1);
+    assert_eq!(report.rejected.len(), 1);
+    assert_eq!(report.rejected[0].op.id(), "none");
+    assert!(report.rejected[0].reason.contains("`_vectors.up`"));
+}
+
+#[test]
+fn shape_problems() {
+    assert_eq!(
+        shape_problem(&replace("1", json!({"_vectors": null}))),
+        None
+    );
+    assert_eq!(
+        shape_problem(&replace("1", json!({"_vectors": {"a": [1]}}))),
+        None
+    );
+    assert!(shape_problem(&replace("1", json!({"_vectors": 3}))).is_some());
+    assert_eq!(shape_problem(&delete("1")), None);
+    let nested = |levels: usize| {
+        let mut v = json!(1);
+        for _ in 0..levels {
+            v = json!([v]);
+        }
+        replace("1", json!({ "x": v }))
+    };
+    // The document object plus 126 arrays is the deepest Meilisearch takes.
+    assert_eq!(shape_problem(&nested(126)), None);
+    assert!(shape_problem(&nested(127)).is_some());
+}
+
+#[test]
+fn jitter_stays_in_range() {
+    for _ in 0..100 {
+        let d = client::jitter(Duration::from_millis(100));
+        assert!(d >= Duration::from_millis(50) && d <= Duration::from_millis(100));
+    }
+    assert_eq!(client::jitter(Duration::ZERO), Duration::ZERO);
 }
 
 #[tokio::test]

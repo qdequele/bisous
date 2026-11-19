@@ -39,6 +39,13 @@ pub struct SinkOptions {
     pub connect_timeout: Duration,
     /// Send document payloads with `Content-Encoding: gzip`.
     pub gzip: bool,
+    /// How many more times a single document is sent after a failure that
+    /// may be transient (`internal`, `vector_embedding_error`) before the
+    /// whole `apply` fails with `SinkError::Transient`.
+    pub suspect_retries: u32,
+    /// First delay before resending such a document; doubled each time,
+    /// jittered.
+    pub suspect_backoff: Duration,
 }
 
 impl Default for SinkOptions {
@@ -51,6 +58,8 @@ impl Default for SinkOptions {
             request_timeout: Duration::from_secs(120),
             connect_timeout: Duration::from_secs(10),
             gzip: true,
+            suspect_retries: 3,
+            suspect_backoff: Duration::from_secs(1),
         }
     }
 }
@@ -178,11 +187,48 @@ impl Chunk {
     }
 }
 
-/// Rejections and successes of one run, before the suspect check.
+/// Successes and deterministic rejections (index into the run, reason) of
+/// one run.
 #[derive(Default)]
 struct RunTally {
     ok: u64,
-    rejected: Vec<(usize, String, bool)>,
+    rejected: Vec<(usize, String)>,
+}
+
+/// Deepest JSON nesting Meilisearch accepts in a document, the top-level
+/// object counting as one (serde_json's recursion limit is 128).
+const MAX_DOC_DEPTH: usize = 127;
+
+fn json_depth(v: &serde_json::Value) -> usize {
+    match v {
+        serde_json::Value::Array(a) => 1 + a.iter().map(json_depth).max().unwrap_or(0),
+        serde_json::Value::Object(o) => 1 + o.values().map(json_depth).max().unwrap_or(0),
+        _ => 0,
+    }
+}
+
+/// Why Meilisearch will always refuse this document although it reports
+/// the failure as `internal` (no stable error code). Checked on the
+/// document itself, never on the error message.
+fn shape_problem(op: &DocOp) -> Option<String> {
+    let doc = match op {
+        DocOp::Replace { doc, .. } | DocOp::Merge { doc, .. } => doc,
+        DocOp::Delete { .. } => return None,
+    };
+    match doc.get("_vectors") {
+        None | Some(serde_json::Value::Null | serde_json::Value::Object(_)) => {}
+        Some(_) => return Some("`_vectors` must be an object".into()),
+    }
+    let depth = 1 + doc.values().map(json_depth).max().unwrap_or(0);
+    (depth > MAX_DOC_DEPTH).then(|| {
+        format!("document nests {depth} levels deep, over Meilisearch's limit of {MAX_DOC_DEPTH}")
+    })
+}
+
+/// What became of a document isolated with a possibly transient failure.
+enum Settled {
+    Written,
+    Rejected(String),
 }
 
 impl MeiliSink {
@@ -225,34 +271,21 @@ impl MeiliSink {
                         line.len(),
                         self.client.opts.max_payload_bytes
                     ),
-                    false,
                 ));
                 continue;
             }
             if chunk.bytes + cost > limit {
                 let full = std::mem::replace(&mut chunk, Chunk::new());
-                self.write_bisect(target, kind, full, &mut tally).await?;
+                self.write_bisect(target, kind, run, full, &mut tally)
+                    .await?;
             }
             chunk.idx.push(i);
             chunk.lines.push(line);
             chunk.bytes += cost;
         }
         if !chunk.lines.is_empty() {
-            self.write_bisect(target, kind, chunk, &mut tally).await?;
-        }
-
-        if tally.ok == 0
-            && !tally.rejected.is_empty()
-            && tally.rejected.iter().all(|(_, _, suspect)| *suspect)
-        {
-            let reason = tally
-                .rejected
-                .first()
-                .map(|(_, r, _)| r.clone())
-                .unwrap_or_default();
-            return Err(SinkError::Transient(format!(
-                "every document of the batch failed with a possibly transient error: {reason}"
-            )));
+            self.write_bisect(target, kind, run, chunk, &mut tally)
+                .await?;
         }
         match kind {
             Kind::Delete => report.deleted += tally.ok,
@@ -265,7 +298,7 @@ impl MeiliSink {
                 "Meilisearch rejected documents"
             );
         }
-        for (i, reason, _) in tally.rejected {
+        for (i, reason) in tally.rejected {
             if let Some(op) = run.get(i) {
                 report.rejected.push(RejectedDoc {
                     op: op.clone(),
@@ -277,11 +310,15 @@ impl MeiliSink {
     }
 
     /// Writes a chunk; on refusal, halves it until each refused document is
-    /// isolated. Left halves go first so the run keeps its order.
+    /// isolated. Left halves go first so the run keeps its order. An
+    /// isolated document whose failure may be transient is settled on the
+    /// spot, before anything after it in the batch is written, so the order
+    /// across runs holds.
     async fn write_bisect(
         &self,
         target: &IndexTarget,
         kind: Kind,
+        run: &[DocOp],
         chunk: Chunk,
         tally: &mut RunTally,
     ) -> Result<(), SinkError> {
@@ -291,7 +328,18 @@ impl MeiliSink {
                 WriteOutcome::Written => tally.ok += (b - a) as u64,
                 WriteOutcome::Refused { reason, suspect } => {
                     if b - a == 1 {
-                        tally.rejected.push((chunk.idx[a], reason, suspect));
+                        let i = chunk.idx[a];
+                        let settled = match run.get(i) {
+                            Some(op) if suspect => {
+                                self.settle_suspect(target, kind, op, &chunk.lines[a..b], reason)
+                                    .await?
+                            }
+                            _ => Settled::Rejected(reason),
+                        };
+                        match settled {
+                            Settled::Written => tally.ok += 1,
+                            Settled::Rejected(reason) => tally.rejected.push((i, reason)),
+                        }
                     } else {
                         let mid = a + (b - a) / 2;
                         tracing::debug!(index = %target.uid, size = b - a, "bisecting refused payload");
@@ -302,6 +350,93 @@ impl MeiliSink {
             }
         }
         Ok(())
+    }
+
+    /// A single document failed with an error that may be transient (an
+    /// embedder or Meilisearch hiccup) or may be its own fault. Resend it a
+    /// few times with backoff; if it keeps failing, reject it only when the
+    /// document itself is provably at fault, otherwise fail the whole call
+    /// with `Transient` so nothing is dead-lettered by mistake.
+    async fn settle_suspect(
+        &self,
+        target: &IndexTarget,
+        kind: Kind,
+        op: &DocOp,
+        line: &[Vec<u8>],
+        mut reason: String,
+    ) -> Result<Settled, SinkError> {
+        if let Some(why) = shape_problem(op) {
+            return Ok(Settled::Rejected(format!("{reason} ({why})")));
+        }
+        let opts = &self.client.opts;
+        let mut delay = opts.suspect_backoff;
+        for attempt in 1..=opts.suspect_retries {
+            tracing::debug!(index = %target.uid, attempt, "resending a document after a possibly transient failure");
+            tokio::time::sleep(client::jitter(delay)).await;
+            delay = delay.saturating_mul(2);
+            match self.write_once(target, kind, line).await? {
+                WriteOutcome::Written => return Ok(Settled::Written),
+                WriteOutcome::Refused {
+                    reason: r,
+                    suspect: false,
+                } => return Ok(Settled::Rejected(r)),
+                WriteOutcome::Refused {
+                    reason: r,
+                    suspect: true,
+                } => reason = r,
+            }
+        }
+        if let Some(embedder) = self.missing_user_provided_vectors(&target.uid, op).await? {
+            return Ok(Settled::Rejected(format!(
+                "{reason} (no `_vectors.{embedder}` for the userProvided embedder `{embedder}`)"
+            )));
+        }
+        Err(SinkError::Transient(format!(
+            "document `{}` still fails after {} retries with a possibly transient error: {reason}",
+            op.id(),
+            opts.suspect_retries
+        )))
+    }
+
+    /// The name of a `userProvided` embedder of the index for which this
+    /// full document has no `_vectors` entry: Meilisearch then fails with
+    /// `vector_embedding_error`, the same code as an embedder outage.
+    async fn missing_user_provided_vectors(
+        &self,
+        uid: &str,
+        op: &DocOp,
+    ) -> Result<Option<String>, SinkError> {
+        // A partial update may rely on the vectors already stored.
+        let DocOp::Replace { doc, .. } = op else {
+            return Ok(None);
+        };
+        let body = match self
+            .client
+            .call(
+                Method::GET,
+                &["indexes", uid, "settings", "embedders"],
+                &[],
+                None,
+            )
+            .await?
+        {
+            Ok(body) => body,
+            Err(api) if api.status == StatusCode::NOT_FOUND => return Ok(None),
+            Err(api) => return Err(map_api_error("reading embedders", &api)),
+        };
+        let embedders =
+            serde_json::from_slice::<Option<serde_json::Map<String, serde_json::Value>>>(&body)
+                .map_err(|e| {
+                    SinkError::Fatal(format!("unexpected embedders from Meilisearch: {e}"))
+                })?
+                .unwrap_or_default();
+        let vectors = doc.get("_vectors").and_then(|v| v.as_object());
+        Ok(embedders
+            .iter()
+            .filter(|(_, e)| e.get("source").and_then(|s| s.as_str()) == Some("userProvided"))
+            .map(|(name, _)| name)
+            .find(|name| !vectors.is_some_and(|v| v.contains_key(name.as_str())))
+            .cloned())
     }
 
     /// One request + its task.
