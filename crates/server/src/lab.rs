@@ -2,9 +2,12 @@
 //!
 //! Each round leases up to [`BATCH_SIZE`] events, sends them as one signed
 //! batch `{"events": [...]}`, and marks the ids the Lab lists in `accepted`
-//! as sent. Everything else stays unsent and comes back when its lease
-//! expires. Sent events older than [`RETENTION`] are pruned hourly. The Lab
-//! being down never affects the syncs.
+//! as sent. Everything else stays unsent and is deferred: each failed
+//! delivery of an event doubles its wait ([`RETRY`]). While deliveries fail
+//! the sender itself backs off too, and logs the failure at most every
+//! [`LOG_EVERY`]. Sent events older than [`RETENTION`] are pruned hourly.
+//! The Lab being down never affects the syncs; the backlog is bounded on the
+//! enqueue side (`LAB_OUTBOX_MAX_PENDING`, see [`crate::usage`]).
 //!
 //! Signature: `X-Lab-Signature: sha256=<hex HMAC-SHA256(secret,
 //! "<timestamp>.<raw body>")>`, with `X-Lab-Instance-Id` and
@@ -15,13 +18,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use hmac::{Hmac, Mac};
-use meili_connect_store::LabOutbox;
+use meili_connect_store::{LabOutbox, RetryBackoff};
 use serde_json::Value;
 use sha2::Sha256;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::config::LabEventsConfig;
+use crate::limits::LogLimiter;
 use crate::usage::UsageMeter;
 
 pub const H_INSTANCE_ID: &str = "x-lab-instance-id";
@@ -36,6 +40,24 @@ pub const LEASE: Duration = Duration::from_secs(30);
 pub const RETENTION: Duration = Duration::from_secs(7 * 86_400);
 /// Largest acknowledgement body read from the Lab.
 pub const MAX_ACK_BYTES: usize = 1024 * 1024;
+/// How long an event waits after a failed delivery (doubling per attempt).
+pub const RETRY: RetryBackoff = RetryBackoff {
+    base: Duration::from_secs(10),
+    max: Duration::from_secs(3600),
+};
+/// Longest pause of the sender after failed rounds.
+pub const MAX_IDLE: Duration = Duration::from_secs(300);
+/// A failing delivery is logged at most this often.
+pub const LOG_EVERY: Duration = Duration::from_secs(300);
+
+/// The sender's pause after `failures` failed rounds in a row: `interval`
+/// doubled per failure, capped at [`MAX_IDLE`] (never below `interval`).
+pub fn next_wait(interval: Duration, failures: u32) -> Duration {
+    interval
+        .saturating_mul(1u32 << failures.min(16))
+        .min(MAX_IDLE)
+        .max(interval)
+}
 
 /// `sha256=<hex HMAC-SHA256(secret, "{timestamp}.{body}")>`.
 pub fn sign(secret: &[u8], timestamp: u64, body: &[u8]) -> String {
@@ -66,8 +88,9 @@ pub enum Delivery {
         delivered: usize,
         pending: usize,
     },
-    /// The whole batch failed (`store`, `connect`, `timeout`, `status`,
-    /// `malformed`); it is retried when the lease expires.
+    /// The whole batch failed (`store`, `connect`, `timeout`,
+    /// `unauthorized`, `status`, `malformed`); it is deferred and retried
+    /// after its backoff.
     Failed {
         reason: &'static str,
         pending: usize,
@@ -79,6 +102,7 @@ pub struct LabSender {
     config: LabEventsConfig,
     http: reqwest::Client,
     lease: Duration,
+    retry: RetryBackoff,
 }
 
 async fn read_capped(mut resp: reqwest::Response, cap: usize) -> Option<Vec<u8>> {
@@ -110,7 +134,25 @@ impl LabSender {
             config,
             http,
             lease: LEASE,
+            retry: RETRY,
         })
+    }
+
+    /// How long a failed event waits (tests shorten it).
+    pub fn with_retry_backoff(mut self, retry: RetryBackoff) -> Self {
+        self.retry = retry;
+        self
+    }
+
+    /// Keep these events of the lease back for their backoff.
+    async fn defer(&self, lease: uuid::Uuid, ids: &[Uuid]) {
+        if ids.is_empty() {
+            return;
+        }
+        if let Err(e) = self.outbox.defer_events(lease, ids, self.retry).await {
+            // They come back when the lease expires.
+            tracing::debug!(error = %e, "cannot defer undelivered usage events");
+        }
     }
 
     /// How long a batch stays leased (tests shorten it).
@@ -134,6 +176,7 @@ impl LabSender {
             return Delivery::Idle;
         }
         let pending = lease.events.len();
+        let ids: Vec<Uuid> = lease.events.iter().map(|e| e.id).collect();
         let mut events = Vec::with_capacity(pending);
         for e in &lease.events {
             let mut body = e.payload.clone();
@@ -145,6 +188,7 @@ impl LabSender {
         let body = match serde_json::to_vec(&serde_json::json!({ "events": events })) {
             Ok(b) => b,
             Err(_) => {
+                self.defer(lease.token, &ids).await;
                 return Delivery::Failed {
                     reason: "malformed",
                     pending,
@@ -167,37 +211,36 @@ impl LabSender {
             Ok(r) => r,
             Err(e) => {
                 let reason = if e.is_timeout() { "timeout" } else { "connect" };
-                tracing::warn!(reason, "Lab unreachable; usage events stay pending");
+                tracing::debug!(reason, "Lab unreachable; usage events stay pending");
+                self.defer(lease.token, &ids).await;
                 return Delivery::Failed { reason, pending };
             }
         };
         let status = resp.status();
         if status != reqwest::StatusCode::OK {
-            if status == reqwest::StatusCode::UNAUTHORIZED {
-                tracing::error!(
-                    "the Lab rejected LAB_INSTANCE_ID / LAB_INSTANCE_SECRET (401); usage events \
-                     stay pending until the credentials are fixed"
-                );
+            tracing::debug!(%status, "the Lab did not accept the usage events batch");
+            self.defer(lease.token, &ids).await;
+            let reason = if status == reqwest::StatusCode::UNAUTHORIZED {
+                "unauthorized"
             } else {
-                tracing::warn!(%status, "the Lab did not accept the usage events batch");
-            }
-            return Delivery::Failed {
-                reason: "status",
-                pending,
+                "status"
             };
+            return Delivery::Failed { reason, pending };
         }
         #[derive(serde::Deserialize)]
         struct Ack {
             accepted: Vec<Uuid>,
         }
         let Some(bytes) = read_capped(resp, MAX_ACK_BYTES).await else {
+            self.defer(lease.token, &ids).await;
             return Delivery::Failed {
                 reason: "malformed",
                 pending,
             };
         };
         let Ok(ack) = serde_json::from_slice::<Ack>(&bytes) else {
-            tracing::warn!("the Lab answered 200 with a malformed body");
+            tracing::debug!("the Lab answered 200 with a malformed body");
+            self.defer(lease.token, &ids).await;
             return Delivery::Failed {
                 reason: "malformed",
                 pending,
@@ -220,8 +263,14 @@ impl LabSender {
         if delivered < pending {
             tracing::warn!(
                 not_accepted = pending - delivered,
-                "the Lab did not accept every usage event; the rest is retried"
+                "the Lab did not accept every usage event; the rest is retried later"
             );
+            let refused: Vec<Uuid> = ids
+                .iter()
+                .copied()
+                .filter(|id| !accepted.contains(id))
+                .collect();
+            self.defer(lease.token, &refused).await;
         }
         Delivery::Sent {
             delivered,
@@ -238,16 +287,53 @@ impl LabSender {
     }
 
     /// Deliver every `interval` until `cancel`, draining while batches come
-    /// back full; prune hourly.
+    /// back full; prune hourly. After failed rounds the pause grows
+    /// ([`next_wait`]) and the failure is logged at most every
+    /// [`LOG_EVERY`].
     pub async fn run(self, interval: Duration, cancel: CancellationToken) {
         let mut last_prune: Option<Instant> = None;
+        let mut failures: u32 = 0;
+        let mut log = LogLimiter::new(LOG_EVERY);
         loop {
             // Bounded drain: at most 20 full batches per tick.
             for _ in 0..20 {
                 match self.deliver_once().await {
                     Delivery::Sent { delivered, pending }
-                        if (delivered + pending) as u32 == BATCH_SIZE && pending == 0 => {}
-                    _ => break,
+                        if (delivered + pending) as u32 == BATCH_SIZE && pending == 0 =>
+                    {
+                        failures = 0;
+                    }
+                    Delivery::Failed { reason, pending } => {
+                        failures = failures.saturating_add(1);
+                        if let Some(suppressed) = log.allow() {
+                            if reason == "unauthorized" {
+                                tracing::error!(
+                                    pending,
+                                    suppressed,
+                                    "the Lab rejected LAB_INSTANCE_ID / LAB_INSTANCE_SECRET \
+                                     (401); usage events stay pending until the credentials \
+                                     are fixed"
+                                );
+                            } else {
+                                tracing::warn!(
+                                    reason,
+                                    pending,
+                                    suppressed,
+                                    "usage events could not be delivered to the Lab; retrying \
+                                     with backoff"
+                                );
+                            }
+                        }
+                        break;
+                    }
+                    _ => {
+                        if failures > 0 {
+                            tracing::info!("usage events reach the Lab again");
+                        }
+                        failures = 0;
+                        log.reset();
+                        break;
+                    }
                 }
             }
             if last_prune.is_none_or(|t| t.elapsed() >= Duration::from_secs(3600)) {
@@ -256,7 +342,7 @@ impl LabSender {
             }
             tokio::select! {
                 _ = cancel.cancelled() => return,
-                _ = tokio::time::sleep(interval) => {}
+                _ = tokio::time::sleep(next_wait(interval, failures)) => {}
             }
         }
     }
@@ -397,7 +483,11 @@ mod tests {
         let ids = seed(&outbox, &[2, 3]).await;
         let sender = LabSender::new(outbox.clone(), config(&server))
             .unwrap()
-            .with_lease(Duration::from_millis(200));
+            .with_lease(Duration::from_millis(200))
+            .with_retry_backoff(RetryBackoff {
+                base: Duration::from_millis(150),
+                max: Duration::from_millis(150),
+            });
         assert_eq!(
             sender.deliver_once().await,
             Delivery::Failed {
@@ -405,8 +495,7 @@ mod tests {
                 pending: 2
             }
         );
-        // Leased: not sent again before the lease expires.
-        assert_eq!(sender.deliver_once().await, Delivery::Idle);
+        // Deferred: not sent again before its backoff.
         tokio::time::sleep(Duration::from_millis(250)).await;
         assert_eq!(
             sender.deliver_once().await,
@@ -430,6 +519,39 @@ mod tests {
             lease.events.iter().map(|e| e.id).collect::<Vec<_>>(),
             vec![ids[1]]
         );
+    }
+
+    #[tokio::test]
+    async fn a_lab_that_keeps_failing_defers_events_and_slows_down() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+        let outbox = Arc::new(MemStore::new());
+        seed(&outbox, &[2, 3]).await;
+        let sender = LabSender::new(outbox.clone(), config(&server))
+            .unwrap()
+            .with_lease(Duration::from_millis(20));
+        assert_eq!(
+            sender.deliver_once().await,
+            Delivery::Failed {
+                reason: "unauthorized",
+                pending: 2
+            }
+        );
+        // The lease is long over, but the events wait for their backoff
+        // instead of being sent again every round.
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert_eq!(sender.deliver_once().await, Delivery::Idle);
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        assert_eq!(outbox.count_unsent().await.unwrap(), 2, "kept, not lost");
+
+        let i = Duration::from_secs(2);
+        assert_eq!(next_wait(i, 0), i);
+        assert_eq!(next_wait(i, 1), Duration::from_secs(4));
+        assert_eq!(next_wait(i, 4), Duration::from_secs(32));
+        assert_eq!(next_wait(i, 30), MAX_IDLE);
     }
 
     #[tokio::test]

@@ -11,6 +11,8 @@ use meili_connect_core::host_policy::{self, PolicyMode};
 use meili_connect_core::{Endpoint, HostPolicy, Secret};
 use thiserror::Error;
 
+use crate::limits::Limits;
+
 #[derive(Debug, Error, PartialEq, Eq)]
 #[error("{0}")]
 pub struct ConfigError(pub String);
@@ -68,6 +70,8 @@ pub struct Config {
     /// `LAB_SERVICE_TOKEN` is set, `any` otherwise. The state database is
     /// always refused as a source origin.
     pub host_policy: HostPolicy,
+    /// Quotas and bounds.
+    pub limits: Limits,
 }
 
 impl Config {
@@ -186,6 +190,28 @@ impl Config {
             lab_send_interval: secs(&get, "LAB_SEND_INTERVAL_SECS", 2, 1, 300)?,
             source_probe_timeout: secs(&get, "SOURCE_PROBE_TIMEOUT_SECS", 30, 1, 600)?,
             shutdown_grace: secs(&get, "SHUTDOWN_GRACE_SECS", 30, 1, 600)?,
+            limits: Limits {
+                max_syncs_per_tenant: num(&get, "MAX_SYNCS_PER_TENANT", 20, 1, 1_000_000)?,
+                probe_concurrency: usize::try_from(num(&get, "PROBE_CONCURRENCY", 16, 1, 1024)?)
+                    .unwrap_or(16),
+                probe_concurrency_per_tenant: usize::try_from(num(
+                    &get,
+                    "PROBE_CONCURRENCY_PER_TENANT",
+                    4,
+                    1,
+                    1024,
+                )?)
+                .unwrap_or(4),
+                request_timeout: secs(&get, "REQUEST_TIMEOUT_SECS", 180, 5, 3600)?,
+                dead_letters_max_per_sync: num(
+                    &get,
+                    "DEAD_LETTERS_MAX_PER_SYNC",
+                    10_000,
+                    0,
+                    10_000_000,
+                )?,
+                outbox_max_pending: num(&get, "LAB_OUTBOX_MAX_PENDING", 100_000, 1, 100_000_000)?,
+            },
         })
     }
 }
@@ -227,6 +253,24 @@ pub fn state_db_endpoints(url: &str) -> Vec<Endpoint> {
     }
     out.retain(|e| !e.host.is_empty());
     out
+}
+
+fn num(
+    get: &impl Fn(&str) -> Option<String>,
+    name: &str,
+    default: u64,
+    min: u64,
+    max: u64,
+) -> Result<u64, ConfigError> {
+    let Some(raw) = get(name) else {
+        return Ok(default);
+    };
+    match raw.trim().parse::<u64>() {
+        Ok(v) if (min..=max).contains(&v) => Ok(v),
+        _ => Err(ConfigError(format!(
+            "{name} must be a number between {min} and {max}"
+        ))),
+    }
 }
 
 fn secs(
@@ -427,6 +471,29 @@ mod tests {
         assert!(cfg(&[("LISTEN_ADDR", "nope")]).is_err());
         assert!(cfg(&[("LOG_FORMAT", "xml")]).is_err());
         assert!(cfg(&[("USAGE_FLUSH_INTERVAL_SECS", "0")]).is_err());
+        assert!(cfg(&[("MAX_SYNCS_PER_TENANT", "0")]).is_err());
+        assert!(cfg(&[("REQUEST_TIMEOUT_SECS", "1")]).is_err());
+        let c = cfg(&[
+            ("MAX_SYNCS_PER_TENANT", "5"),
+            ("PROBE_CONCURRENCY", "8"),
+            ("PROBE_CONCURRENCY_PER_TENANT", "2"),
+            ("DEAD_LETTERS_MAX_PER_SYNC", "100"),
+            ("LAB_OUTBOX_MAX_PENDING", "1000"),
+            ("REQUEST_TIMEOUT_SECS", "30"),
+        ])
+        .unwrap();
+        assert_eq!(
+            c.limits,
+            Limits {
+                max_syncs_per_tenant: 5,
+                probe_concurrency: 8,
+                probe_concurrency_per_tenant: 2,
+                request_timeout: Duration::from_secs(30),
+                dead_letters_max_per_sync: 100,
+                outbox_max_pending: 1000,
+            }
+        );
+        assert_eq!(cfg(&[]).unwrap().limits, Limits::default());
         assert_eq!(
             cfg(&[("USAGE_FLUSH_INTERVAL_SECS", "5")])
                 .unwrap()

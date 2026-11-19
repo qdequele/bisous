@@ -63,3 +63,12 @@ All notable changes to meili-connect are listed here. The format follows
   `?force=true`) and synced fresh; new streams or another Meilisearch URL
   clear the checkpoint so the data is backfilled; anything else restarts.
   A paused sync stays paused.
+- Bounded growth: Lab events that fail are deferred with exponential backoff
+  (additive migration: `attempts`, `next_attempt_at`), the sender backs off
+  and rate-limits its logs, and past `LAB_OUTBOX_MAX_PENDING` unsent events
+  usage stays counted in memory. Dead letters are capped per sync
+  (`DEAD_LETTERS_MAX_PER_SYNC`, default 10,000; `dead_letters_overflow` in the
+  status) and payloads over 64 KiB are truncated. Tenants own at most
+  `MAX_SYNCS_PER_TENANT` syncs (default 20), `check`/`discover` run under
+  global and per-tenant concurrency limits, and every request is bounded by
+  `REQUEST_TIMEOUT_SECS`.

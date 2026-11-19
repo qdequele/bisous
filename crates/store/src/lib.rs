@@ -87,6 +87,77 @@ pub struct DailyProgress {
     pub written: u64,
     pub deleted: u64,
     pub rejected: u64,
+    /// Dead letters not stored because the sync had reached
+    /// [`DeadLetterLimits::max_per_sync`] (they are counted in `rejected`).
+    #[serde(default)]
+    pub dead_letters_dropped: u64,
+}
+
+/// What one sync may keep in the dead-letter table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeadLetterLimits {
+    /// Stored letters per sync. Past it, letters are counted
+    /// ([`DailyProgress::dead_letters_dropped`]) but not stored.
+    pub max_per_sync: u64,
+    /// A payload whose JSON is larger is replaced by
+    /// `{"truncated": true, "bytes": <size>}`.
+    pub max_payload_bytes: usize,
+}
+
+impl Default for DeadLetterLimits {
+    fn default() -> Self {
+        Self {
+            max_per_sync: 10_000,
+            max_payload_bytes: 64 * 1024,
+        }
+    }
+}
+
+/// Longest stored `reason` and `document_id`, in characters.
+const MAX_LETTER_TEXT: usize = 2_048;
+
+fn cap_text(s: &str) -> String {
+    if s.chars().count() <= MAX_LETTER_TEXT {
+        s.to_owned()
+    } else {
+        let mut out: String = s.chars().take(MAX_LETTER_TEXT).collect();
+        out.push('…');
+        out
+    }
+}
+
+/// The letter as stored: payload, reason and id bounded.
+pub(crate) fn bound_letter(letter: &DeadLetter, limits: &DeadLetterLimits) -> DeadLetter {
+    let size = serde_json::to_vec(&letter.payload).map_or(usize::MAX, |b| b.len());
+    let payload = if size > limits.max_payload_bytes {
+        serde_json::json!({ "truncated": true, "bytes": size })
+    } else {
+        letter.payload.clone()
+    };
+    DeadLetter {
+        sync_id: letter.sync_id.clone(),
+        index: cap_text(&letter.index),
+        document_id: cap_text(&letter.document_id),
+        payload,
+        reason: cap_text(&letter.reason),
+        created_at: letter.created_at,
+    }
+}
+
+/// How long an event waits after its `attempts`-th failed delivery:
+/// `base * 2^attempts`, capped at `max`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetryBackoff {
+    pub base: Duration,
+    pub max: Duration,
+}
+
+impl RetryBackoff {
+    pub fn delay(&self, attempts: u32) -> Duration {
+        self.base
+            .saturating_mul(1u32 << attempts.min(20))
+            .min(self.max)
+    }
 }
 
 /// A Lab event waiting in the outbox.
@@ -204,6 +275,19 @@ pub trait LabOutbox: Send + Sync {
     /// batches so no single statement holds locks for long. Unsent events
     /// are never deleted. Returns how many went.
     async fn prune_sent_events(&self, older_than: Duration) -> Result<u64, RepoError>;
+
+    /// A delivery of these events (still held under `lease`) failed: count
+    /// the attempt, release the lease, and keep them back until
+    /// `backoff.delay(attempts)` from now. Returns how many were deferred.
+    async fn defer_events(
+        &self,
+        lease: Uuid,
+        ids: &[Uuid],
+        backoff: RetryBackoff,
+    ) -> Result<u64, RepoError>;
+
+    /// Events not delivered yet (the backlog).
+    async fn count_unsent(&self) -> Result<u64, RepoError>;
 }
 
 /// Checks shared by both stores before writing a spec.

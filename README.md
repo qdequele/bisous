@@ -205,7 +205,12 @@ Every variable, with defaults, is in [`.env.example`](.env.example).
 | `USAGE_FLUSH_INTERVAL_SECS` | `60` | How often counts become usage events. |
 | `LAB_SEND_INTERVAL_SECS` | `2` | How often the outbox is delivered. |
 | `SOURCE_PROBE_TIMEOUT_SECS` | `30` | Limit of `check` and `discover`. |
-| `SHUTDOWN_GRACE_SECS` | `30` | Time the syncs get to stop on SIGTERM/SIGINT. |
+| `SHUTDOWN_GRACE_SECS` | `30` | Time the syncs get to stop on SIGTERM/SIGINT; also the bound on stopping one sync. |
+| `MAX_SYNCS_PER_TENANT` | `20` | Syncs a tenant may own (`409 sync_quota_exceeded`). The global scope is not limited. |
+| `PROBE_CONCURRENCY` / `PROBE_CONCURRENCY_PER_TENANT` | `16` / `4` | `check` and `discover` running at once, in all and per tenant (`429 too_many_probes`). |
+| `REQUEST_TIMEOUT_SECS` | `180` | Longest API request (`503 request_timeout`); a change to a sync still completes. |
+| `DEAD_LETTERS_MAX_PER_SYNC` | `10000` | Dead letters kept per sync; past it they are counted (`dead_letters_overflow` in the status) but not stored. Payloads over 64 KiB are stored as `{"truncated": true, "bytes": n}`. |
+| `LAB_OUTBOX_MAX_PENDING` | `100000` | Unsent Lab events beyond which usage stays counted in memory instead of enqueued. |
 | `LOG_FORMAT` | `pretty` | `pretty` or `json`. |
 | `LOG_LEVEL` / `RUST_LOG` | `info` | `RUST_LOG` wins and takes the full filter syntax. |
 
@@ -262,8 +267,12 @@ with a non-zero count goes into the outbox (Postgres):
 A sender leases up to 500 events, posts `{"events": [...]}` to
 `<LAB_URL>/internal/events` with `X-Lab-Instance-Id`, `X-Lab-Timestamp` and
 `X-Lab-Signature: sha256=<hex HMAC-SHA256(LAB_INSTANCE_SECRET, "<ts>.<body>")>`,
-marks the ids the Lab lists in `accepted` as sent and retries the rest. Sent
-events are pruned after 7 days. Delivery is **at-least-once from the outbox
+marks the ids the Lab lists in `accepted` as sent and retries the rest. An
+event that failed waits longer after each attempt (10 s doubling up to an
+hour), the sender slows down while the Lab fails and logs it at most every
+5 minutes, and past `LAB_OUTBOX_MAX_PENDING` unsent events usage is kept
+counted in memory (one number per sync) instead of enqueued. Sent events are
+pruned after 7 days. Delivery is **at-least-once from the outbox
 onward** (the event id is stable, the Lab deduplicates). Counts accumulated in
 memory but not yet enqueued **are lost if the process crashes** (at most one
 flush interval); a graceful shutdown enqueues them. Global (non-tenant) syncs

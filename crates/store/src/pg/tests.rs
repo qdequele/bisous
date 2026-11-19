@@ -102,6 +102,7 @@ async fn specs_are_sealed_at_rest() {
     let other = PgStore {
         pool: store.pool().clone(),
         key: SecretKey::generate(),
+        limits: DeadLetterLimits::default(),
     };
     assert!(matches!(
         other.get_sync(Some("t"), "s1").await,
@@ -414,13 +415,15 @@ async fn progress_is_additive() {
                 day: yesterday,
                 written: 7,
                 deleted: 0,
-                rejected: 0
+                rejected: 0,
+                dead_letters_dropped: 0,
             },
             DailyProgress {
                 day: today,
                 written: 60,
                 deleted: 40,
-                rejected: 20
+                rejected: 20,
+                dead_letters_dropped: 0,
             }
         ]
     );
@@ -718,6 +721,65 @@ async fn outbox_prunes_old_sent_events_in_batches() {
         .await
         .unwrap();
     assert_eq!(left, [unsent]);
+}
+
+#[tokio::test]
+async fn dead_letters_are_capped_per_sync_and_bounded_in_size() {
+    let Some(store) = store().await else { return };
+    let store = store.with_dead_letter_limits(DeadLetterLimits {
+        max_per_sync: 3,
+        max_payload_bytes: 64,
+    });
+    store
+        .create_sync(None, &spec("a", None, "a"))
+        .await
+        .unwrap();
+    let mut big = letter("a", "big");
+    big.payload = serde_json::json!({"doc": "x".repeat(1000)});
+    store.push_dead_letters(&[big]).await.unwrap();
+    let batch: Vec<_> = (0..5).map(|i| letter("a", &i.to_string())).collect();
+    store.push_dead_letters(&batch).await.unwrap();
+    let got = store
+        .list_dead_letters(None, "a", DeadLetterPage::default())
+        .await
+        .unwrap();
+    assert_eq!(got.len(), 3);
+    assert_eq!(got[0].letter.payload["truncated"], true);
+    let today = Utc::now().date_naive();
+    let p = store.progress(None, "a", today, today).await.unwrap();
+    assert_eq!(p[0].dead_letters_dropped, 3);
+}
+
+#[tokio::test]
+async fn deferred_events_wait_for_their_backoff() {
+    let Some(store) = store().await else { return };
+    let id = store
+        .enqueue_event(Some("t"), &serde_json::json!({}))
+        .await
+        .unwrap();
+    assert_eq!(store.count_unsent().await.unwrap(), 1);
+    let lease = store
+        .lease_events(10, Duration::from_millis(10))
+        .await
+        .unwrap();
+    let backoff = RetryBackoff {
+        base: Duration::from_secs(60),
+        max: Duration::from_secs(3600),
+    };
+    assert_eq!(
+        store
+            .defer_events(lease.token, &[id], backoff)
+            .await
+            .unwrap(),
+        1
+    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let again = store
+        .lease_events(10, Duration::from_secs(1))
+        .await
+        .unwrap();
+    assert!(again.events.is_empty());
+    assert_eq!(store.count_unsent().await.unwrap(), 1);
 }
 
 #[tokio::test]

@@ -290,6 +290,7 @@ paths:
                         day: { type: string, format: date }
                         written: { type: integer }
                         deleted: { type: integer }
+                        dead_letters_dropped: { type: integer }
                         rejected: { type: integer }
         "400": { $ref: "#/components/responses/Error" }
         "401": { $ref: "#/components/responses/Error" }
@@ -401,7 +402,12 @@ components:
             `conflict`, `source_config`, `source_paused`, `source_unavailable`,
             `source_error`, `source_timeout`, `teardown_failed`,
             `store_unavailable`, `shutting_down`, `engine`, `internal`,
-            `secret_required` (422: a `"<redacted>"` placeholder for a secret
+            `sync_quota_exceeded` (409: the tenant owns
+            `MAX_SYNCS_PER_TENANT` syncs), `too_many_probes` (429: too many
+            checks or discoveries running; retry), `request_timeout` (503:
+            the request took longer than `REQUEST_TIMEOUT_SECS`; a change to
+            a sync still completes), `secret_required` (422: a
+            `"<redacted>"` placeholder for a secret
             whose source or destination changed), `host_not_allowed` (422:
             the host policy refuses the source or
             destination; the message names the host, never what it resolved
@@ -432,6 +438,13 @@ components:
             written: { type: integer }
             deleted: { type: integer }
             rejected: { type: integer }
+        dead_letters_overflow:
+          type: integer
+          description: |
+            Rejected documents not kept as dead letters because the sync
+            holds `DEAD_LETTERS_MAX_PER_SYNC` of them already (they are
+            counted in `progress.rejected`). Clear the dead letters to keep
+            new ones.
 
     SourceSpec:
       type: object

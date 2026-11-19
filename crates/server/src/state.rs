@@ -8,6 +8,7 @@ use meili_connect_store::{LabOutbox, SyncRepository};
 
 use crate::auth::AuthConfig;
 use crate::guard::GuardedSources;
+use crate::limits::{Limits, ProbeSlots};
 use crate::manager::{SinkFactory, SyncManager};
 
 /// Everything a store must be for the server: the engine's state, the
@@ -30,6 +31,9 @@ pub struct AppState {
     pub probe_timeout: Duration,
     /// Usage events go to the Lab (all three `LAB_*` event variables set).
     pub lab_events: bool,
+    pub limits: Limits,
+    /// Slots for `check` and `discover`.
+    pub probes: Arc<ProbeSlots>,
 }
 
 impl AppState {

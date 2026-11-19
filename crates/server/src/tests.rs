@@ -23,6 +23,7 @@ use tokio_util::sync::CancellationToken;
 use tower::ServiceExt;
 
 use crate::auth::{AuthConfig, H_TENANT_ID};
+use crate::limits::Limits;
 use crate::manager::SinkFactory;
 use crate::routes::ROUTES;
 use crate::state::{AppState, Backend};
@@ -244,6 +245,32 @@ fn app_with(auth: AuthConfig, store: Arc<MemStore>) -> App {
 }
 
 fn app_full(auth: AuthConfig, store: Arc<MemStore>, policy: HostPolicy) -> App {
+    app_build(
+        auth,
+        store,
+        policy,
+        Limits::default(),
+        Duration::from_millis(200),
+    )
+}
+
+fn app_limits(auth: AuthConfig, limits: Limits, probe_timeout: Duration) -> App {
+    app_build(
+        auth,
+        Arc::new(MemStore::new()),
+        HostPolicy::any(),
+        limits,
+        probe_timeout,
+    )
+}
+
+fn app_build(
+    auth: AuthConfig,
+    store: Arc<MemStore>,
+    policy: HostPolicy,
+    limits: Limits,
+    probe_timeout: Duration,
+) -> App {
     let probe = Arc::new(Probe::default());
     let state = build_state(
         Arc::clone(&store) as Arc<dyn Backend>,
@@ -253,8 +280,9 @@ fn app_full(auth: AuthConfig, store: Arc<MemStore>, policy: HostPolicy) -> App {
             policy: Arc::new(policy),
             supervisor: SupervisorConfig::default(),
             auth,
-            probe_timeout: Duration::from_millis(200),
+            probe_timeout,
             lab_events: true,
+            limits,
         },
         CancellationToken::new(),
     );
@@ -1027,6 +1055,221 @@ async fn lab_callers_and_tenant_syncs_get_coarse_errors() {
         st["message"].as_str().unwrap().contains("DRIVER-DETAIL"),
         "{st}"
     );
+}
+
+// ------------------------------------------------------------- quotas
+
+#[tokio::test]
+async fn a_tenant_owns_a_bounded_number_of_syncs() {
+    let a = app_limits(
+        locked(),
+        Limits {
+            max_syncs_per_tenant: 2,
+            ..Limits::default()
+        },
+        Duration::from_millis(200),
+    );
+    create(&a, &lab("t1"), "one").await;
+    let two = create(&a, &lab("t1"), "two").await;
+    let (status, body) = call(
+        &a.router,
+        "POST",
+        "/syncs",
+        &lab("t1"),
+        Some(sync_body("three")),
+    )
+    .await;
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (StatusCode::CONFLICT, Some("sync_quota_exceeded")),
+        "{body}"
+    );
+    // Other tenants and the global scope are not affected.
+    create(&a, &lab("t2"), "one").await;
+    for i in 0..3 {
+        create(&a, &admin(), &format!("g{i}")).await;
+    }
+    // Deleting one frees a slot.
+    let (status, _) = call(
+        &a.router,
+        "DELETE",
+        &format!("/syncs/{two}"),
+        &lab("t1"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    create(&a, &lab("t1"), "three").await;
+}
+
+#[tokio::test]
+async fn concurrent_creates_respect_the_quota() {
+    let a = app_limits(
+        locked(),
+        Limits {
+            max_syncs_per_tenant: 3,
+            ..Limits::default()
+        },
+        Duration::from_millis(200),
+    );
+    let calls = (0..8).map(|i| {
+        let router = a.router.clone();
+        async move {
+            call(
+                &router,
+                "POST",
+                "/syncs",
+                &lab("t1"),
+                Some(sync_body(&format!("s{i}"))),
+            )
+            .await
+            .0
+        }
+    });
+    let statuses = futures_join_all(calls).await;
+    assert_eq!(
+        statuses
+            .iter()
+            .filter(|s| **s == StatusCode::CREATED)
+            .count(),
+        3
+    );
+    let (_, list) = call(&a.router, "GET", "/syncs", &lab("t1"), None).await;
+    assert_eq!(list["syncs"].as_array().unwrap().len(), 3);
+}
+
+async fn futures_join_all<F: std::future::Future + Send + 'static>(
+    futs: impl Iterator<Item = F>,
+) -> Vec<F::Output>
+where
+    F::Output: Send + 'static,
+{
+    let handles: Vec<_> = futs.map(tokio::spawn).collect();
+    let mut out = Vec::new();
+    for h in handles {
+        out.push(h.await.unwrap());
+    }
+    out
+}
+
+#[tokio::test]
+async fn probes_are_bounded_per_tenant_and_in_all() {
+    let a = app_limits(
+        locked(),
+        Limits {
+            probe_concurrency: 2,
+            probe_concurrency_per_tenant: 1,
+            ..Limits::default()
+        },
+        Duration::from_millis(400),
+    );
+    let slow = json!({"source": {"kind": "postgres", "config": {"slow": true}}});
+    let fast = json!({"source": {"kind": "postgres", "config": {}}});
+    let router = a.router.clone();
+    let s = slow.clone();
+    let first = tokio::spawn(async move {
+        call(&router, "POST", "/sources/check", &lab("t1"), Some(s))
+            .await
+            .0
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    // The same tenant has no slot left.
+    let (status, body) = call(
+        &a.router,
+        "POST",
+        "/sources/discover",
+        &lab("t1"),
+        Some(fast.clone()),
+    )
+    .await;
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (StatusCode::TOO_MANY_REQUESTS, Some("too_many_probes"))
+    );
+    // Another tenant has one, until the global pool is used up.
+    let router = a.router.clone();
+    let second = tokio::spawn(async move {
+        call(&router, "POST", "/sources/check", &lab("t2"), Some(slow))
+            .await
+            .0
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let (status, _) = call(
+        &a.router,
+        "POST",
+        "/sources/check",
+        &lab("t3"),
+        Some(fast.clone()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(first.await.unwrap(), StatusCode::GATEWAY_TIMEOUT);
+    assert_eq!(second.await.unwrap(), StatusCode::GATEWAY_TIMEOUT);
+    // Slots come back.
+    let (status, _) = call(&a.router, "POST", "/sources/check", &lab("t1"), Some(fast)).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn requests_are_bounded_in_time() {
+    let a = app_limits(
+        AuthConfig::open(),
+        Limits {
+            request_timeout: Duration::from_millis(150),
+            ..Limits::default()
+        },
+        Duration::from_secs(20),
+    );
+    let started = std::time::Instant::now();
+    let (status, body) = call(
+        &a.router,
+        "POST",
+        "/sources/check",
+        &[],
+        Some(json!({"source": {"kind": "postgres", "config": {"slow": true}}})),
+    )
+    .await;
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (StatusCode::SERVICE_UNAVAILABLE, Some("request_timeout"))
+    );
+    assert!(started.elapsed() < Duration::from_secs(5));
+}
+
+#[tokio::test]
+async fn dead_letters_overflow_is_reported() {
+    let store = Arc::new(MemStore::new().with_dead_letter_limits(
+        meili_connect_store::DeadLetterLimits {
+            max_per_sync: 2,
+            ..Default::default()
+        },
+    ));
+    let a = app_with(AuthConfig::open(), store);
+    let id = create(&a, &[], "s").await;
+    let letters: Vec<_> = (0..5)
+        .map(|i| meili_connect_core::DeadLetter {
+            sync_id: id.clone(),
+            index: "items".into(),
+            document_id: format!("d{i}"),
+            payload: json!({"kind": "replace"}),
+            reason: "invalid".into(),
+            created_at: chrono::Utc::now(),
+        })
+        .collect();
+    meili_connect_core::StateStore::push_dead_letters(&*a.store, &letters)
+        .await
+        .unwrap();
+    let (_, st) = call(&a.router, "GET", &format!("/syncs/{id}/status"), &[], None).await;
+    assert_eq!(st["dead_letters_overflow"], 3, "{st}");
+    let (_, page) = call(
+        &a.router,
+        "GET",
+        &format!("/syncs/{id}/dead-letters"),
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(page["items"].as_array().unwrap().len(), 2);
 }
 
 // ------------------------------------------------------------- concurrency

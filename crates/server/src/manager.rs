@@ -82,6 +82,8 @@ pub struct ManagerDeps {
     pub meter: Arc<UsageMeter>,
     /// Usage events go to the Lab: a deleted sync's count is enqueued.
     pub lab_events: bool,
+    /// Syncs one tenant may own.
+    pub max_syncs_per_tenant: u64,
     pub cancel: CancellationToken,
 }
 
@@ -95,6 +97,7 @@ pub struct SyncManager {
     cancel: CancellationToken,
     meter: Arc<UsageMeter>,
     lab_events: bool,
+    max_syncs_per_tenant: u64,
     /// Time limit of a teardown run outside a supervisor.
     teardown_timeout: Duration,
     supervisors: Mutex<HashMap<String, Arc<Supervisor>>>,
@@ -117,6 +120,7 @@ impl SyncManager {
             cancel: deps.cancel,
             meter: deps.meter,
             lab_events: deps.lab_events,
+            max_syncs_per_tenant: deps.max_syncs_per_tenant,
             teardown_timeout: Duration::from_secs(60),
             supervisors: Mutex::new(HashMap::new()),
             ops: Mutex::new(HashMap::new()),
@@ -218,8 +222,27 @@ impl SyncManager {
 
     // ------------------------------------------------------------ entry points
 
-    /// Store a new sync and start it.
+    /// Store a new sync and start it. A tenant owns at most
+    /// `max_syncs_per_tenant` syncs.
     pub async fn create(&self, spec: SyncSpec) -> ApiResult<StoredSync> {
+        // Creations of one tenant run one at a time, so the count holds.
+        let _quota = match &spec.tenant {
+            Some(tenant) => Some(self.serialize(&format!("tenant/{tenant}")).await),
+            None => None,
+        };
+        if let Some(tenant) = &spec.tenant {
+            let owned = self.backend.list_syncs(Some(tenant)).await?.len() as u64;
+            if owned >= self.max_syncs_per_tenant {
+                return Err(ApiError::new(
+                    StatusCode::CONFLICT,
+                    "sync_quota_exceeded",
+                    format!(
+                        "this tenant already has {owned} syncs, the most it may have; delete \
+                         one first"
+                    ),
+                ));
+            }
+        }
         let _op = self.serialize(&spec.id).await;
         let stored = self
             .backend
