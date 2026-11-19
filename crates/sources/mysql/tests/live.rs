@@ -765,6 +765,8 @@ async fn xa_transactions() {
         eprintln!("gtid_mode is not ON: skipping");
         return;
     }
+    // A prepared XA left by an interrupted run would hold its locks.
+    let _ = conn.query_drop("XA ROLLBACK 'd'").await;
     fresh_db(&mut conn, "mc_xa").await;
     conn.query_drop("CREATE TABLE mc_xa.items (id INT PRIMARY KEY, v VARCHAR(10))")
         .await
