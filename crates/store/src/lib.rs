@@ -99,6 +99,15 @@ pub struct OutboxEvent {
     pub created_at: DateTime<Utc>,
 }
 
+/// Events leased together by [`LabOutbox::lease_events`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct OutboxLease {
+    /// Proves the lease: pass it to [`LabOutbox::mark_events_sent`].
+    pub token: Uuid,
+    /// Oldest first. Empty when nothing was free.
+    pub events: Vec<OutboxEvent>,
+}
+
 /// Sync specs and their per-sync data, scoped by tenant.
 #[async_trait]
 pub trait SyncRepository: Send + Sync {
@@ -181,16 +190,20 @@ pub trait LabOutbox: Send + Sync {
     ) -> Result<Uuid, RepoError>;
 
     /// Lease up to `limit` unsent events whose lease is free or expired,
-    /// oldest first, for `lease`. Concurrent leasers never get the same
-    /// event while its lease runs.
-    async fn lease_events(
-        &self,
-        limit: u32,
-        lease: Duration,
-    ) -> Result<Vec<OutboxEvent>, RepoError>;
+    /// oldest first, for `lease`, under a fresh token. Concurrent leasers
+    /// never get the same event while its lease runs.
+    async fn lease_events(&self, limit: u32, lease: Duration) -> Result<OutboxLease, RepoError>;
 
-    /// Mark events as delivered. Returns how many were newly marked.
-    async fn mark_events_sent(&self, ids: &[Uuid]) -> Result<u64, RepoError>;
+    /// Mark events as delivered, but only those still held under `lease`
+    /// (the token of an [`OutboxLease`]): an event whose lease expired and
+    /// was taken by another leaser is left to that leaser. Returns how many
+    /// were newly marked.
+    async fn mark_events_sent(&self, lease: Uuid, ids: &[Uuid]) -> Result<u64, RepoError>;
+
+    /// Delete delivered events sent more than `older_than` ago, in bounded
+    /// batches so no single statement holds locks for long. Unsent events
+    /// are never deleted. Returns how many went.
+    async fn prune_sent_events(&self, older_than: Duration) -> Result<u64, RepoError>;
 }
 
 /// Checks shared by both stores before writing a spec.
@@ -198,6 +211,7 @@ pub(crate) fn validate_spec(tenant: Option<&str>, spec: &SyncSpec) -> Result<(),
     if spec.id.is_empty() {
         return Err(RepoError::Invalid("sync id is empty".into()));
     }
+    spec.validate().map_err(RepoError::Invalid)?;
     if spec.name.is_empty() {
         return Err(RepoError::Invalid("sync name is empty".into()));
     }
@@ -267,6 +281,29 @@ pub(crate) mod test_support {
             message: None,
             resyncing: false,
             updated_at: now(),
+        }
+    }
+
+    /// A spec `SyncSpec::validate` refuses.
+    pub fn invalid_specs(id: &str, tenant: Option<&str>) -> Vec<SyncSpec> {
+        let mut no_streams = spec(id, tenant, "n");
+        no_streams.streams.clear();
+        let mut bad_index = spec(id, tenant, "n");
+        bad_index.streams[0].index = "bad uid".into();
+        let mut bad_guard = spec(id, tenant, "n");
+        bad_guard.mass_delete_guard = Some(2.0);
+        vec![no_streams, bad_index, bad_guard]
+    }
+
+    /// A record the source skipped: no payload, a position as the id.
+    pub fn skipped_letter(sync_id: &str, position: &str) -> DeadLetter {
+        DeadLetter {
+            sync_id: sync_id.into(),
+            index: "orders".into(),
+            document_id: position.into(),
+            payload: serde_json::Value::Null,
+            reason: "undecodable record".into(),
+            created_at: now(),
         }
     }
 

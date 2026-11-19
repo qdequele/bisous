@@ -17,11 +17,29 @@ use uuid::Uuid;
 
 use crate::error::from_sqlx;
 use crate::{
-    BootSync, DailyProgress, DeadLetterPage, LabOutbox, OutboxEvent, RepoError, SecretKey,
-    StoredDeadLetter, StoredSync, SyncRepository, to_i64, to_u64, validate_spec,
+    BootSync, DailyProgress, DeadLetterPage, LabOutbox, OutboxEvent, OutboxLease, RepoError,
+    SecretKey, StoredDeadLetter, StoredSync, SyncRepository, to_i64, to_u64, validate_spec,
 };
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
+
+/// Rows deleted per statement by `prune_sent_events`.
+const PRUNE_BATCH: i64 = 1_000;
+
+/// Pick then lease. The `MATERIALIZED` CTE runs once: an `IN (SELECT …
+/// LIMIT n FOR UPDATE SKIP LOCKED)` subquery may be re-run per outer row
+/// under a nested-loop plan and lease more than `n` rows.
+const LEASE_SQL: &str = "WITH picked AS MATERIALIZED (
+        SELECT id FROM lab_events_outbox
+        WHERE sent_at IS NULL AND (leased_until IS NULL OR leased_until <= now())
+        ORDER BY created_at, id
+        LIMIT $1
+        FOR UPDATE SKIP LOCKED
+     )
+     UPDATE lab_events_outbox o
+     SET leased_until = now() + make_interval(secs => $2), lease_token = $3
+     FROM picked WHERE o.id = picked.id
+     RETURNING o.id, o.tenant_id, o.payload, o.created_at";
 
 pub struct PgStore {
     pool: PgPool,
@@ -54,10 +72,14 @@ impl PgStore {
 
     /// Wrap an existing pool, applying pending migrations first.
     pub async fn from_pool(pool: PgPool, key: SecretKey) -> Result<Self, StoreError> {
-        MIGRATOR
-            .run(&pool)
-            .await
-            .map_err(|e| StoreError::Fatal(format!("migrations failed: {e}")))?;
+        MIGRATOR.run(&pool).await.map_err(|e| match e {
+            // A connection lost while migrating is worth a retry.
+            sqlx::migrate::MigrateError::Execute(e) => match from_sqlx(e) {
+                RepoError::Transient(m) => StoreError::Transient(format!("migrations: {m}")),
+                other => StoreError::Fatal(format!("migrations failed: {other}")),
+            },
+            other => StoreError::Fatal(format!("migrations failed: {other}")),
+        })?;
         Ok(Self { pool, key })
     }
 
@@ -479,31 +501,22 @@ impl LabOutbox for PgStore {
         Ok(id)
     }
 
-    async fn lease_events(
-        &self,
-        limit: u32,
-        lease: Duration,
-    ) -> Result<Vec<OutboxEvent>, RepoError> {
+    async fn lease_events(&self, limit: u32, lease: Duration) -> Result<OutboxLease, RepoError> {
+        let token = Uuid::new_v4();
         if limit == 0 {
-            return Ok(Vec::new());
+            return Ok(OutboxLease {
+                token,
+                events: Vec::new(),
+            });
         }
-        let rows = sqlx::query(
-            "UPDATE lab_events_outbox SET leased_until = now() + make_interval(secs => $2)
-             WHERE id IN (
-                SELECT id FROM lab_events_outbox
-                WHERE sent_at IS NULL AND (leased_until IS NULL OR leased_until <= now())
-                ORDER BY created_at, id
-                LIMIT $1
-                FOR UPDATE SKIP LOCKED
-             )
-             RETURNING id, tenant_id, payload, created_at",
-        )
-        .bind(i64::from(limit))
-        .bind(lease.as_secs_f64())
-        .fetch_all(&self.pool)
-        .await
-        .map_err(from_sqlx)?;
-        let mut out = rows
+        let rows = sqlx::query(LEASE_SQL)
+            .bind(i64::from(limit))
+            .bind(lease.as_secs_f64())
+            .bind(token)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(from_sqlx)?;
+        let mut events = rows
             .iter()
             .map(|r| {
                 let Json(payload): Json<serde_json::Value> =
@@ -517,23 +530,54 @@ impl LabOutbox for PgStore {
                 })
             })
             .collect::<Result<Vec<_>, RepoError>>()?;
-        out.sort_by_key(|e| (e.created_at, e.id));
-        Ok(out)
+        events.sort_by_key(|e| (e.created_at, e.id));
+        Ok(OutboxLease { token, events })
     }
 
-    async fn mark_events_sent(&self, ids: &[Uuid]) -> Result<u64, RepoError> {
+    async fn mark_events_sent(&self, lease: Uuid, ids: &[Uuid]) -> Result<u64, RepoError> {
         if ids.is_empty() {
             return Ok(0);
         }
         let done = sqlx::query(
             "UPDATE lab_events_outbox SET sent_at = now(), leased_until = NULL
-             WHERE id = ANY($1) AND sent_at IS NULL",
+             WHERE id = ANY($2) AND lease_token = $1 AND sent_at IS NULL",
         )
+        .bind(lease)
         .bind(ids)
         .execute(&self.pool)
         .await
         .map_err(from_sqlx)?;
         Ok(done.rows_affected())
+    }
+
+    async fn prune_sent_events(&self, older_than: Duration) -> Result<u64, RepoError> {
+        // One cutoff for every batch, so the loop ends even while events
+        // keep being delivered.
+        let cutoff: DateTime<Utc> = sqlx::query_scalar("SELECT now() - make_interval(secs => $1)")
+            .bind(older_than.as_secs_f64())
+            .fetch_one(&self.pool)
+            .await
+            .map_err(from_sqlx)?;
+        let mut total = 0;
+        loop {
+            let done = sqlx::query(
+                "WITH old AS MATERIALIZED (
+                    SELECT id FROM lab_events_outbox
+                    WHERE sent_at IS NOT NULL AND sent_at < $1
+                    LIMIT $2
+                 )
+                 DELETE FROM lab_events_outbox o USING old WHERE o.id = old.id",
+            )
+            .bind(cutoff)
+            .bind(PRUNE_BATCH)
+            .execute(&self.pool)
+            .await
+            .map_err(from_sqlx)?;
+            total += done.rows_affected();
+            if done.rows_affected() < PRUNE_BATCH as u64 {
+                return Ok(total);
+            }
+        }
     }
 }
 

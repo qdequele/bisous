@@ -12,8 +12,8 @@
 //!   It reads from the deployment's default read preference (primary unless
 //!   the URI says otherwise); reading from a lagging secondary could miss
 //!   writes made just before the start position.
-//! - **Events**: see [`event`] for the mapping and [`convert`] for BSON →
-//!   JSON.
+//! - **Events**: see [`event`] for the mapping, [`convert`] for BSON →
+//!   JSON and [`key`] for the `_id` → document id encoding.
 //! - **Origin footprint**: none. Change streams hold nothing on the server,
 //!   so acks need no action and `teardown` has nothing to remove. A stopped
 //!   sync can resume as long as its token is still in the oplog; after that,
@@ -28,6 +28,7 @@ pub mod config;
 pub mod convert;
 pub mod error;
 pub mod event;
+pub mod key;
 pub mod position;
 mod source;
 

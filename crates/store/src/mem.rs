@@ -1,8 +1,11 @@
 //! In-memory store for tests and single-node trials. Nothing survives a
 //! restart.
 //!
-//! Unlike [`crate::PgStore`], the [`StateStore`] methods do not require the
-//! sync to exist in the repository, so engine tests can use it bare.
+//! [`MemStore::new`] behaves like [`crate::PgStore`]: the [`StateStore`]
+//! writes (`save`, `push_dead_letters`, `record_progress`) for a sync that
+//! does not exist fail with [`StoreError::NotFound`], as the foreign keys do
+//! in Postgres. [`MemStore::permissive`] accepts unknown sync ids, for
+//! engine tests that never create a spec.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Mutex, MutexGuard};
@@ -14,8 +17,8 @@ use meili_connect_core::{DeadLetter, StateStore, StoreError, SyncSpec, SyncState
 use uuid::Uuid;
 
 use crate::{
-    BootSync, DailyProgress, DeadLetterPage, LabOutbox, OutboxEvent, RepoError, StoredDeadLetter,
-    StoredSync, SyncRepository, validate_spec,
+    BootSync, DailyProgress, DeadLetterPage, LabOutbox, OutboxEvent, OutboxLease, RepoError,
+    StoredDeadLetter, StoredSync, SyncRepository, validate_spec,
 };
 
 #[derive(Default)]
@@ -31,6 +34,7 @@ struct Inner {
 struct OutboxRow {
     event: OutboxEvent,
     leased_until: Option<DateTime<Utc>>,
+    lease_token: Option<Uuid>,
     sent_at: Option<DateTime<Utc>>,
 }
 
@@ -52,11 +56,30 @@ impl Inner {
 #[derive(Default)]
 pub struct MemStore {
     inner: Mutex<Inner>,
+    permissive: bool,
 }
 
 impl MemStore {
+    /// A store that, like Postgres, refuses state for unknown syncs.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Test helper: a store whose [`StateStore`] methods accept sync ids
+    /// that were never created, so an engine can run without specs.
+    pub fn permissive() -> Self {
+        Self {
+            permissive: true,
+            ..Self::default()
+        }
+    }
+
+    fn check_sync(&self, inner: &Inner, sync_id: &str) -> Result<(), StoreError> {
+        if self.permissive || inner.syncs.contains_key(sync_id) {
+            Ok(())
+        } else {
+            Err(StoreError::NotFound(format!("sync {sync_id}")))
+        }
     }
 
     fn lock(&self) -> Result<MutexGuard<'_, Inner>, StoreError> {
@@ -79,14 +102,18 @@ impl StateStore for MemStore {
     }
 
     async fn save(&self, state: &SyncState) -> Result<(), StoreError> {
-        self.lock()?
-            .states
-            .insert(state.sync_id.clone(), state.clone());
+        let mut inner = self.lock()?;
+        self.check_sync(&inner, &state.sync_id)?;
+        inner.states.insert(state.sync_id.clone(), state.clone());
         Ok(())
     }
 
     async fn push_dead_letters(&self, letters: &[DeadLetter]) -> Result<(), StoreError> {
         let mut inner = self.lock()?;
+        // All or nothing, like the single INSERT in Postgres.
+        for letter in letters {
+            self.check_sync(&inner, &letter.sync_id)?;
+        }
         for letter in letters {
             inner.next_dead_letter += 1;
             let id = inner.next_dead_letter;
@@ -104,6 +131,7 @@ impl StateStore for MemStore {
     ) -> Result<(), StoreError> {
         let day = Utc::now().date_naive();
         let mut inner = self.lock()?;
+        self.check_sync(&inner, sync_id)?;
         let c = inner.progress.entry((sync_id.to_owned(), day)).or_default();
         c[0] = c[0].saturating_add(written);
         c[1] = c[1].saturating_add(deleted);
@@ -309,42 +337,44 @@ impl LabOutbox for MemStore {
                 created_at: Utc::now(),
             },
             leased_until: None,
+            lease_token: None,
             sent_at: None,
         });
         Ok(id)
     }
 
-    async fn lease_events(
-        &self,
-        limit: u32,
-        lease: Duration,
-    ) -> Result<Vec<OutboxEvent>, RepoError> {
+    async fn lease_events(&self, limit: u32, lease: Duration) -> Result<OutboxLease, RepoError> {
+        let token = Uuid::new_v4();
         let now = Utc::now();
         let until = chrono::Duration::from_std(lease)
             .ok()
             .and_then(|d| now.checked_add_signed(d))
             .unwrap_or(DateTime::<Utc>::MAX_UTC);
         let mut inner = self.lock()?;
-        let mut out = Vec::new();
+        let mut events = Vec::new();
         // Rows are kept in insertion (= creation) order.
         for row in inner.outbox.iter_mut() {
-            if out.len() >= limit as usize {
+            if events.len() >= limit as usize {
                 break;
             }
             if row.sent_at.is_none() && row.leased_until.is_none_or(|t| t <= now) {
                 row.leased_until = Some(until);
-                out.push(row.event.clone());
+                row.lease_token = Some(token);
+                events.push(row.event.clone());
             }
         }
-        Ok(out)
+        Ok(OutboxLease { token, events })
     }
 
-    async fn mark_events_sent(&self, ids: &[Uuid]) -> Result<u64, RepoError> {
+    async fn mark_events_sent(&self, lease: Uuid, ids: &[Uuid]) -> Result<u64, RepoError> {
         let now = Utc::now();
         let mut inner = self.lock()?;
         let mut n = 0;
         for row in inner.outbox.iter_mut() {
-            if row.sent_at.is_none() && ids.contains(&row.event.id) {
+            if row.sent_at.is_none()
+                && row.lease_token == Some(lease)
+                && ids.contains(&row.event.id)
+            {
                 row.sent_at = Some(now);
                 row.leased_until = None;
                 n += 1;
@@ -352,17 +382,34 @@ impl LabOutbox for MemStore {
         }
         Ok(n)
     }
+
+    async fn prune_sent_events(&self, older_than: Duration) -> Result<u64, RepoError> {
+        let cutoff = chrono::Duration::from_std(older_than)
+            .ok()
+            .and_then(|d| Utc::now().checked_sub_signed(d))
+            .unwrap_or(DateTime::<Utc>::MIN_UTC);
+        let mut inner = self.lock()?;
+        let before = inner.outbox.len();
+        inner
+            .outbox
+            .retain(|row| row.sent_at.is_none_or(|t| t >= cutoff));
+        Ok((before - inner.outbox.len()) as u64)
+    }
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::test_support::{letter, spec, state};
+    use crate::test_support::{invalid_specs, letter, skipped_letter, spec, state};
 
     #[tokio::test]
     async fn state_round_trip() {
         let store = MemStore::new();
+        store
+            .create_sync(None, &spec("s1", None, "n"))
+            .await
+            .unwrap();
         assert!(store.load("s1").await.unwrap().is_none());
         let st = state("s1");
         store.save(&st).await.unwrap();
@@ -371,6 +418,95 @@ mod tests {
         st2.resyncing = true;
         store.save(&st2).await.unwrap();
         assert_eq!(store.load("s1").await.unwrap(), Some(st2));
+    }
+
+    /// Same contract as the Postgres foreign keys.
+    #[tokio::test]
+    async fn unknown_syncs_are_not_found_like_postgres() {
+        let store = MemStore::new();
+        assert!(matches!(
+            store.save(&state("ghost")).await,
+            Err(StoreError::NotFound(_))
+        ));
+        assert!(matches!(
+            store.record_progress("ghost", 1, 0, 0).await,
+            Err(StoreError::NotFound(_))
+        ));
+        store
+            .create_sync(None, &spec("s", None, "n"))
+            .await
+            .unwrap();
+        // One unknown sync fails the whole batch.
+        assert!(matches!(
+            store
+                .push_dead_letters(&[letter("s", "1"), letter("ghost", "2")])
+                .await,
+            Err(StoreError::NotFound(_))
+        ));
+        assert!(
+            store
+                .list_dead_letters(None, "s", DeadLetterPage::default())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        store.push_dead_letters(&[letter("s", "1")]).await.unwrap();
+        store.record_progress("s", 1, 0, 0).await.unwrap();
+        store.save(&state("s")).await.unwrap();
+
+        // The test helper accepts anything.
+        let loose = MemStore::permissive();
+        loose.save(&state("ghost")).await.unwrap();
+        loose
+            .push_dead_letters(&[letter("ghost", "1")])
+            .await
+            .unwrap();
+        loose.record_progress("ghost", 1, 0, 0).await.unwrap();
+        assert!(loose.load("ghost").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn skipped_records_round_trip_as_dead_letters() {
+        let store = MemStore::new();
+        store
+            .create_sync(None, &spec("s", None, "n"))
+            .await
+            .unwrap();
+        let letters = vec![
+            skipped_letter("s", "orders/3@1842"),
+            letter("s", "1"),
+            skipped_letter("s", "public.orders@0/16B3748"),
+        ];
+        store.push_dead_letters(&letters).await.unwrap();
+        let got = store
+            .list_dead_letters(None, "s", DeadLetterPage::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            got.into_iter().map(|d| d.letter).collect::<Vec<_>>(),
+            letters
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_specs_are_refused() {
+        let store = MemStore::new();
+        for bad in invalid_specs("s", None) {
+            assert!(matches!(
+                store.create_sync(None, &bad).await,
+                Err(RepoError::Invalid(_))
+            ));
+        }
+        store
+            .create_sync(None, &spec("s", None, "n"))
+            .await
+            .unwrap();
+        for bad in invalid_specs("s", None) {
+            assert!(matches!(
+                store.update_sync(None, &bad).await,
+                Err(RepoError::Invalid(_))
+            ));
+        }
     }
 
     #[tokio::test]
@@ -539,23 +675,27 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            first.iter().map(|e| e.id).collect::<Vec<_>>(),
+            first.events.iter().map(|e| e.id).collect::<Vec<_>>(),
             ids[..2].to_vec()
         );
         let second = store
             .lease_events(10, Duration::from_secs(60))
             .await
             .unwrap();
-        assert_eq!(second.len(), 1);
+        assert_eq!(second.events.len(), 1);
+        assert_ne!(first.token, second.token);
         assert!(
             store
                 .lease_events(10, Duration::from_secs(60))
                 .await
                 .unwrap()
+                .events
                 .is_empty()
         );
-        assert_eq!(store.mark_events_sent(&ids).await.unwrap(), 3);
-        assert_eq!(store.mark_events_sent(&ids).await.unwrap(), 0);
+        // Each lease marks only its own events.
+        assert_eq!(store.mark_events_sent(first.token, &ids).await.unwrap(), 2);
+        assert_eq!(store.mark_events_sent(second.token, &ids).await.unwrap(), 1);
+        assert_eq!(store.mark_events_sent(second.token, &ids).await.unwrap(), 0);
 
         // An expired lease frees the event.
         let id = store
@@ -567,7 +707,53 @@ mod tests {
             .lease_events(1, Duration::from_secs(60))
             .await
             .unwrap();
-        assert_eq!(again[0].id, id);
+        assert_eq!(again.events[0].id, id);
+    }
+
+    #[tokio::test]
+    async fn outbox_stale_lease_cannot_mark_sent() {
+        let store = MemStore::new();
+        let id = store
+            .enqueue_event(None, &serde_json::json!({}))
+            .await
+            .unwrap();
+        let stale = store.lease_events(1, Duration::ZERO).await.unwrap();
+        let fresh = store
+            .lease_events(1, Duration::from_secs(60))
+            .await
+            .unwrap();
+        assert_eq!(fresh.events[0].id, id);
+        assert_eq!(store.mark_events_sent(stale.token, &[id]).await.unwrap(), 0);
+        assert_eq!(store.mark_events_sent(fresh.token, &[id]).await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn outbox_prunes_only_old_sent_events() {
+        let store = MemStore::new();
+        let ids = enqueue_three(&store).await;
+        let lease = store
+            .lease_events(2, Duration::from_secs(60))
+            .await
+            .unwrap();
+        store.mark_events_sent(lease.token, &ids).await.unwrap();
+        // The first was sent two hours ago.
+        store.lock().unwrap().outbox[0].sent_at = Some(Utc::now() - chrono::Duration::hours(2));
+        assert_eq!(
+            store
+                .prune_sent_events(Duration::from_secs(3600))
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(store.prune_sent_events(Duration::ZERO).await.unwrap(), 1);
+        // The unsent one stays, whatever its age.
+        assert_eq!(store.prune_sent_events(Duration::ZERO).await.unwrap(), 0);
+        let rest = store
+            .lease_events(10, Duration::from_secs(60))
+            .await
+            .unwrap();
+        assert_eq!(rest.events.len(), 1);
+        assert_eq!(rest.events[0].id, ids[2]);
     }
 
     async fn enqueue_three(store: &MemStore) -> Vec<Uuid> {

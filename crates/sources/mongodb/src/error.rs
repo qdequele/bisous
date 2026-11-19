@@ -17,10 +17,27 @@ pub mod codes {
     pub const ATLAS_ERROR: i32 = 8000;
     /// "The $changeStream stage is only supported on replica sets".
     pub const CHANGE_STREAM_NEEDS_REPLICA_SET: i32 = 40573;
+    /// The only codes that mean the saved resume point is gone for good.
+    pub const POSITION_LOST: &[i32] = &[
+        CAPPED_POSITION_LOST,
+        INVALID_RESUME_TOKEN,
+        CHANGE_STREAM_FATAL,
+        CHANGE_STREAM_HISTORY_LOST,
+    ];
+    /// Driver/server error labels that mean "try again".
+    pub const TRANSIENT_LABELS: &[&str] = &[
+        "ResumableChangeStreamError",
+        "RetryableError",
+        "RetryableWriteError",
+        "SystemOverloadedError",
+        "TransientTransactionError",
+        "NetworkError",
+    ];
     /// Codes that mean "try again": network, elections, shutdowns, timeouts.
     pub const TRANSIENT: &[i32] = &[
         6,     // HostUnreachable
         7,     // HostNotFound
+        24,    // LockTimeout
         43,    // CursorNotFound
         50,    // MaxTimeMSExpired
         63,    // StaleShardVersion
@@ -28,12 +45,15 @@ pub mod codes {
         91,    // ShutdownInProgress
         133,   // FailedToSatisfyReadPreference
         150,   // StaleEpoch
+        175,   // QueryPlanKilled (index dropped mid-query)
         189,   // PrimarySteppedDown
         234,   // RetryChangeStream
+        237,   // CursorKilled (killOp, killCursors)
         262,   // ExceededTimeLimit
         9001,  // SocketException
         10107, // NotWritablePrimary
         11600, // InterruptedAtShutdown
+        11601, // Interrupted (killOp)
         11602, // InterruptedDueToReplStateChange
         13388, // StaleConfig
         13435, // NotPrimaryNoSecondaryOk
@@ -186,15 +206,28 @@ pub fn map_error(err: &Error, context: &str, scrub: &Scrubber) -> SourceError {
         | ErrorKind::ConnectionPoolCleared { .. }
         | ErrorKind::DnsResolve { .. }
         | ErrorKind::Shutdown => SourceError::Transient(message),
-        _ if err.contains_label("ResumableChangeStreamError")
-            || err.contains_label("RetryableWriteError")
-            || err.contains_label("TransientTransactionError")
-            || err.contains_label("NetworkError") =>
+        _ if codes::TRANSIENT_LABELS
+            .iter()
+            .any(|l| err.contains_label(l)) =>
         {
             SourceError::Transient(message)
         }
         ErrorKind::Command(_) => SourceError::Fatal(message),
         _ => SourceError::Fatal(message),
+    }
+}
+
+/// [`map_error`] for the read that validates a saved resume token. Only
+/// the history-lost codes ([`codes::POSITION_LOST`]) become `PositionLost`
+/// (a full resync); every other error keeps its own classification, so a
+/// network blip or an unclassified error never triggers a resync.
+pub fn map_resume_error(err: &Error, context: &str, scrub: &Scrubber) -> SourceError {
+    match map_error(err, context, scrub) {
+        SourceError::PositionLost(m) => SourceError::PositionLost(m),
+        other if error_code(err).is_some_and(|c| codes::POSITION_LOST.contains(&c)) => {
+            SourceError::PositionLost(format!("the saved resume token is unusable: {other}"))
+        }
+        other => other,
     }
 }
 
@@ -266,10 +299,59 @@ mod tests {
         let other = map_error(&command_error(2, "BadValue", "nope"), "x", &s);
         assert!(matches!(other, SourceError::Fatal(_)));
 
+        // Snapshot `find` errors carry no change-stream label: a killOp or
+        // an index drop mid-snapshot must be retried, not fail the sync.
+        for (code, name) in [
+            (175, "QueryPlanKilled"),
+            (237, "CursorKilled"),
+            (11601, "Interrupted"),
+            (24, "LockTimeout"),
+            (43, "CursorNotFound"),
+            (50, "MaxTimeMSExpired"),
+            (262, "ExceededTimeLimit"),
+        ] {
+            let e = map_error(&command_error(code, name, "x"), "snapshot find", &s);
+            assert!(matches!(e, SourceError::Transient(_)), "{code}: {e:?}");
+        }
+        for label in codes::TRANSIENT_LABELS {
+            // Labels can only be set through a server reply.
+            let wc: mongodb::error::WriteConcernError = mongodb::bson::from_document(
+                mongodb::bson::doc! {"code": 2, "codeName": "BadValue", "errmsg": "x", "errorLabels": [*label]},
+            )
+            .unwrap();
+            let e = Error::from(ErrorKind::Write(WriteFailure::WriteConcernError(wc)));
+            assert!(e.contains_label(label));
+            assert!(
+                matches!(map_error(&e, "x", &s), SourceError::Transient(_)),
+                "{label}"
+            );
+        }
+
         let io = Error::from(ErrorKind::Io(std::sync::Arc::new(std::io::Error::other(
             "reset",
         ))));
         assert!(matches!(map_error(&io, "x", &s), SourceError::Transient(_)));
+    }
+
+    #[test]
+    fn resume_errors_keep_their_classification() {
+        let s = scrubber();
+        for (code, name) in [
+            (286, "ChangeStreamHistoryLost"),
+            (280, "ChangeStreamFatalError"),
+            (260, "InvalidResumeToken"),
+            (136, "CappedPositionLost"),
+        ] {
+            let e = map_resume_error(&command_error(code, name, "x"), "resuming", &s);
+            assert!(matches!(e, SourceError::PositionLost(_)), "{code}: {e:?}");
+        }
+        // An unclassified error is not a lost position (no full resync).
+        let e = map_resume_error(&command_error(2, "BadValue", "x"), "resuming", &s);
+        assert!(matches!(e, SourceError::Fatal(_)), "{e:?}");
+        let e = map_resume_error(&command_error(11601, "Interrupted", "x"), "resuming", &s);
+        assert!(matches!(e, SourceError::Transient(_)), "{e:?}");
+        let e = map_resume_error(&command_error(13, "Unauthorized", "x"), "resuming", &s);
+        assert!(matches!(e, SourceError::Config(_)), "{e:?}");
     }
 
     #[tokio::test]

@@ -18,9 +18,10 @@ use mongodb::{Client, Database};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{FullDocumentMode, MongoConfig, Target, resolve_targets};
-use crate::convert::{bson_to_json, document_to_json};
-use crate::error::{Scrubber, codes, error_code, map_error};
+use crate::convert::document_to_json;
+use crate::error::{Scrubber, codes, error_code, map_error, map_resume_error};
 use crate::event::{Mapped, Namespaces, map_event};
+use crate::key::key_of;
 use crate::position::Position;
 
 /// Longest a `getMore` waits for new events; also the cancellation latency
@@ -137,6 +138,22 @@ impl MongoSource {
         let client = Client::with_options(opts).map_err(|e| self.err(&e, "creating the client"))?;
         self.client = Some(client.clone());
         Ok(client)
+    }
+
+    /// [`Self::client`], or `None` once `cancel` fires (an `mongodb+srv`
+    /// URI resolves DNS here).
+    async fn client_or_cancel(
+        &mut self,
+        cancel: &CancellationToken,
+    ) -> Result<Option<Client>, SourceError> {
+        if cancel.is_cancelled() {
+            return Ok(None);
+        }
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => Ok(None),
+            c = self.client() => c.map(Some),
+        }
     }
 
     /// One database when every mapping lives in it, else the deployment.
@@ -574,22 +591,14 @@ impl Source for MongoSource {
                 // The server checks the resume point lazily, on the first
                 // read: open the stream and read once (at most one event,
                 // kept for `stream`). A token older than the oplog fails
-                // with ChangeStreamHistoryLost (→ PositionLost); a token the
-                // server cannot decode is just as unusable.
-                let resume_err = |e: SourceError| match e {
-                    SourceError::Fatal(m) => SourceError::PositionLost(format!(
-                        "the saved resume token is unusable: {m}"
-                    )),
-                    other => other,
-                };
-                let mut stream = self
-                    .open_stream(&client, Some(&position))
-                    .await
-                    .map_err(resume_err)?;
+                // with ChangeStreamHistoryLost (→ PositionLost). Any other
+                // error keeps its own classification: a blip is retried,
+                // not turned into a full resync.
+                let mut stream = self.open_stream(&client, Some(&position)).await?;
                 let first = stream
                     .next_if_any()
                     .await
-                    .map_err(|e| resume_err(self.err(&e, "resuming the change stream")))?
+                    .map_err(|e| map_resume_error(&e, "resuming the change stream", &self.scrub))?
                     .map(|ev| (ev, stream.resume_token()));
                 tracing::info!(sync_id = %self.sync_id, "mongodb: resumed from checkpoint");
                 *self.held_stream() = Some(Held { stream, first });
@@ -604,7 +613,9 @@ impl Source for MongoSource {
         events: EventSender,
         cancel: CancellationToken,
     ) -> Result<(), SourceError> {
-        let client = self.client().await?;
+        let Some(client) = self.client_or_cancel(&cancel).await? else {
+            return Ok(());
+        };
         let batch = self.config.snapshot_batch_size;
         for t in self.targets.clone() {
             let coll = client.database(&t.db).collection::<Document>(&t.coll);
@@ -626,7 +637,7 @@ impl Source for MongoSource {
                 })?;
                 let change = Change {
                     collection: t.name.clone(),
-                    key: vec![bson_to_json(id)],
+                    key: vec![key_of(id)],
                     op: Op::Upsert {
                         doc: document_to_json(&doc),
                     },
@@ -649,7 +660,9 @@ impl Source for MongoSource {
     ) -> Result<(), SourceError> {
         // Resume tokens hold nothing on the server: acks need no action.
         drop(acks);
-        let client = self.client().await?;
+        let Some(client) = self.client_or_cancel(&cancel).await? else {
+            return Ok(());
+        };
         let mut position = self
             .position
             .clone()
@@ -744,7 +757,7 @@ impl Source for MongoSource {
                     if let Some(doc) = found {
                         let change = Change {
                             collection,
-                            key: vec![bson_to_json(&id)],
+                            key: vec![key_of(&id)],
                             op: Op::Upsert {
                                 doc: document_to_json(&doc),
                             },
@@ -835,6 +848,69 @@ mod tests {
         assert_eq!(get("n").source_type, "int|long");
         assert!(!get("n").nullable);
         assert!(get("tags").nullable);
+    }
+
+    /// A source pointed at a port nothing listens on: every server
+    /// selection waits for its 15 s timeout, so only cancellation can end
+    /// `snapshot` or `stream` quickly.
+    fn unreachable() -> MongoSource {
+        let config = MongoConfig::from_json(
+            &serde_json::json!({"uri": "mongodb://127.0.0.1:1/?directConnection=true"}),
+        )
+        .unwrap();
+        let streams: Vec<StreamMapping> =
+            serde_json::from_value(serde_json::json!([{"collection": "a.x", "index": "x"}]))
+                .unwrap();
+        MongoSource::new("s", config, &streams).unwrap()
+    }
+
+    #[tokio::test]
+    async fn snapshot_returns_ok_promptly_on_cancel() {
+        let mut s = unreachable();
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let cancel = CancellationToken::new();
+        let c = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            c.cancel();
+        });
+        let started = Instant::now();
+        let r = tokio::time::timeout(Duration::from_secs(3), s.snapshot(tx, cancel))
+            .await
+            .expect("snapshot ignored the cancellation");
+        assert!(r.is_ok(), "{r:?}");
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn stream_returns_ok_promptly_on_cancel() {
+        let mut s = unreachable();
+        s.position = Some(Position::from_timestamp(mongodb::bson::Timestamp {
+            time: 1,
+            increment: 1,
+        }));
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let (_ack_tx, acks) = meili_connect_core::ack_channel();
+        let cancel = CancellationToken::new();
+        let c = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            c.cancel();
+        });
+        let r = tokio::time::timeout(Duration::from_secs(3), s.stream(tx, acks, cancel))
+            .await
+            .expect("stream ignored the cancellation");
+        assert!(r.is_ok(), "{r:?}");
+
+        // Already cancelled: Ok at once, even before `open`.
+        let mut s = unreachable();
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let (_ack_tx, acks) = meili_connect_core::ack_channel();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        assert!(s.stream(tx, acks, cancel.clone()).await.is_ok());
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        assert!(s.snapshot(tx, cancel).await.is_ok());
     }
 
     #[test]

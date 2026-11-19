@@ -9,9 +9,14 @@ use std::sync::Arc;
 use sqlx::Connection;
 
 use super::*;
-use crate::test_support::{letter, spec, state};
+use crate::test_support::{invalid_specs, letter, skipped_letter, spec, state};
 
 async fn store_with_key(key: SecretKey) -> Option<PgStore> {
+    store_with(key, &[]).await
+}
+
+/// A store whose connections also carry these server settings.
+async fn store_with(key: SecretKey, settings: &[(&str, &str)]) -> Option<PgStore> {
     let Ok(url) = std::env::var("DATABASE_URL") else {
         eprintln!("DATABASE_URL is unset: skipping Postgres store test");
         return None;
@@ -25,7 +30,8 @@ async fn store_with_key(key: SecretKey) -> Option<PgStore> {
     conn.close().await.unwrap();
     let options = PgConnectOptions::from_str(&url)
         .unwrap()
-        .options([("search_path", schema.as_str())]);
+        .options([("search_path", schema.as_str())])
+        .options(settings.iter().copied());
     let pool = PgPoolOptions::new()
         .max_connections(5)
         .connect_with(options)
@@ -443,24 +449,33 @@ async fn outbox_concurrent_leasers_never_share() {
             .unwrap();
         all.insert(id);
     }
-    async fn leaser(store: Arc<PgStore>) -> Vec<Uuid> {
+    async fn leaser(store: Arc<PgStore>) -> Vec<(Uuid, Vec<Uuid>)> {
         let mut got = Vec::new();
         loop {
-            let batch = store
+            let lease = store
                 .lease_events(7, Duration::from_secs(300))
                 .await
                 .unwrap();
-            if batch.is_empty() {
+            if lease.events.is_empty() {
                 return got;
             }
-            got.extend(batch.into_iter().map(|e| e.id));
+            got.push((
+                lease.token,
+                lease.events.into_iter().map(|e| e.id).collect(),
+            ));
         }
     }
-    let (a, b) = tokio::join!(
+    let (la, lb) = tokio::join!(
         tokio::spawn(leaser(store.clone())),
         tokio::spawn(leaser(store.clone()))
     );
-    let (a, b) = (a.unwrap(), b.unwrap());
+    let (la, lb) = (la.unwrap(), lb.unwrap());
+    let flat = |l: &[(Uuid, Vec<Uuid>)]| {
+        l.iter()
+            .flat_map(|(_, ids)| ids.clone())
+            .collect::<Vec<_>>()
+    };
+    let (a, b) = (flat(&la), flat(&lb));
     let sa: HashSet<_> = a.iter().copied().collect();
     let sb: HashSet<_> = b.iter().copied().collect();
     assert_eq!(sa.len(), a.len());
@@ -474,11 +489,20 @@ async fn outbox_concurrent_leasers_never_share() {
             .lease_events(10, Duration::from_secs(60))
             .await
             .unwrap()
+            .events
             .is_empty()
     );
-    let ids: Vec<Uuid> = all.iter().copied().collect();
-    assert_eq!(store.mark_events_sent(&ids).await.unwrap(), 200);
-    assert_eq!(store.mark_events_sent(&ids).await.unwrap(), 0);
+    let mut marked = 0;
+    for (token, ids) in la.iter().chain(&lb) {
+        // Another lease's token marks nothing.
+        assert_eq!(
+            store.mark_events_sent(Uuid::new_v4(), ids).await.unwrap(),
+            0
+        );
+        marked += store.mark_events_sent(*token, ids).await.unwrap();
+        assert_eq!(store.mark_events_sent(*token, ids).await.unwrap(), 0);
+    }
+    assert_eq!(marked, 200);
 }
 
 #[tokio::test]
@@ -492,7 +516,8 @@ async fn outbox_expired_lease_is_released_in_order() {
         .enqueue_event(Some("t"), &serde_json::json!({ "n": 2 }))
         .await
         .unwrap();
-    let leased = store.lease_events(10, Duration::ZERO).await.unwrap();
+    let stale = store.lease_events(10, Duration::ZERO).await.unwrap();
+    let leased = &stale.events;
     assert_eq!(
         leased.iter().map(|e| e.id).collect::<Vec<_>>(),
         [first, second]
@@ -503,18 +528,254 @@ async fn outbox_expired_lease_is_released_in_order() {
         .lease_events(1, Duration::from_secs(60))
         .await
         .unwrap();
-    assert_eq!(again[0].id, first);
-    store.mark_events_sent(&[first]).await.unwrap();
+    assert_eq!(again.events[0].id, first);
+    // The expired lease was taken over: its holder can no longer mark it.
+    assert_eq!(
+        store.mark_events_sent(stale.token, &[first]).await.unwrap(),
+        0
+    );
+    assert_eq!(
+        store.mark_events_sent(again.token, &[first]).await.unwrap(),
+        1
+    );
     let rest = store
         .lease_events(10, Duration::from_secs(60))
         .await
         .unwrap();
-    assert_eq!(rest.iter().map(|e| e.id).collect::<Vec<_>>(), [second]);
+    assert_eq!(
+        rest.events.iter().map(|e| e.id).collect::<Vec<_>>(),
+        [second]
+    );
     assert!(
         store
             .lease_events(0, Duration::ZERO)
             .await
             .unwrap()
+            .events
             .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn timeouts_and_read_only_transactions_are_transient() {
+    let Some(store) = store().await else { return };
+    // 57014: statement timeout.
+    let mut tx = store.pool().begin().await.unwrap();
+    sqlx::query("SET LOCAL statement_timeout = 10")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    let err = sqlx::query("SELECT pg_sleep(1)")
+        .execute(&mut *tx)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(from_sqlx(err), RepoError::Transient(m) if m.contains("57014")),
+        "statement timeout"
+    );
+    drop(tx);
+    // 25006: what a demoted primary answers to a write.
+    let mut tx = store.pool().begin().await.unwrap();
+    sqlx::query("SET TRANSACTION READ ONLY")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    let err = sqlx::query("INSERT INTO lab_events_outbox (id, payload) VALUES ($1, '{}')")
+        .bind(Uuid::new_v4())
+        .execute(&mut *tx)
+        .await
+        .unwrap_err();
+    let mapped = StoreError::from(from_sqlx(err));
+    assert!(
+        matches!(&mapped, StoreError::Transient(m) if m.contains("25006")),
+        "{mapped:?}"
+    );
+}
+
+/// Under a nested-loop plan an `IN (SELECT … LIMIT n FOR UPDATE SKIP
+/// LOCKED)` subquery can be re-run per outer row and lease more than `n`
+/// rows. Force that plan shape and race leasers: no call may exceed its
+/// limit, and no event may be leased twice.
+#[tokio::test]
+async fn outbox_lease_never_exceeds_its_limit() {
+    let Some(store) = store_with(
+        SecretKey::generate(),
+        &[
+            ("enable_hashjoin", "off"),
+            ("enable_mergejoin", "off"),
+            ("enable_material", "off"),
+            ("enable_memoize", "off"),
+            ("enable_indexscan", "off"),
+            ("enable_bitmapscan", "off"),
+        ],
+    )
+    .await
+    else {
+        return;
+    };
+    let store = Arc::new(store);
+    for i in 0..600 {
+        store
+            .enqueue_event(None, &serde_json::json!({ "n": i }))
+            .await
+            .unwrap();
+    }
+    async fn leaser(store: Arc<PgStore>) -> Vec<Uuid> {
+        let mut got = Vec::new();
+        loop {
+            let batch = store
+                .lease_events(5, Duration::from_secs(300))
+                .await
+                .unwrap()
+                .events;
+            assert!(
+                batch.len() <= 5,
+                "leased {} rows for a limit of 5",
+                batch.len()
+            );
+            if batch.is_empty() {
+                return got;
+            }
+            got.extend(batch.into_iter().map(|e| e.id));
+        }
+    }
+    let handles: Vec<_> = (0..4)
+        .map(|_| tokio::spawn(leaser(store.clone())))
+        .collect();
+    let mut all = Vec::new();
+    for h in handles {
+        all.extend(h.await.unwrap());
+    }
+    let distinct: HashSet<_> = all.iter().copied().collect();
+    assert_eq!(distinct.len(), all.len(), "an event was leased twice");
+    assert_eq!(distinct.len(), 600);
+}
+
+/// The picking query runs exactly once per lease (a materialized CTE), so
+/// no plan can make it pick twice.
+#[tokio::test]
+async fn outbox_lease_picks_once() {
+    let Some(store) = store().await else { return };
+    let plan: Json<serde_json::Value> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "EXPLAIN (FORMAT JSON) {LEASE_SQL}"
+    )))
+    .bind(5_i64)
+    .bind(60.0_f64)
+    .bind(Uuid::new_v4())
+    .fetch_one(store.pool())
+    .await
+    .unwrap();
+    let text = plan.0.to_string();
+    assert!(text.contains(r#""CTE Name":"picked""#), "{text}");
+    assert_eq!(
+        text.matches(r#""Node Type":"LockRows""#).count(),
+        1,
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn outbox_prunes_old_sent_events_in_batches() {
+    let Some(store) = store().await else { return };
+    // 2 500 events sent a day ago: three delete batches.
+    sqlx::query(
+        "INSERT INTO lab_events_outbox (id, payload, created_at, sent_at)
+         SELECT gen_random_uuid(), '{}', now() - interval '2 days', now() - interval '1 day'
+         FROM generate_series(1, 2500)",
+    )
+    .execute(store.pool())
+    .await
+    .unwrap();
+    let recent = store
+        .enqueue_event(None, &serde_json::json!({ "n": 1 }))
+        .await
+        .unwrap();
+    let unsent = store
+        .enqueue_event(None, &serde_json::json!({ "n": 2 }))
+        .await
+        .unwrap();
+    let lease = store
+        .lease_events(1, Duration::from_secs(60))
+        .await
+        .unwrap();
+    assert_eq!(lease.events[0].id, recent);
+    store
+        .mark_events_sent(lease.token, &[recent])
+        .await
+        .unwrap();
+
+    assert_eq!(
+        store
+            .prune_sent_events(Duration::from_secs(3600))
+            .await
+            .unwrap(),
+        2500
+    );
+    assert_eq!(store.prune_sent_events(Duration::ZERO).await.unwrap(), 1);
+    assert_eq!(store.prune_sent_events(Duration::ZERO).await.unwrap(), 0);
+    let left: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM lab_events_outbox")
+        .fetch_all(store.pool())
+        .await
+        .unwrap();
+    assert_eq!(left, [unsent]);
+}
+
+#[tokio::test]
+async fn invalid_specs_are_refused() {
+    let Some(store) = store().await else { return };
+    for bad in invalid_specs("s", Some("t")) {
+        assert!(matches!(
+            store.create_sync(Some("t"), &bad).await,
+            Err(RepoError::Invalid(_))
+        ));
+    }
+    store
+        .create_sync(Some("t"), &spec("s", Some("t"), "n"))
+        .await
+        .unwrap();
+    for bad in invalid_specs("s", Some("t")) {
+        assert!(matches!(
+            store.update_sync(Some("t"), &bad).await,
+            Err(RepoError::Invalid(_))
+        ));
+    }
+    assert_eq!(
+        store.get_sync(Some("t"), "s").await.unwrap().unwrap().spec,
+        spec("s", Some("t"), "n")
+    );
+}
+
+/// What `MemStore::new` mirrors: state of an unknown sync is not found.
+#[tokio::test]
+async fn unknown_syncs_are_not_found() {
+    let Some(store) = store().await else { return };
+    assert!(matches!(
+        store.record_progress("ghost", 1, 0, 0).await,
+        Err(StoreError::NotFound(_))
+    ));
+}
+
+/// Skipped source records are dead letters with a JSON null payload and a
+/// source position as the id.
+#[tokio::test]
+async fn skipped_records_round_trip_as_dead_letters() {
+    let Some(store) = store().await else { return };
+    store
+        .create_sync(None, &spec("s", None, "n"))
+        .await
+        .unwrap();
+    let letters = vec![
+        skipped_letter("s", "orders/3@1842"),
+        letter("s", "1"),
+        skipped_letter("s", "public.orders@0/16B3748"),
+    ];
+    store.push_dead_letters(&letters).await.unwrap();
+    let got = store
+        .list_dead_letters(None, "s", DeadLetterPage::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        got.into_iter().map(|d| d.letter).collect::<Vec<_>>(),
+        letters
     );
 }
