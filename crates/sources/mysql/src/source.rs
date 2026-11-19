@@ -7,8 +7,8 @@ use std::future::Future;
 use async_trait::async_trait;
 use meili_connect_core::{
     AckReceiver, Capabilities, Change, CheckReport, Checkpoint, CollectionInfo, Document,
-    EventSender, Op, Opened, Source, SourceError, SourceEvent, SourceFactory, SourceKind,
-    SourceSpec, StreamMapping,
+    EventSender, LagReporter, Op, Opened, Source, SourceError, SourceEvent, SourceFactory,
+    SourceKind, SourceSpec, StreamMapping,
 };
 use mysql_async::prelude::Queryable;
 use mysql_async::{Conn, Row, Value};
@@ -53,6 +53,8 @@ pub struct MysqlSource {
     pub(crate) tables: Vec<(String, String)>,
     /// Set by `open`: where `stream` starts.
     pub(crate) position: Option<Position>,
+    /// Set by `report_lag`: where `stream` publishes how far behind it is.
+    pub(crate) lag: Option<LagReporter>,
 }
 
 impl std::fmt::Debug for MysqlSource {
@@ -95,6 +97,7 @@ impl MysqlSource {
             config,
             tables: tables.into_iter().collect(),
             position: None,
+            lag: None,
         })
     }
 
@@ -171,7 +174,7 @@ pub(crate) async fn server_info(conn: &mut Conn) -> Result<ServerInfo, SourceErr
     })
 }
 
-async fn current_file_position(conn: &mut Conn) -> Result<Position, SourceError> {
+pub(crate) async fn current_file_position(conn: &mut Conn) -> Result<Position, SourceError> {
     // 8.2+ renamed SHOW MASTER STATUS; MariaDB and older MySQL keep it.
     let mut last_err = None;
     for q in ["SHOW BINARY LOG STATUS", "SHOW MASTER STATUS"] {
@@ -379,6 +382,10 @@ impl Source for MysqlSource {
     async fn teardown(&mut self) -> Result<(), SourceError> {
         // Nothing was created on the origin.
         Ok(())
+    }
+
+    fn report_lag(&mut self, reporter: LagReporter) {
+        self.lag = Some(reporter);
     }
 }
 

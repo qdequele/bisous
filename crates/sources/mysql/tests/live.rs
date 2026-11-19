@@ -19,7 +19,7 @@ use meili_connect_core::{
     Checkpoint, Op, Opened, Source, SourceError, SourceEvent, SourceKind, SourceSpec,
     StreamMapping, ack_channel,
 };
-use meili_connect_source_mysql::MysqlSource;
+use meili_connect_source_mysql::{GtidSet, MysqlSource};
 use mysql_async::prelude::Queryable;
 use mysql_async::{Conn, Opts};
 use serde_json::{Value, json};
@@ -114,8 +114,11 @@ impl Running {
         loop {
             let ev = tokio::time::timeout(Duration::from_secs(30), self.rx.recv())
                 .await
-                .expect("timed out waiting for binlog events")
-                .expect("stream ended");
+                .expect("timed out waiting for binlog events");
+            let Some(ev) = ev else {
+                let res = (&mut self.task).await;
+                panic!("stream ended: {res:?}");
+            };
             let stop = done(&ev);
             out.push(ev);
             if stop {
@@ -679,4 +682,308 @@ async fn snapshot_honours_cancellation() {
         .expect("snapshot did not honour cancellation")
         .unwrap();
     assert!(res.is_ok(), "{res:?}");
+}
+
+/// The stream publishes its lag: event age while reading, then zero seconds
+/// and zero bytes once the server is idle (heartbeat).
+#[tokio::test]
+async fn reports_lag() {
+    let Some(url) = url() else { return };
+    let _g = SERIAL.lock().await;
+    let mut conn = admin(&url).await;
+    fresh_db(&mut conn, "mc_lag").await;
+    conn.query_drop("CREATE TABLE mc_lag.items (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    let mut src = source(&url, "mc_lag", &["items"], "lag-sync");
+    let (reporter, mut watch) = meili_connect_core::LagReporter::new();
+    src.report_lag(reporter);
+    src.open(None).await.unwrap();
+    let mut run = Running::start(src);
+    conn.query_drop("INSERT INTO mc_lag.items VALUES (1)")
+        .await
+        .unwrap();
+    run.until(|e| is_change_with(e, 1)).await;
+    let lag = watch
+        .borrow_and_update()
+        .expect("lag published after a commit");
+    let secs = lag.seconds.expect("seconds known");
+    assert!((0.0..10.0).contains(&secs), "{lag:?}");
+    // Caught up: a heartbeat (every 5 s) and a position probe follow.
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            watch.changed().await.unwrap();
+            let l = watch.borrow().unwrap();
+            if l.seconds == Some(0.0) && l.bytes == Some(0) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("no caught-up lag report");
+    run.stop().await;
+}
+
+/// `stream` returns `Ok(())` promptly on cancel: while blocked on a full
+/// channel, with its ack sender gone, and when cancelled before it starts.
+#[tokio::test]
+async fn stream_honours_cancellation_under_back_pressure() {
+    let Some(url) = url() else { return };
+    let _g = SERIAL.lock().await;
+    let mut conn = admin(&url).await;
+    fresh_db(&mut conn, "mc_scancel").await;
+    conn.query_drop("CREATE TABLE mc_scancel.items (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    let mut src = source(&url, "mc_scancel", &["items"], "scancel-sync");
+    src.open(None).await.unwrap();
+    for i in 0..20 {
+        conn.exec_drop("INSERT INTO mc_scancel.items VALUES (?)", (i,))
+            .await
+            .unwrap();
+    }
+    // A channel nobody reads, and no ack sender at all.
+    let (tx, _rx) = mpsc::channel(1);
+    let (ack_tx, ack_rx) = ack_channel();
+    drop(ack_tx);
+    let cancel = CancellationToken::new();
+    let c = cancel.clone();
+    let task = tokio::spawn(async move {
+        let res = src.stream(tx, ack_rx, c).await;
+        (src, res)
+    });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!task.is_finished(), "the stream stopped by itself");
+    cancel.cancel();
+    let (mut src, res) = tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .expect("stream did not honour cancellation")
+        .unwrap();
+    assert!(res.is_ok(), "{res:?}");
+
+    // Already cancelled: returns at once.
+    let (tx, _rx) = mpsc::channel(1);
+    let (_ack_tx, ack_rx) = ack_channel();
+    let res = tokio::time::timeout(Duration::from_secs(5), src.stream(tx, ack_rx, cancel))
+        .await
+        .expect("stream did not honour cancellation");
+    assert!(res.is_ok(), "{res:?}");
+}
+
+/// Binlog images carry text in the column's charset; the snapshot reads it
+/// as utf8mb4. Both must give the same document.
+#[tokio::test]
+async fn non_utf8_charsets_decode_like_the_snapshot() {
+    let Some(url) = url() else { return };
+    let _g = SERIAL.lock().await;
+    let mut conn = admin(&url).await;
+    fresh_db(&mut conn, "mc_charset").await;
+    conn.query_drop(
+        "CREATE TABLE mc_charset.t (
+            id INT PRIMARY KEY,
+            lat VARCHAR(40) CHARACTER SET latin1,
+            cyr VARCHAR(40) CHARACTER SET cp1251,
+            gb VARCHAR(40) CHARACTER SET gbk,
+            sj VARCHAR(40) CHARACTER SET cp932,
+            u16 VARCHAR(40) CHARACTER SET utf16
+        ) CHARACTER SET utf8mb4",
+    )
+    .await
+    .unwrap();
+    let values = "'€ “œ” Ÿ café', 'Привет, мир', '中文', 'あ①', 'é😀'";
+    conn.query_drop("SET NAMES utf8mb4").await.unwrap();
+    conn.query_drop(format!("INSERT INTO mc_charset.t VALUES (1, {values})"))
+        .await
+        .unwrap();
+
+    let mut src = source(&url, "mc_charset", &["t"], "charset-sync");
+    src.open(None).await.unwrap();
+    let (tx, mut rx) = mpsc::channel(16);
+    src.snapshot(tx, CancellationToken::new()).await.unwrap();
+    let Some(SourceEvent::Change(snap)) = rx.recv().await else {
+        panic!("one snapshot row");
+    };
+    let mut run = Running::start(src);
+    conn.query_drop(format!("INSERT INTO mc_charset.t VALUES (2, {values})"))
+        .await
+        .unwrap();
+    let evs = run.until(|e| is_change_with(e, 2)).await;
+    run.stop().await;
+    let SourceEvent::Change(streamed) = evs.last().unwrap() else {
+        unreachable!()
+    };
+    let (Op::Upsert { doc: a }, Op::Upsert { doc: b }) = (&snap.op, &streamed.op) else {
+        panic!("upserts expected");
+    };
+    let mut a = a.clone();
+    let mut b = b.clone();
+    a.remove("id");
+    b.remove("id");
+    assert_eq!(a, b, "snapshot and binlog disagree");
+    assert_eq!(a["lat"], json!("€ “œ” Ÿ café"));
+    assert_eq!(a["cyr"], json!("Привет, мир"));
+}
+
+/// The GTID set of a checkpoint (GTID mode only).
+fn gtid_set(cp: &Checkpoint) -> GtidSet {
+    cp.0["gtid_set"].as_str().unwrap().parse().unwrap()
+}
+
+async fn gtid_executed(conn: &mut Conn) -> GtidSet {
+    let s: String = conn
+        .query_first("SELECT @@GLOBAL.gtid_executed")
+        .await
+        .unwrap()
+        .unwrap();
+    s.replace(['\n', ' '], "").parse().unwrap()
+}
+
+/// MySQL 8.4 logs an XA transaction as two groups:
+/// `GTID n, Query(XA START), Table_map, Rows, Query(XA END), XA_prepare`
+/// then `GTID n+1, Query(XA COMMIT | XA ROLLBACK)`; `XA COMMIT … ONE PHASE`
+/// is one group ending in an `XA_prepare` event with the one-phase flag.
+/// XA on unmapped tables is skipped with its position checkpointed; XA on
+/// a mapped table stops the stream with a configuration error before any
+/// of its rows are emitted.
+#[tokio::test]
+async fn xa_transactions() {
+    let Some(url) = url() else { return };
+    let _g = SERIAL.lock().await;
+    let mut conn = admin(&url).await;
+    if !gtid_on(&mut conn).await {
+        eprintln!("gtid_mode is not ON: skipping");
+        return;
+    }
+    // A prepared XA left by an interrupted run would hold its locks.
+    let _ = conn.query_drop("XA ROLLBACK 'd'").await;
+    fresh_db(&mut conn, "mc_xa").await;
+    conn.query_drop("CREATE TABLE mc_xa.items (id INT PRIMARY KEY, v VARCHAR(10))")
+        .await
+        .unwrap();
+    conn.query_drop("CREATE TABLE mc_xa.other (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    let mut src = source(&url, "mc_xa", &["items"], "xa-sync");
+    src.open(None).await.unwrap();
+    let mut run = Running::start(src);
+
+    for sql in [
+        "XA START 'a'; INSERT INTO mc_xa.other VALUES (1); XA END 'a'; XA PREPARE 'a'; XA COMMIT 'a'",
+        "XA START 'b'; INSERT INTO mc_xa.other VALUES (2); XA END 'b'; XA PREPARE 'b'; XA ROLLBACK 'b'",
+        "XA START 'c'; INSERT INTO mc_xa.other VALUES (3); XA END 'c'; XA COMMIT 'c' ONE PHASE",
+        "INSERT INTO mc_xa.items VALUES (1, 'plain')",
+    ] {
+        conn.query_drop(sql).await.unwrap();
+    }
+    let executed = gtid_executed(&mut conn).await;
+    let evs = run
+        .until(|e| matches!(e, SourceEvent::Checkpoint(c) if gtid_set(c) == executed))
+        .await;
+    let changes: Vec<_> = evs
+        .iter()
+        .filter_map(|e| match e {
+            SourceEvent::Change(c) => Some((c.collection.clone(), c.key.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        changes,
+        vec![("mc_xa.items".to_owned(), vec![json!(1)])],
+        "unmapped XA transactions are skipped"
+    );
+
+    // XA on a mapped table: refused before its rows are emitted, and its
+    // GTID never reaches a checkpoint.
+    let before = gtid_executed(&mut conn).await;
+    conn.query_drop(
+        "XA START 'd'; INSERT INTO mc_xa.items VALUES (2, 'xa'); XA END 'd'; XA PREPARE 'd'",
+    )
+    .await
+    .unwrap();
+    let rest = tokio::time::timeout(Duration::from_secs(30), async {
+        let mut seen = Vec::new();
+        while let Some(ev) = run.rx.recv().await {
+            seen.push(ev);
+        }
+        seen
+    })
+    .await
+    .expect("the stream did not stop");
+    for ev in &rest {
+        match ev {
+            SourceEvent::Change(c) => panic!("XA row emitted: {c:?}"),
+            SourceEvent::Checkpoint(c) => assert!(before.contains_set(&gtid_set(c))),
+            _ => {}
+        }
+    }
+    let err = run.task.await.unwrap().unwrap_err();
+    assert!(
+        matches!(&err, SourceError::Config(m) if m.contains("XA transactions on mapped tables are not supported")),
+        "{err:?}"
+    );
+    conn.query_drop("XA ROLLBACK 'd'").await.unwrap();
+}
+
+/// MySQL 8.4 logs `CREATE TABLE … SELECT` as one group:
+/// `GTID, Query(BEGIN), Query(CREATE TABLE … START TRANSACTION),
+/// Table_map, Write_rows, Xid`. Its rows are emitted before any checkpoint
+/// that covers its GTID.
+#[tokio::test]
+async fn create_table_select_rows_precede_its_checkpoint() {
+    let Some(url) = url() else { return };
+    let _g = SERIAL.lock().await;
+    let mut conn = admin(&url).await;
+    if !gtid_on(&mut conn).await {
+        eprintln!("gtid_mode is not ON: skipping");
+        return;
+    }
+    fresh_db(&mut conn, "mc_cts").await;
+    conn.query_drop("CREATE TABLE mc_cts.src (id INT PRIMARY KEY, v VARCHAR(10))")
+        .await
+        .unwrap();
+    conn.query_drop("INSERT INTO mc_cts.src VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+        .await
+        .unwrap();
+    conn.query_drop("CREATE TABLE mc_cts.copy (id INT PRIMARY KEY, v VARCHAR(10))")
+        .await
+        .unwrap();
+    let mut src = source(&url, "mc_cts", &["copy"], "cts-sync");
+    src.open(None).await.unwrap();
+    let mut run = Running::start(src);
+    // The stream is live (it read the table's schema) before the DROP.
+    conn.query_drop("INSERT INTO mc_cts.copy VALUES (0, 'live')")
+        .await
+        .unwrap();
+    run.until(|e| is_change_with(e, 0)).await;
+    conn.query_drop("DROP TABLE mc_cts.copy").await.unwrap();
+    conn.query_drop("CREATE TABLE mc_cts.copy (PRIMARY KEY (id)) SELECT id, v FROM mc_cts.src")
+        .await
+        .unwrap();
+    let executed = gtid_executed(&mut conn).await;
+    let evs = run
+        .until(|e| matches!(e, SourceEvent::Checkpoint(c) if gtid_set(c) == executed))
+        .await;
+    run.stop().await;
+    let last_row = evs
+        .iter()
+        .rposition(|e| matches!(e, SourceEvent::Change(_)))
+        .expect("rows of CREATE … SELECT");
+    let first_covering = evs
+        .iter()
+        .position(|e| matches!(e, SourceEvent::Checkpoint(c) if gtid_set(c) == executed))
+        .unwrap();
+    assert!(first_covering > last_row, "{evs:#?}");
+    let keys: Vec<_> = evs
+        .iter()
+        .filter_map(|e| match e {
+            SourceEvent::Change(c) if matches!(c.op, Op::Upsert { .. }) => Some(c.key.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(keys, vec![vec![json!(1)], vec![json!(2)], vec![json!(3)]]);
+    assert!(
+        evs.iter().any(
+            |e| matches!(e, SourceEvent::Truncate { collection } if collection == "mc_cts.copy")
+        )
+    );
 }
