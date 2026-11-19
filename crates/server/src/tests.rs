@@ -993,6 +993,47 @@ async fn the_public_policy_refuses_internal_origins_everywhere() {
     assert_eq!(status, StatusCode::OK, "{body}");
 }
 
+/// With the production sinks (which refuse a literal internal address
+/// themselves) the answer is still `422 host_not_allowed`.
+#[tokio::test]
+async fn a_loopback_destination_is_host_not_allowed_with_the_real_sinks() {
+    let policy = Arc::new(HostPolicy::public());
+    let state = build_state(
+        Arc::new(MemStore::new()) as Arc<dyn Backend>,
+        Wiring {
+            sources: Arc::new(FakeSources(Arc::new(Probe::default()))),
+            sinks: crate::manager::meili_sinks(Arc::clone(&policy)),
+            policy,
+            supervisor: SupervisorConfig::default(),
+            auth: AuthConfig::open(),
+            probe_timeout: Duration::from_millis(200),
+            lab_events: false,
+            limits: Limits::default(),
+        },
+        CancellationToken::new(),
+    );
+    let router = router(state);
+    for dest in [
+        "http://127.0.0.1:7700",
+        "http://[::1]:7700",
+        "http://localhost:7700",
+    ] {
+        let (status, body) = call(
+            &router,
+            "POST",
+            "/syncs",
+            &[],
+            Some(body_with(origin("8.8.8.8", 5432), dest, "d")),
+        )
+        .await;
+        assert_eq!(
+            (status, body["code"].as_str()),
+            (StatusCode::UNPROCESSABLE_ENTITY, Some("host_not_allowed")),
+            "{dest}: {body}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn the_state_database_is_refused_even_under_any() {
     let policy = HostPolicy::any().forbid_origin(Endpoint::new("127.0.0.1", 6543));

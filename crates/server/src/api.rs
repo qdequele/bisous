@@ -201,14 +201,6 @@ impl SyncInput {
 /// a destination the host policy allows (resolved now, so a refusal is
 /// immediate; vetted again on every start).
 async fn validate(state: &AppState, spec: &SyncSpec, coarse: bool) -> ApiResult<()> {
-    validate_shape(state, spec)?;
-    vet_destination(&state.policy, spec.destination.url.trim())
-        .await
-        .map_err(ApiError::host_not_allowed)?;
-    vet(state, &spec.source, coarse).await
-}
-
-fn validate_shape(state: &AppState, spec: &SyncSpec) -> ApiResult<()> {
     if spec.name.is_empty() || spec.name.len() > MAX_NAME_LEN {
         return Err(ApiError::invalid(format!(
             "name must be 1 to {MAX_NAME_LEN} characters"
@@ -219,6 +211,17 @@ fn validate_shape(state: &AppState, spec: &SyncSpec) -> ApiResult<()> {
     if !(url.starts_with("http://") || url.starts_with("https://")) {
         return Err(ApiError::invalid("destination.url must be an http(s) URL"));
     }
+    // Before the sink is built: it refuses a literal address of its own,
+    // with a less precise error.
+    vet_destination(&state.policy, url)
+        .await
+        .map_err(ApiError::host_not_allowed)?;
+    validate_shape(state, spec)?;
+    vet(state, &spec.source, coarse).await
+}
+
+/// The sink and the source accept their config.
+fn validate_shape(state: &AppState, spec: &SyncSpec) -> ApiResult<()> {
     (state.sinks)(&spec.destination).map_err(|e| ApiError::invalid(e.to_string()))?;
     // Builds the source without connecting: the connector checks its
     // config shape and the mappings.
