@@ -101,6 +101,13 @@ All notable changes to meili-connect are listed here. The format follows
 
 ### Fixed
 
+- An idle sync no longer sends a `usage.recorded` event (and a Tinybird row)
+  every flush interval carrying only its free `sync_seconds`: about 1,440
+  zero-amount ledger rows a day per sync. Its seconds accumulate (none is
+  lost) and go with its next billable usage, when it stops (pause, hold,
+  failure, deletion, graceful shutdown), or after `USAGE_IDLE_FLUSH_SECS`
+  (new, default 3600). `GET /usage` from Tinybird adds what is not sent yet.
+  Migration `20261119000007` adds `usage_pending.pending_since`.
 - `POST /sources/check` without `streams` is a connection-level pre-flight,
   as the Lab console's wizard sends it before the tables are picked: it no
   longer fails a healthy origin with `tables: no table is mapped`. Every

@@ -13,7 +13,7 @@ use chrono::{DateTime, Days, NaiveDate, Utc};
 use meili_connect_core::{
     MeiliDestination, Source, SourceSpec, StreamMapping, SyncPhase, SyncSpec,
 };
-use meili_connect_store::{DeadLetterPage, StoredSync, SyncRow};
+use meili_connect_store::{DeadLetterPage, Lane, StoredSync, SyncRow};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -703,7 +703,19 @@ pub async fn usage(
         }
     }
     let rows = match rows {
-        Some(rows) => rows,
+        Some(mut rows) => {
+            // Tinybird has what was sent; the usage not sent yet (an idle
+            // sync's seconds wait up to USAGE_IDLE_FLUSH_SECS) counts today.
+            let today = Utc::now().date_naive();
+            if (from..=to).contains(&today) {
+                for p in state.backend.pending_usage(Lane::Tinybird).await? {
+                    if p.tenant.as_deref() == scope.tenant() {
+                        rows.push((today, p.sync_id, p.usage));
+                    }
+                }
+            }
+            rows
+        }
         None => state
             .backend
             .usage(scope.tenant(), from, to)

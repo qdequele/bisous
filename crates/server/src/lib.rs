@@ -106,6 +106,9 @@ pub struct Wiring {
     pub external_ids: Option<Arc<ExternalIds>>,
     /// The server's own AWS principal, for `GET /sources/dynamodb/trust`.
     pub aws_principal: Arc<AwsPrincipal>,
+    /// `USAGE_IDLE_FLUSH_SECS`: how long a running sync's `sync_seconds`
+    /// alone stay pending before they are sent.
+    pub usage_idle_flush: std::time::Duration,
 }
 
 /// Assemble the shared state around a backend. The engine gets the
@@ -122,8 +125,11 @@ pub fn build_state(
     if wiring.tinybird.is_some() {
         lanes.push(Lane::Tinybird);
     }
-    let usage =
-        Arc::new(UsageEvents::new(lanes).with_backlog_cap(wiring.limits.outbox_max_pending));
+    let usage = Arc::new(
+        UsageEvents::new(lanes)
+            .with_backlog_cap(wiring.limits.outbox_max_pending)
+            .with_idle_flush(wiring.usage_idle_flush),
+    );
     backend.set_usage_lanes(usage.lanes());
     let metrics = Arc::new(Metrics::new());
     let engine_store: Arc<dyn StateStore> = Arc::new(MeteredStore::new(
@@ -337,6 +343,7 @@ pub async fn run() -> Result<(), String> {
             hosted: config.hosted(),
             external_ids,
             aws_principal: Arc::new(AwsPrincipal::from_host()),
+            usage_idle_flush: config.usage_idle_flush,
         },
         cancel.child_token(),
     );
@@ -349,9 +356,11 @@ pub async fn run() -> Result<(), String> {
     let background = CancellationToken::new();
     let mut tasks = Vec::new();
     if !state.manager.usage().lanes().is_empty() {
+        let manager = Arc::clone(&state.manager);
         tasks.push(tokio::spawn(lab::run_usage_flush(
             Arc::clone(state.manager.usage()),
             Arc::clone(&backend) as Arc<dyn UsageLedger>,
+            Arc::new(move || manager.active_ids()),
             config.usage_flush_interval,
             background.child_token(),
         )));
@@ -394,8 +403,9 @@ pub async fn run() -> Result<(), String> {
 
     info!("stopping the syncs");
     state.manager.shutdown(config.shutdown_grace).await;
-    // Pending usage is durable; enqueue it now so it goes out sooner.
-    if let Err(e) = state.manager.usage().flush(&*backend).await {
+    // Pending usage is durable; enqueue all of it now (idle seconds
+    // included) so it goes out sooner.
+    if let Err(e) = state.manager.usage().flush_all(&*backend).await {
         warn!(error = %e, "cannot enqueue the last usage; it stays pending");
     }
     background.cancel();

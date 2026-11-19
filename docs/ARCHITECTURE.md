@@ -160,8 +160,11 @@ Standalone works with none of the `LAB_*` variables set. With them:
   first (Lab-owned contract). Usage is durable end to end
   (`store::UsageLedger`): `record_progress` adds a batch's units to a
   `usage_pending` row per lane (Lab, Tinybird) in the same transaction as
-  the progress counters, and the flush moves pending rows into the lane's
-  outbox in one transaction. The one double count left: a crash after
+  the progress counters, and the flush moves the due pending rows into the
+  lane's outbox in one transaction: billable usage at once, an idle sync's
+  `sync_seconds` alone once the row is `USAGE_IDLE_FLUSH_SECS` old
+  (`usage_pending.pending_since`), a stopped sync's tail at once
+  (`store::UsageDrain`). The one double count left: a crash after
   Meilisearch accepted a batch and before its progress and checkpoint were
   saved replays (and records) that batch once more.
 - **Secrets at rest** are sealed with ChaCha20-Poly1305

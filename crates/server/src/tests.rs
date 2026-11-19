@@ -335,6 +335,7 @@ fn app_tweaked(
         hosted: false,
         external_ids: None,
         aws_principal: test_principal(),
+        usage_idle_flush: crate::usage::DEFAULT_IDLE_FLUSH,
         limits,
     };
     tweak(&mut wiring);
@@ -1112,6 +1113,7 @@ async fn a_loopback_destination_is_host_not_allowed_with_the_real_sinks() {
             hosted: false,
             external_ids: None,
             aws_principal: test_principal(),
+            usage_idle_flush: crate::usage::DEFAULT_IDLE_FLUSH,
             limits: Limits::default(),
         },
         CancellationToken::new(),
@@ -2085,7 +2087,7 @@ async fn engine_progress_becomes_usage_events_for_tenant_syncs() {
     wait_for(async || snapshot(&global).await == 3).await;
     assert_eq!(a.store.pending_usage(Lane::Lab).await.unwrap().len(), 1);
     assert_eq!(
-        usage.flush(&*a.store).await.unwrap(),
+        usage.flush(&*a.store, &[]).await.unwrap(),
         1,
         "global syncs are not billed"
     );
@@ -2137,6 +2139,183 @@ async fn engine_progress_becomes_usage_events_for_tenant_syncs() {
         lease.events[0].payload["data"]["units"]["documents_streamed"],
         2
     );
+}
+
+/// An idle sync sends no event per flush: its seconds accumulate (none
+/// lost) until `USAGE_IDLE_FLUSH_SECS`, go with the next activity, and go
+/// when it stops. `/usage` always equals the events plus what is pending.
+#[tokio::test]
+async fn idle_seconds_wait_for_activity_the_idle_period_or_a_stop() {
+    let a = app(locked());
+    let id = create(&a, &lab("team-a"), "s").await;
+    let usage = Arc::clone(a.state.manager.usage());
+    let units = [
+        "documents_streamed",
+        "documents_snapshot",
+        "documents_resync",
+        "bytes",
+        "sync_seconds",
+    ];
+    let sent: std::sync::Mutex<std::collections::HashMap<&str, u64>> = Default::default();
+    // Lease what the Lab lane holds, add it to `sent`, return the events.
+    let take = async || {
+        let lease = a
+            .store
+            .lease_events(100, Duration::from_secs(30))
+            .await
+            .unwrap();
+        let ids: Vec<_> = lease.events.iter().map(|e| e.id).collect();
+        a.store.mark_events_sent(lease.token, &ids).await.unwrap();
+        let mut sent = sent.lock().unwrap();
+        for e in &lease.events {
+            assert_eq!(e.payload["data"]["job_id"], id.as_str());
+            for u in units {
+                *sent.entry(u).or_default() += e.payload["data"]["units"][u].as_u64().unwrap();
+            }
+        }
+        lease
+            .events
+            .into_iter()
+            .map(|e| e.payload)
+            .collect::<Vec<_>>()
+    };
+    // `/usage` = what was sent + what is pending, unit by unit.
+    let consistent = async || {
+        let (_, body) = call(&a.router, "GET", "/usage", &lab("team-a"), None).await;
+        let pending = a.store.pending_usage(Lane::Lab).await.unwrap();
+        let sent = sent.lock().unwrap().clone();
+        for u in units {
+            let pending: u64 = pending
+                .iter()
+                .map(|p| match u {
+                    "documents_streamed" => p.usage.documents_streamed,
+                    "documents_snapshot" => p.usage.documents_snapshot,
+                    "documents_resync" => p.usage.documents_resync,
+                    "bytes" => p.usage.bytes,
+                    _ => p.usage.sync_seconds,
+                })
+                .sum();
+            assert_eq!(
+                body["totals"][u].as_u64().unwrap(),
+                sent.get(u).copied().unwrap_or(0) + pending,
+                "{u}: {body}"
+            );
+        }
+    };
+    let pending_seconds = async || {
+        a.store
+            .pending_usage(Lane::Lab)
+            .await
+            .unwrap()
+            .iter()
+            .map(|p| p.usage.sync_seconds)
+            .sum::<u64>()
+    };
+    let seconds = |n: u64| meili_connect_core::Progress {
+        usage: meili_connect_core::Usage {
+            sync_seconds: n,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let flush = async || {
+        usage
+            .flush(&*a.store, &a.state.manager.active_ids())
+            .await
+            .unwrap()
+    };
+
+    // The snapshot is billable: it goes at the next flush.
+    wait_for(async || status_of_tenant(&a, &id, "team-a").await["phase"] == "streaming").await;
+    assert_eq!(a.state.manager.active_ids(), vec![id.clone()]);
+    assert_eq!(flush().await, 1);
+    assert_eq!(take().await[0]["data"]["units"]["documents_snapshot"], 3);
+    consistent().await;
+
+    // Idle for five flush intervals: no event, every second kept.
+    let before = pending_seconds().await;
+    for _ in 0..5 {
+        a.store.record_progress(&id, &seconds(60)).await.unwrap();
+        assert_eq!(flush().await, 0);
+        assert!(take().await.is_empty());
+        consistent().await;
+    }
+    assert_eq!(pending_seconds().await, before + 300);
+    let status = status_of_tenant(&a, &id, "team-a").await;
+    assert!(status["sync_seconds"].as_u64().unwrap() >= 300, "{status}");
+    // The idle period passes: one event with all of them.
+    a.store.age_pending_usage(crate::usage::DEFAULT_IDLE_FLUSH);
+    let all = pending_seconds().await;
+    assert_eq!(flush().await, 1);
+    let events = take().await;
+    assert_eq!(events[0]["data"]["units"]["sync_seconds"], all);
+    assert_eq!(events[0]["data"]["units"]["bytes"], 0);
+    consistent().await;
+
+    // Activity takes the pending seconds with it.
+    a.store.record_progress(&id, &seconds(45)).await.unwrap();
+    assert_eq!(flush().await, 0);
+    let streamed = meili_connect_core::Progress {
+        written: 2,
+        usage: meili_connect_core::Usage {
+            documents_streamed: 2,
+            bytes: 200,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    a.store.record_progress(&id, &streamed).await.unwrap();
+    let with = pending_seconds().await;
+    assert!(with >= 45);
+    assert_eq!(flush().await, 1);
+    let events = take().await;
+    assert_eq!(events[0]["data"]["units"]["documents_streamed"], 2);
+    assert_eq!(events[0]["data"]["units"]["sync_seconds"], with);
+    consistent().await;
+
+    // A pause sends the tail at once.
+    a.store.record_progress(&id, &seconds(10)).await.unwrap();
+    let (status, _) = call(
+        &a.router,
+        "POST",
+        &format!("/syncs/{id}/pause"),
+        &lab("team-a"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(pending_seconds().await, 0);
+    let events = take().await;
+    assert_eq!(events.len(), 1);
+    assert!(events[0]["data"]["units"]["sync_seconds"].as_u64().unwrap() >= 10);
+    consistent().await;
+
+    // Seconds left by a sync that is not running (held, failed, or a
+    // crash before the pause) go at the next flush.
+    assert!(a.state.manager.active_ids().is_empty());
+    a.store.record_progress(&id, &seconds(4)).await.unwrap();
+    assert_eq!(flush().await, 1);
+    assert_eq!(take().await[0]["data"]["units"]["sync_seconds"], 4);
+    consistent().await;
+
+    // A graceful stop sends everything, idle seconds included.
+    let other = create(&a, &lab("team-a"), "t").await;
+    wait_for(async || a.state.manager.active_ids().contains(&other)).await;
+    a.store.record_progress(&other, &seconds(9)).await.unwrap();
+    usage.flush_all(&*a.store).await.unwrap();
+    assert!(a.store.pending_usage(Lane::Lab).await.unwrap().is_empty());
+}
+
+async fn status_of_tenant(a: &App, id: &str, tenant: &str) -> Value {
+    call(
+        &a.router,
+        "GET",
+        &format!("/syncs/{id}/status"),
+        &lab(tenant),
+        None,
+    )
+    .await
+    .1
 }
 
 // ------------------------------------------------------------- routes
@@ -2692,6 +2871,40 @@ async fn usage_comes_from_tinybird_when_configured_with_the_same_shape() {
     assert_eq!(by_sync["rows"][0]["sync_id"], "s1");
     assert_eq!(by_sync["rows"][0]["units"]["documents_streamed"], 15);
     assert!(by_sync["rows"][0]["name"].is_null(), "unknown here");
+
+    // What is not sent to Tinybird yet (idle seconds wait up to
+    // USAGE_IDLE_FLUSH_SECS) counts today.
+    let id = create(&a, &lab("team-a"), "pending").await;
+    a.store
+        .record_progress(
+            &id,
+            &meili_connect_core::Progress {
+                usage: meili_connect_core::Usage {
+                    sync_seconds: 40,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let pending: u64 = a
+        .store
+        .pending_usage(Lane::Tinybird)
+        .await
+        .unwrap()
+        .iter()
+        .map(|p| p.usage.sync_seconds)
+        .sum();
+    assert!(pending >= 40);
+    let (_, body) = call(&a.router, "GET", "/usage", &lab("team-a"), None).await;
+    assert_eq!(body["source"], "tinybird");
+    assert_eq!(body["totals"]["sync_seconds"], 150 + pending, "{body}");
+    let (_, other) = call(&a.router, "GET", "/usage", &lab("team-b"), None).await;
+    assert_eq!(
+        other["totals"]["sync_seconds"], 0,
+        "another tenant's: {other}"
+    );
 
     // Tinybird down: the state database answers, same shape.
     tb.reset().await;

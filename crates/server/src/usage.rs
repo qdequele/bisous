@@ -6,10 +6,25 @@
 //! enabled lane ([`Lane::Lab`], [`Lane::Tinybird`]) and sync **in the same
 //! transaction** as the progress counters. Every `USAGE_FLUSH_INTERVAL_SECS`,
 //! [`UsageEvents::flush`] drains each lane: one transaction takes the
-//! pending rows and enqueues one event per sync with non-zero units into the
+//! pending rows that are due and enqueues one event per sync into the
 //! lane's outbox, from which that lane's sender delivers them at least once
 //! (deduplicated downstream by event id). So what is sent is exactly what
 //! progress recorded, and a crash at any point loses nothing.
+//!
+//! When an event is due (the Lab writes one ledger row per event):
+//!
+//! - a billable unit (documents or bytes) is pending: at the next flush,
+//!   carrying the `sync_seconds` accumulated so far;
+//! - only `sync_seconds` is pending (an idle sync): once the row is
+//!   `USAGE_IDLE_FLUSH_SECS` old, so an idle sync sends about one event per
+//!   period instead of one per flush. The row's age is stored with it;
+//! - the sync stopped (paused, held, failed, deleted, out of credits):
+//!   its tail goes at once ([`UsageEvents::flush_sync`]) or at the next
+//!   flush (it is not among the running syncs), and everything goes when
+//!   the server stops gracefully ([`UsageEvents::flush_all`]).
+//!
+//! `GET /usage` and the status read the progress counters, which hold the
+//! pending part too.
 //!
 //! Remaining double count, bounded: a crash after Meilisearch accepted a
 //! batch and before the engine recorded it and saved its checkpoint replays
@@ -27,7 +42,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use chrono::{SecondsFormat, Utc};
 use meili_connect_core::{DeadLetter, Progress, StateStore, StoreError, SyncSpec, SyncState};
-use meili_connect_store::{DrainOutcome, Lane, PendingUsage, RepoError, UsageLedger};
+use meili_connect_store::{DrainOutcome, Lane, PendingUsage, RepoError, UsageDrain, UsageLedger};
 use serde_json::{Value, json};
 
 use crate::limits::LogLimiter;
@@ -105,8 +120,14 @@ pub struct UsageEvents {
     /// Unsent events of a lane beyond which its usage stays pending
     /// (`LAB_OUTBOX_MAX_PENDING`; 0: no cap).
     backlog_cap: u64,
+    /// How long a running sync's `sync_seconds` alone may stay pending
+    /// (`USAGE_IDLE_FLUSH_SECS`).
+    idle_after: Duration,
     backlog_log: Mutex<LogLimiter>,
 }
+
+/// Default of `USAGE_IDLE_FLUSH_SECS`.
+pub const DEFAULT_IDLE_FLUSH: Duration = Duration::from_secs(3600);
 
 impl UsageEvents {
     pub fn new(lanes: Vec<Lane>) -> Self {
@@ -114,6 +135,7 @@ impl UsageEvents {
             lanes,
             descriptions: Mutex::new(HashMap::new()),
             backlog_cap: 0,
+            idle_after: DEFAULT_IDLE_FLUSH,
             backlog_log: Mutex::new(LogLimiter::new(Duration::from_secs(300))),
         }
     }
@@ -121,6 +143,12 @@ impl UsageEvents {
     /// Keep a lane's usage pending while it holds `cap` unsent events.
     pub fn with_backlog_cap(mut self, cap: u64) -> Self {
         self.backlog_cap = cap;
+        self
+    }
+
+    /// Send a running sync's `sync_seconds` alone once they are this old.
+    pub fn with_idle_flush(mut self, idle_after: Duration) -> Self {
+        self.idle_after = idle_after;
         self
     }
 
@@ -163,11 +191,11 @@ impl UsageEvents {
         &self,
         ledger: &dyn UsageLedger,
         lane: Lane,
-        sync_id: Option<&str>,
+        which: UsageDrain<'_>,
     ) -> Result<usize, RepoError> {
         let build = |p: &PendingUsage| self.event(lane, p);
         match ledger
-            .drain_usage(lane, sync_id, self.backlog_cap, &build)
+            .drain_usage(lane, which, self.backlog_cap, &build)
             .await?
         {
             DrainOutcome::Enqueued(n) => Ok(n),
@@ -192,15 +220,41 @@ impl UsageEvents {
         }
     }
 
-    /// Enqueue the pending usage of every lane. Lanes are independent: one
-    /// failing does not keep the others from being drained; the first
-    /// error is returned after trying all. Returns how many events were
-    /// enqueued.
-    pub async fn flush(&self, ledger: &dyn UsageLedger) -> Result<usize, RepoError> {
+    /// Enqueue the usage that is due on every lane: billable usage, the
+    /// seconds of the syncs not in `active` (they stopped), and seconds
+    /// pending for `USAGE_IDLE_FLUSH_SECS`. `active` is the syncs running
+    /// now. Lanes are independent: one failing does not keep the others
+    /// from being drained; the first error is returned after trying all.
+    /// Returns how many events were enqueued.
+    pub async fn flush(
+        &self,
+        ledger: &dyn UsageLedger,
+        active: &[String],
+    ) -> Result<usize, RepoError> {
+        self.drain_lanes(
+            ledger,
+            UsageDrain::Due {
+                idle_after: self.idle_after,
+                active,
+            },
+        )
+        .await
+    }
+
+    /// Enqueue everything pending (the server stops).
+    pub async fn flush_all(&self, ledger: &dyn UsageLedger) -> Result<usize, RepoError> {
+        self.drain_lanes(ledger, UsageDrain::All(None)).await
+    }
+
+    async fn drain_lanes(
+        &self,
+        ledger: &dyn UsageLedger,
+        which: UsageDrain<'_>,
+    ) -> Result<usize, RepoError> {
         let mut total = 0;
         let mut first_error = None;
         for &lane in &self.lanes {
-            match self.drain(ledger, lane, None).await {
+            match self.drain(ledger, lane, which).await {
                 Ok(n) => total += n,
                 Err(e) => {
                     tracing::warn!(lane = lane.as_str(), error = %e, "cannot enqueue usage events");
@@ -214,14 +268,17 @@ impl UsageEvents {
         }
     }
 
-    /// Enqueue the pending usage of one sync now (it is being deleted).
-    /// When this fails the usage stays pending and goes with the next
-    /// flush: nothing is lost.
+    /// Enqueue the pending usage of one sync now (it stopped, or it is
+    /// being deleted). When this fails the usage stays pending and goes
+    /// with the next flush: nothing is lost.
     pub async fn flush_sync(&self, ledger: &dyn UsageLedger, sync_id: &str) {
         for &lane in &self.lanes {
-            if let Err(e) = self.drain(ledger, lane, Some(sync_id)).await {
+            if let Err(e) = self
+                .drain(ledger, lane, UsageDrain::All(Some(sync_id)))
+                .await
+            {
                 tracing::warn!(sync_id, lane = lane.as_str(), error = %e,
-                    "usage of a deleted sync could not be enqueued yet; it stays pending");
+                    "usage of a stopped sync could not be enqueued yet; it stays pending");
             }
         }
     }
@@ -324,8 +381,8 @@ mod tests {
             .record_progress("s1", &progress(1200, 0, 1_482_113, 60))
             .await
             .unwrap();
-        assert_eq!(events.flush(&store).await.unwrap(), 1);
-        assert_eq!(events.flush(&store).await.unwrap(), 0, "nothing new");
+        assert_eq!(events.flush(&store, &[]).await.unwrap(), 1);
+        assert_eq!(events.flush(&store, &[]).await.unwrap(), 0, "nothing new");
 
         let lease = store
             .lease_events(10, Duration::from_secs(30))
@@ -381,7 +438,7 @@ mod tests {
             .record_progress("g", &progress(5, 0, 50, 0))
             .await
             .unwrap();
-        assert_eq!(events.flush(&store).await.unwrap(), 1);
+        assert_eq!(events.flush(&store, &[]).await.unwrap(), 1);
         assert_eq!(
             store.count_unsent().await.unwrap(),
             0,
@@ -446,7 +503,11 @@ mod tests {
             .record_progress("s1", &progress(5, 0, 0, 0))
             .await
             .unwrap();
-        assert_eq!(events.flush(&store).await.unwrap(), 1, "Tinybird's only");
+        assert_eq!(
+            events.flush(&store, &[]).await.unwrap(),
+            1,
+            "Tinybird's only"
+        );
         assert_eq!(store.pending_usage(Lane::Lab).await.unwrap().len(), 1);
         assert_eq!(
             store.outbox(Lane::Tinybird).count_unsent().await.unwrap(),
@@ -468,7 +529,7 @@ mod tests {
             .record_progress("s1", &progress(5, 0, 0, 0))
             .await
             .unwrap();
-        assert_eq!(events.flush(&store).await.unwrap(), 0);
+        assert_eq!(events.flush(&store, &[]).await.unwrap(), 0);
         assert_eq!(store.pending_usage(Lane::Lab).await.unwrap().len(), 1);
         store
             .record_progress("s1", &progress(1, 0, 0, 0))
@@ -476,7 +537,7 @@ mod tests {
             .unwrap();
         // Room again: the whole count goes out at once.
         let roomy = UsageEvents::new(vec![Lane::Lab]).with_backlog_cap(10);
-        assert_eq!(roomy.flush(&store).await.unwrap(), 1);
+        assert_eq!(roomy.flush(&store, &[]).await.unwrap(), 1);
         let lease = store
             .lease_events(10, Duration::from_secs(30))
             .await

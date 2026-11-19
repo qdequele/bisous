@@ -22,8 +22,8 @@ use crate::error::from_sqlx;
 use crate::{
     BootSync, DailyProgress, DeadLetterLimits, DeadLetterPage, DrainOutcome, EventBuilder,
     LabOutbox, Lane, OutboxEvent, OutboxLease, PendingUsage, RepoError, RetryBackoff, SecretKey,
-    StoredDeadLetter, StoredSync, SyncRepository, SyncRow, UnreadableSync, UsageLedger, UsageRow,
-    bound_letter, lane_mask, lanes_of, to_i64, to_u64, validate_spec,
+    StoredDeadLetter, StoredSync, SyncRepository, SyncRow, UnreadableSync, UsageDrain, UsageLedger,
+    UsageRow, bound_letter, lane_mask, lanes_of, to_i64, to_u64, validate_spec,
 };
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
@@ -705,7 +705,7 @@ impl UsageLedger for PgStore {
     async fn drain_usage(
         &self,
         lane: Lane,
-        sync_id: Option<&str>,
+        which: UsageDrain<'_>,
         backlog_cap: u64,
         event: &EventBuilder<'_>,
     ) -> Result<DrainOutcome, RepoError> {
@@ -715,18 +715,33 @@ impl UsageLedger for PgStore {
                 return Ok(DrainOutcome::Backlogged(backlog));
             }
         }
+        let (all, sync_id, active, idle_secs) = match which {
+            UsageDrain::All(sync_id) => (true, sync_id, &[][..], 0.0),
+            UsageDrain::Due { idle_after, active } => {
+                (false, None, active, idle_after.as_secs_f64())
+            }
+        };
         let mut tx = self.pool.begin().await.map_err(from_sqlx)?;
         // Taken and enqueued in one transaction: a crash leaves the usage
         // either pending or enqueued, never both, never neither. A
         // `record_progress` racing on a taken row waits for the commit,
-        // then starts a new one.
+        // then starts a new one (aged from then).
         let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
             "DELETE FROM usage_pending
-             WHERE lane = $1 AND ($2::text IS NULL OR sync_id = $2)
+             WHERE lane = $1 AND CASE WHEN $2
+                THEN $3::text IS NULL OR sync_id = $3
+                ELSE documents_streamed > 0 OR documents_snapshot > 0
+                    OR documents_resync > 0 OR bytes > 0
+                    OR sync_id <> ALL($4::text[])
+                    OR pending_since <= now() - make_interval(secs => $5::float8)
+             END
              RETURNING sync_id, tenant_id, source_kind, sync_name, {USAGE_COLUMNS}"
         )))
         .bind(lane.as_str())
+        .bind(all)
         .bind(sync_id)
+        .bind(active)
+        .bind(idle_secs)
         .fetch_all(&mut *tx)
         .await
         .map_err(from_sqlx)?;

@@ -103,6 +103,23 @@ async fn usage_is_durable_per_lane() {
     crate::test_support::ledger_contract(&store).await;
 }
 
+/// The row's age is stored with it (`pending_since`): it survives a
+/// restart, and the upsert never makes it younger.
+#[tokio::test]
+async fn idle_usage_waits_for_its_period() {
+    let Some(store) = store().await else { return };
+    crate::test_support::idle_usage_contract(&store, async |s: &PgStore, by: Duration| {
+        sqlx::query(
+            "UPDATE usage_pending SET pending_since = pending_since - make_interval(secs => $1)",
+        )
+        .bind(by.as_secs_f64())
+        .execute(&s.pool)
+        .await
+        .unwrap();
+    })
+    .await;
+}
+
 /// Progress recorded while drains run: every unit ends up in exactly one
 /// event.
 #[tokio::test]
@@ -132,7 +149,10 @@ async fn concurrent_progress_and_drains_lose_and_double_nothing() {
         let store = Arc::clone(&store);
         tokio::spawn(async move {
             for _ in 0..40 {
-                store.drain_usage(Lane::Lab, None, 0, &build).await.unwrap();
+                store
+                    .drain_usage(Lane::Lab, UsageDrain::All(None), 0, &build)
+                    .await
+                    .unwrap();
                 tokio::task::yield_now().await;
             }
         })
@@ -141,7 +161,10 @@ async fn concurrent_progress_and_drains_lose_and_double_nothing() {
         w.await.unwrap();
     }
     drainer.await.unwrap();
-    store.drain_usage(Lane::Lab, None, 0, &build).await.unwrap();
+    store
+        .drain_usage(Lane::Lab, UsageDrain::All(None), 0, &build)
+        .await
+        .unwrap();
     let lease = store
         .lease_events(10_000, Duration::from_secs(30))
         .await
