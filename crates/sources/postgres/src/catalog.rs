@@ -2,11 +2,17 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use meili_connect_core::SourceError;
+use meili_connect_core::{Document, SourceError};
 
 use crate::conn::Sql;
 use crate::convert::{self, Oid, TypeRegistry};
 use crate::ident;
+use crate::pgoutput::RowRef;
+
+/// Why a table with inheritance children cannot be synced.
+pub const INHERITANCE: &str = "other tables inherit from it: their rows would be read by the \
+     snapshot but their changes are published under their own names, so they would never be \
+     updated or deleted. Map each table separately (declarative partitioning is supported)";
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct TableInfo {
@@ -22,6 +28,11 @@ pub struct TableInfo {
     pub columns: Vec<ColumnInfo>,
     pub can_select: bool,
     pub is_owner: bool,
+    pub oid: u32,
+    /// A plain table with inheritance children (not partitions): a SELECT
+    /// reads their rows, but their changes are published under their own
+    /// names.
+    pub has_inheritance_children: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -83,7 +94,9 @@ pub async fn tables(
                FROM pg_index i
                CROSS JOIN LATERAL unnest(i.indkey::int2[]) WITH ORDINALITY AS k(attnum, ord)
                JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum
-               WHERE i.indrelid = c.oid AND i.{flag}), '{{}}')"
+               WHERE i.indrelid = c.oid AND i.{flag}
+                 -- Key columns only: INCLUDE columns do not identify a row.
+                 AND k.ord <= i.indnkeyatts), '{{}}')"
         )
     };
     let col_agg = |expr: &str, ty: &str| {
@@ -107,7 +120,9 @@ pub async fn tables(
                 {pk}, {ri},
                 {names}, {oids}, {types}, {notnull},
                 has_table_privilege(c.oid, 'SELECT'),
-                pg_has_role(c.relowner, 'USAGE')
+                pg_has_role(c.relowner, 'USAGE'),
+                c.oid,
+                c.relkind = 'r' AND EXISTS (SELECT 1 FROM pg_inherits h WHERE h.inhparent = c.oid)
          FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
          WHERE c.relkind IN ('r', 'p') AND {where_clause}
          ORDER BY 1, 2",
@@ -155,6 +170,8 @@ pub async fn tables(
             columns,
             can_select: col(&row, 11)?,
             is_owner: col(&row, 12)?,
+            oid: col(&row, 13)?,
+            has_inheritance_children: col(&row, 14)?,
         });
     }
     Ok(out)
@@ -228,6 +245,81 @@ pub async fn resolve_types(
     Ok(())
 }
 
+/// The current row with key `row.key_columns`, as a whole document of the
+/// relation's columns. `None` when the row (or its table, or a key column)
+/// is gone: a later change in the stream covers it.
+pub async fn fetch_row(
+    sql: &Sql,
+    registry: &mut TypeRegistry,
+    row: &RowRef,
+) -> Result<Option<Document>, SourceError> {
+    let qualified = ident::qualified(&row.schema, &row.table);
+    let rows = sql
+        .query(
+            "SELECT a.attname::text, a.atttypid, format_type(a.atttypid, NULL)
+             FROM pg_attribute a
+             WHERE a.attrelid = to_regclass($1) AND a.attnum > 0 AND NOT a.attisdropped",
+            &[&qualified],
+        )
+        .await?;
+    let mut current: HashMap<String, (Oid, String)> = HashMap::with_capacity(rows.len());
+    for r in &rows {
+        current.insert(col(r, 0)?, (col(r, 1)?, col(r, 2)?));
+    }
+    // The relation's columns that still exist, typed as they are now.
+    let columns: Vec<(String, Oid)> = row
+        .columns
+        .iter()
+        .filter_map(|c| current.get(&c.name).map(|(oid, _)| (c.name.clone(), *oid)))
+        .collect();
+    let mut filters = Vec::with_capacity(row.key_columns.len());
+    let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+        Vec::with_capacity(row.key_columns.len());
+    for (i, (column, text)) in row.key_columns.iter().enumerate() {
+        let Some((_, type_name)) = current.get(&column.name) else {
+            return Ok(None);
+        };
+        filters.push(format!(
+            "{} = ${}::text::{type_name}",
+            ident::quote_ident(&column.name),
+            i + 1
+        ));
+        params.push(text);
+    }
+    if columns.is_empty() || filters.is_empty() {
+        return Ok(None);
+    }
+    resolve_types(sql, registry, columns.iter().map(|(_, oid)| *oid)).await?;
+    let select = columns
+        .iter()
+        .map(|(name, _)| format!("{}::text", ident::quote_ident(name)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let query = format!(
+        "SELECT {select} FROM {qualified} WHERE {}",
+        filters.join(" AND ")
+    );
+    let found = match sql.query(&query, &params).await {
+        Ok(found) => found,
+        // Dropped or altered between the catalog read and the query.
+        Err(SourceError::Config(_)) => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let Some(found) = found.first() else {
+        return Ok(None);
+    };
+    let mut doc = Document::new();
+    for (i, (name, oid)) in columns.iter().enumerate() {
+        let value: Option<String> = col(found, i)?;
+        let value = match value {
+            Some(text) => registry.to_json(*oid, &text),
+            None => serde_json::Value::Null,
+        };
+        doc.insert(name.clone(), value);
+    }
+    Ok(Some(doc))
+}
+
 /// A column, without panicking on a type mismatch.
 fn col<'a, T: tokio_postgres::types::FromSql<'a>>(
     row: &'a tokio_postgres::Row,
@@ -298,6 +390,35 @@ impl SlotInfo {
     }
 }
 
+/// The end of the WAL this server has: flushed on a primary, received or
+/// replayed (whichever is further) on a standby.
+pub async fn wal_end(sql: &Sql) -> Result<String, SourceError> {
+    let rows = sql
+        .query(
+            "SELECT (CASE WHEN pg_is_in_recovery()
+                      THEN GREATEST(pg_last_wal_receive_lsn(), pg_last_wal_replay_lsn())
+                      ELSE pg_current_wal_flush_lsn() END)::text",
+            &[],
+        )
+        .await?;
+    rows.first()
+        .and_then(|r| r.try_get::<_, Option<String>>(0).ok().flatten())
+        .ok_or_else(|| SourceError::Transient("the server reports no WAL position".into()))
+}
+
+/// Whether backend `pid` is a session of ours: this connector's
+/// application name, logged in as the current role.
+pub async fn is_own_backend(sql: &Sql, pid: i32) -> Result<bool, SourceError> {
+    let rows = sql
+        .query(
+            "SELECT 1 FROM pg_stat_activity
+             WHERE pid = $1 AND application_name = $2 AND usename = current_user",
+            &[&pid, &crate::conn::APPLICATION_NAME],
+        )
+        .await?;
+    Ok(!rows.is_empty())
+}
+
 /// Tables (`schema.table`) in a publication, `None` when it does not exist.
 pub async fn publication_tables(
     sql: &Sql,
@@ -321,12 +442,36 @@ pub async fn publication_tables(
         .map(Some)
 }
 
-/// Create the publication for exactly `tables`, or reset an existing one
-/// to exactly them.
+/// The comment that marks a publication as created by `sync_id`.
+pub fn marker(sync_id: &str) -> String {
+    format!("meili-connect:{sync_id}")
+}
+
+/// The publication's comment: `None` when it does not exist, `Some(None)`
+/// when it has no comment.
+pub async fn publication_comment(
+    sql: &Sql,
+    name: &str,
+) -> Result<Option<Option<String>>, SourceError> {
+    let rows = sql
+        .query(
+            "SELECT obj_description(oid, 'pg_publication') FROM pg_publication WHERE pubname = $1",
+            &[&name],
+        )
+        .await?;
+    rows.first()
+        .map(|r| col::<Option<String>>(r, 0))
+        .transpose()
+}
+
+/// Create the publication for exactly `tables` and mark it as ours, or
+/// reset an existing one (the caller checked it carries our marker) to
+/// exactly them. Partition changes are published under the partitioned
+/// table's name, the one the user mapped.
 pub async fn ensure_publication(
     sql: &Sql,
-    version: i32,
     name: &str,
+    marker: &str,
     tables: &[(String, String)],
 ) -> Result<(), SourceError> {
     let list = tables
@@ -335,28 +480,21 @@ pub async fn ensure_publication(
         .collect::<Vec<_>>()
         .join(", ");
     let quoted = ident::quote_ident(name);
-    let exists = publication_tables(sql, name).await?.is_some();
-    if exists {
-        sql.simple(&format!("ALTER PUBLICATION {quoted} SET TABLE {list}"))
-            .await?;
-        if version >= 130_000 {
-            sql.simple(&format!(
-                "ALTER PUBLICATION {quoted} SET (publish_via_partition_root = true)"
-            ))
-            .await?;
-        }
+    let exists = publication_comment(sql, name).await?.is_some();
+    // One simple query is one implicit transaction: never a publication
+    // without its marker.
+    let statements = if exists {
+        format!(
+            "ALTER PUBLICATION {quoted} SET TABLE {list};
+             ALTER PUBLICATION {quoted} SET (publish_via_partition_root = true)"
+        )
     } else {
-        // Partition changes are published under the partitioned table's
-        // name, the one the user mapped (13+).
-        let with = if version >= 130_000 {
-            " WITH (publish_via_partition_root = true)"
-        } else {
-            ""
-        };
-        sql.simple(&format!(
-            "CREATE PUBLICATION {quoted} FOR TABLE {list}{with}"
-        ))
-        .await?;
-    }
+        format!(
+            "CREATE PUBLICATION {quoted} FOR TABLE {list} WITH (publish_via_partition_root = true);
+             COMMENT ON PUBLICATION {quoted} IS {}",
+            ident::quote_literal(marker)
+        )
+    };
+    sql.simple(&statements).await?;
     Ok(())
 }

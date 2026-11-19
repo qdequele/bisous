@@ -4,11 +4,11 @@ use meili_connect_core::{CheckReport, CheckStatus, SourceError};
 
 use crate::catalog;
 use crate::conn::Sql;
-use crate::source::{MIN_VERSION, PostgresSource};
+use crate::source::{MIN_VERSION, PostgresSource, too_old};
 
 pub async fn run(src: &mut PostgresSource) -> Result<CheckReport, SourceError> {
     let mut report = CheckReport::default();
-    if let Err(e) = src.connect().await {
+    if let Err(e) = src.connect().await.map_err(crate::error::first_contact) {
         let mut message = e.to_string();
         if src.supabase() && matches!(e, SourceError::Transient(_)) {
             message.push_str(
@@ -30,14 +30,13 @@ pub async fn run(src: &mut PostgresSource) -> Result<CheckReport, SourceError> {
     let publication = src.settings.publication.clone();
     let list = src.table_list();
     let targets = src.targets.clone();
+    let owned = src.ownership().await?;
+    let foreign_slot = owned.foreign_slot(&src.settings);
+    let foreign_publication = owned.foreign_publication(&src.settings);
     let sql = src.db()?;
 
     if version < MIN_VERSION {
-        report.push(
-            "server_version",
-            CheckStatus::Failed,
-            format!("Postgres {version} is too old: logical replication needs 10 or later"),
-        );
+        report.push("server_version", CheckStatus::Failed, too_old(version));
     } else {
         report.push("server_version", CheckStatus::Ok, version_text(version));
     }
@@ -89,7 +88,7 @@ pub async fn run(src: &mut PostgresSource) -> Result<CheckReport, SourceError> {
         );
     }
 
-    let slot_exists = catalog::slot(sql, &slot_name).await?.is_some();
+    let slot_exists = owned.slot.is_some();
     let rows = sql
         .query(
             "SELECT current_setting('max_replication_slots')::int8,
@@ -104,7 +103,9 @@ pub async fn run(src: &mut PostgresSource) -> Result<CheckReport, SourceError> {
         let used_slots: i64 = r.try_get(1).unwrap_or(0);
         let max_senders: i64 = r.try_get(2).unwrap_or(0);
         let used_senders: i64 = r.try_get(3).unwrap_or(0);
-        if slot_exists {
+        if let Some(message) = foreign_slot {
+            report.push("replication_slots", CheckStatus::Failed, message);
+        } else if slot_exists {
             report.push(
                 "replication_slots",
                 CheckStatus::Ok,
@@ -195,6 +196,8 @@ pub async fn run(src: &mut PostgresSource) -> Result<CheckReport, SourceError> {
                 "the role cannot create publications: GRANT CREATE ON DATABASE <db> TO <user>",
             );
         }
+    } else if let Some(message) = foreign_publication {
+        report.push("publication", CheckStatus::Failed, message);
     } else {
         report.push(
             "publication",
@@ -238,6 +241,9 @@ pub async fn run(src: &mut PostgresSource) -> Result<CheckReport, SourceError> {
                 "no primary key: add one or set REPLICA IDENTITY USING INDEX <unique index>"
                     .to_owned(),
             ),
+        }
+        if info.has_inheritance_children {
+            problems.push(catalog::INHERITANCE.to_owned());
         }
         if !info.can_select {
             problems.push("the role cannot SELECT from it".to_owned());

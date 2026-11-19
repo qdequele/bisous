@@ -85,6 +85,8 @@ pub struct Settings {
     pub conn: ConnParams,
     pub slot: String,
     pub publication: String,
+    /// The sync these objects belong to: their ownership marker.
+    pub sync_id: String,
 }
 
 impl PostgresConfig {
@@ -183,6 +185,7 @@ impl PostgresConfig {
             },
             slot,
             publication,
+            sync_id: sync_id.to_owned(),
         })
     }
 }
@@ -305,8 +308,9 @@ mod tests {
         assert_eq!(s.conn.user, "u");
         assert_eq!(s.conn.password.expose(), "p");
         assert_eq!(s.conn.sslmode, SslMode::Disable);
-        assert_eq!(s.slot, "meili_connect_sync_1");
-        assert_eq!(s.publication, "meili_connect_sync_1");
+        // `sync-1` is sanitised, so its name carries the id's hash.
+        assert!(s.slot.starts_with("meili_connect_sync_1_"), "{}", s.slot);
+        assert_eq!(s.publication, s.slot);
         assert!(!s.conn.supabase);
     }
 

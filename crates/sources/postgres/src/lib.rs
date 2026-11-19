@@ -21,6 +21,15 @@
 //!   invalidated, and has not confirmed past `lsn`; otherwise
 //!   `PositionLost`.
 //! - **teardown** drops the slot and the publication.
+//!
+//! Ownership: the publication we create carries the comment
+//! `meili-connect:<sync_id>`; a slot is ours when it is a pgoutput slot of
+//! this database named after the sync id or paired with a publication of
+//! ours. An existing object that is not ours is never altered, reused or
+//! dropped: `check` fails and `open` returns `Config` (the name is taken).
+//!
+//! Postgres 14 or later: `pgwire-replication` always asks pgoutput for
+//! `messages`, which older servers reject at `START_REPLICATION`.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
@@ -107,6 +116,33 @@ mod tests {
             assert!(caps.snapshot && caps.patches);
             assert!(!format!("{src:?}").contains("pw"));
         }
+    }
+
+    /// A project ref that does not resolve: a typo or a deleted project
+    /// before the sync ever ran needs the user, not a silent "paused".
+    #[tokio::test]
+    async fn unknown_supabase_host_is_config_before_the_first_run() {
+        let spec = SourceSpec {
+            kind: SourceKind::Supabase,
+            config: json!({"host": "db.zzzzzzzzzzzzzzzzzzzzqq.supabase.co",
+                           "user": "postgres", "password": "pw"}),
+        };
+        let f = PostgresSourceFactory::new();
+        let mut src = f
+            .build_source("s1", &spec, &[mapping("public.items")])
+            .unwrap();
+        let report = src.check().await.unwrap();
+        assert_eq!(
+            report.items[0].status,
+            meili_connect_core::CheckStatus::Failed,
+            "{report:#?}"
+        );
+        let err = src.open(None).await.unwrap_err();
+        assert!(matches!(err, SourceError::Config(_)), "{err:?}");
+        // A sync that already ran: the same failure is a paused project.
+        let resume = meili_connect_core::Checkpoint(json!({"lsn": "0/16B3748"}));
+        let err = src.open(Some(resume)).await.unwrap_err();
+        assert!(matches!(err, SourceError::Paused(_)), "{err:?}");
     }
 
     #[test]

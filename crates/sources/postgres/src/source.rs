@@ -24,8 +24,22 @@ use crate::pgoutput::{Decoded, Decoder, KeyColumns, Mapped};
 /// Rows per `FETCH` during the snapshot: the most rows held in memory.
 const SNAPSHOT_BATCH: usize = 500;
 const CURSOR: &str = "meili_connect_snapshot";
-/// Oldest supported server: logical replication with pgoutput.
-pub(crate) const MIN_VERSION: i32 = 100_000;
+/// How many times `teardown` tries to free and drop the slot (250 ms apart).
+const TEARDOWN_ATTEMPTS: usize = 20;
+/// Oldest supported server. `pgwire-replication` always asks pgoutput for
+/// `messages 'true'`, an option pgoutput only knows from Postgres 14: an
+/// older server accepts the slot and the snapshot, then refuses every
+/// START_REPLICATION. Refuse it before creating anything.
+pub(crate) const MIN_VERSION: i32 = 140_000;
+
+pub(crate) fn too_old(version: i32) -> String {
+    format!(
+        "Postgres {}.{} is too old: logical replication through this connector needs \
+         Postgres 14 or later",
+        version / 10_000,
+        version % 10_000
+    )
+}
 
 /// One mapped table: canonical identity plus the name the user mapped.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -131,6 +145,11 @@ impl PostgresSource {
         if self.sql.is_none() {
             let sql = conn::connect_sql(&self.settings.conn, &CancellationToken::new()).await?;
             self.version = catalog::server_version(&sql).await?;
+            if self.version >= 140_000 {
+                // Between type lookups the stream's SQL session idles for
+                // as long as the stream runs.
+                sql.simple("SET idle_session_timeout = 0").await?;
+            }
             self.sql = Some(sql);
         }
         Ok(())
@@ -155,6 +174,12 @@ impl PostgresSource {
                 .iter()
                 .find(|f| f.schema == t.schema && f.table == t.table)
                 .ok_or_else(|| SourceError::Config(format!("table {canonical} does not exist")))?;
+            if info.has_inheritance_children {
+                return Err(SourceError::Config(format!(
+                    "table {canonical}: {}",
+                    catalog::INHERITANCE
+                )));
+            }
             let key = info.key().ok_or_else(|| {
                 SourceError::Config(format!(
                     "table {canonical} has no primary key or usable REPLICA IDENTITY: \
@@ -166,11 +191,34 @@ impl PostgresSource {
                 Mapped {
                     name: t.name.clone(),
                     key,
+                    oid: info.oid,
                 },
             );
         }
         self.keys = keys;
         Ok(found)
+    }
+
+    /// What exists under our slot and publication names, and whether each
+    /// is ours. A publication is ours when its comment is our marker. A slot
+    /// is ours when it is a pgoutput slot of this database and either has
+    /// the name derived from the sync id or is paired with a publication of
+    /// ours.
+    pub(crate) async fn ownership(&mut self) -> Result<Ownership, SourceError> {
+        self.connect().await?;
+        let sql = self.db()?;
+        let marker = catalog::marker(&self.settings.sync_id);
+        let publication = catalog::publication_comment(sql, &self.settings.publication)
+            .await?
+            .map(|comment| comment.as_deref() == Some(marker.as_str()));
+        let slot = catalog::slot(sql, &self.settings.slot).await?.map(|slot| {
+            let ours = slot.plugin.as_deref() == Some("pgoutput")
+                && slot.database.as_deref() == Some(self.settings.conn.database.as_str())
+                && (self.settings.slot == ident::default_name(&self.settings.sync_id)
+                    || publication == Some(true));
+            (slot, ours)
+        });
+        Ok(Ownership { publication, slot })
     }
 
     async fn warm_types(&mut self, tables: &[TableInfo]) -> Result<(), SourceError> {
@@ -217,6 +265,14 @@ impl PostgresSource {
                 )));
             }
         }
+        let server = lsn::parse(&catalog::wal_end(sql).await?)?;
+        if resume > server {
+            return Err(SourceError::PositionLost(format!(
+                "the saved checkpoint {resume} is ahead of the server's WAL ({server}): the \
+                 server was restored or failed over to one that is behind, and the changes in \
+                 between are not there to stream"
+            )));
+        }
         match catalog::publication_tables(sql, &publication).await? {
             None => {
                 return Err(SourceError::PositionLost(format!(
@@ -243,15 +299,20 @@ impl PostgresSource {
         self.connect().await?;
         let version = self.version;
         let supabase = self.supabase();
+        let marker = catalog::marker(&self.settings.sync_id);
+        // Never adopt what another sync or another tool owns: check both
+        // names before creating or changing anything.
+        let owned = self.ownership().await?;
+        owned.refuse_foreign(&self.settings)?;
         let sql = self.db()?;
 
         // The publication must exist before the slot's start point, or
         // decoding fails on changes it cannot see the publication for.
-        catalog::ensure_publication(sql, version, &publication, &list).await?;
+        catalog::ensure_publication(sql, &publication, &marker, &list).await?;
 
         // A slot left by an interrupted first sync: its exported snapshot is
         // gone, so start over with a new one.
-        if let Some(existing) = catalog::slot(sql, &slot_name).await? {
+        if let Some((existing, _)) = owned.slot {
             if let Some(pid) = existing.active_pid {
                 return Err(SourceError::Transient(format!(
                     "replication slot {slot_name} is in use by process {pid}"
@@ -301,6 +362,54 @@ impl PostgresSource {
         })
     }
 
+    async fn open_inner(&mut self, resume: Option<Checkpoint>) -> Result<Opened, SourceError> {
+        self.pending = None;
+        self.start = None;
+        if self.targets.is_empty() {
+            return Err(SourceError::Config("no table is mapped".into()));
+        }
+        self.connect().await?;
+        if self.version < MIN_VERSION {
+            return Err(SourceError::Config(too_old(self.version)));
+        }
+        let tables = self.mapped_tables().await?;
+        self.warm_types(&tables).await?;
+        match resume {
+            Some(cp) => self.open_resume(cp).await,
+            None => self.open_fresh().await,
+        }
+    }
+
+    /// A START_REPLICATION failure. The server reports an invalidated slot
+    /// only as "can no longer get changes" (SQLSTATE 55000), the reason
+    /// being in a DETAIL the driver drops: look at the slot to tell it from
+    /// a configuration problem.
+    async fn start_error(&mut self, err: &pgwire_replication::PgWireError) -> SourceError {
+        let mapped = error::from_wire(err, Context::Stream, self.supabase());
+        let pgwire_replication::PgWireError::Server(text) = err else {
+            return mapped;
+        };
+        if !text.ends_with("(SQLSTATE 55000)") {
+            return mapped;
+        }
+        let slot_name = self.settings.slot.clone();
+        let Ok(sql) = self.db() else {
+            return mapped;
+        };
+        match catalog::slot(sql, &slot_name).await {
+            Ok(None) => SourceError::PositionLost(format!(
+                "{text}: replication slot {slot_name} no longer exists"
+            )),
+            Ok(Some(slot)) => match slot.lost_reason() {
+                Some(reason) => SourceError::PositionLost(format!(
+                    "{text}: replication slot {slot_name} cannot stream any more: {reason}"
+                )),
+                None => mapped,
+            },
+            Err(_) => mapped,
+        }
+    }
+
     async fn snapshot_tables(
         &mut self,
         snapshot: &str,
@@ -312,8 +421,14 @@ impl PostgresSource {
             .sql
             .as_ref()
             .ok_or_else(|| SourceError::Fatal("postgres connection unavailable".into()))?;
+        // The transaction sits idle whenever the engine applies
+        // back-pressure, for as long as it takes: no origin-side timeout may
+        // kill it (a killed snapshot restarts from scratch).
         sql.simple(&format!(
-            "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET TRANSACTION SNAPSHOT {}",
+            "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET TRANSACTION SNAPSHOT {};
+             SET LOCAL idle_in_transaction_session_timeout = 0;
+             SET LOCAL statement_timeout = 0;
+             SET LOCAL lock_timeout = 0",
             ident::quote_literal(snapshot)
         ))
         .await?;
@@ -424,6 +539,46 @@ impl PostgresSource {
     }
 }
 
+/// See [`PostgresSource::ownership`]. `None`: nothing by that name.
+pub(crate) struct Ownership {
+    pub(crate) publication: Option<bool>,
+    pub(crate) slot: Option<(catalog::SlotInfo, bool)>,
+}
+
+impl Ownership {
+    /// A Config error naming the first object that exists without being
+    /// ours.
+    pub(crate) fn refuse_foreign(&self, settings: &Settings) -> Result<(), SourceError> {
+        if let Some(message) = self.foreign_publication(settings) {
+            return Err(SourceError::Config(message));
+        }
+        if let Some(message) = self.foreign_slot(settings) {
+            return Err(SourceError::Config(message));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn foreign_publication(&self, settings: &Settings) -> Option<String> {
+        (self.publication == Some(false)).then(|| {
+            format!(
+                "publication {} already exists and was not created by this sync: the name is \
+                 taken, pick another publication_name (it is never changed or dropped)",
+                settings.publication
+            )
+        })
+    }
+
+    pub(crate) fn foreign_slot(&self, settings: &Settings) -> Option<String> {
+        matches!(self.slot, Some((_, false))).then(|| {
+            format!(
+                "replication slot {} already exists and was not created by this sync: the name \
+                 is taken, pick another slot_name (it is never reused or dropped)",
+                settings.slot
+            )
+        })
+    }
+}
+
 /// Send with cancellation; false when cancelled or the engine went away.
 async fn send_plain(events: &EventSender, event: SourceEvent, cancel: &CancellationToken) -> bool {
     tokio::select! {
@@ -469,23 +624,10 @@ impl Source for PostgresSource {
     }
 
     async fn open(&mut self, resume: Option<Checkpoint>) -> Result<Opened, SourceError> {
-        self.pending = None;
-        self.start = None;
-        if self.targets.is_empty() {
-            return Err(SourceError::Config("no table is mapped".into()));
-        }
-        self.connect().await?;
-        if self.version < MIN_VERSION {
-            return Err(SourceError::Config(format!(
-                "Postgres {} is too old: logical replication needs 10 or later",
-                self.version
-            )));
-        }
-        let tables = self.mapped_tables().await?;
-        self.warm_types(&tables).await?;
-        match resume {
-            Some(cp) => self.open_resume(cp).await,
-            None => self.open_fresh().await,
+        if resume.is_some() {
+            self.open_inner(resume).await
+        } else {
+            self.open_inner(None).await.map_err(error::first_contact)
         }
     }
 
@@ -541,9 +683,16 @@ impl Source for PostgresSource {
         );
         let wire =
             |e: pgwire_replication::PgWireError| error::from_wire(&e, Context::Stream, supabase);
-        let mut client = ReplicationClient::connect(cfg).await.map_err(wire)?;
+        let mut client = match ReplicationClient::connect(cfg).await {
+            Ok(client) => client,
+            Err(e) => return Err(self.start_error(&e).await),
+        };
         tokio::select! {
-            r = client.wait_started() => r.map_err(wire)?,
+            r = client.wait_started() => {
+                if let Err(e) = r {
+                    return Err(self.start_error(&e).await);
+                }
+            }
             () = cancel.cancelled() => return Ok(()),
         }
         tracing::info!(slot = %self.settings.slot, %start, "replication started");
@@ -587,6 +736,21 @@ impl Source for PostgresSource {
                                 })?;
                                 catalog::resolve_types(sql, &mut self.types, oids).await?;
                             }
+                            Decoded::Refetch { mut events, row } => {
+                                let sql = self.sql.as_ref().ok_or_else(|| {
+                                    SourceError::Fatal("postgres connection unavailable".into())
+                                })?;
+                                if let Some(doc) =
+                                    catalog::fetch_row(sql, &mut self.types, &row).await?
+                                {
+                                    events.push(SourceEvent::Change(Change {
+                                        collection: row.collection,
+                                        key: row.key,
+                                        op: Op::Upsert { doc },
+                                    }));
+                                }
+                                break events;
+                            }
                         }
                     };
                     for ev in out {
@@ -626,13 +790,32 @@ impl Source for PostgresSource {
         let slot_name = self.settings.slot.clone();
         let publication = self.settings.publication.clone();
         self.connect().await?;
+        let owned = self.ownership().await?;
         let sql = self.db()?;
-        for attempt in 0..20 {
+        let drop_slot = match &owned.slot {
+            Some((_, true)) => true,
+            Some((_, false)) => {
+                tracing::warn!(slot = %slot_name, "replication slot not created by this sync: left alone");
+                false
+            }
+            None => false,
+        };
+        for _ in 0..TEARDOWN_ATTEMPTS {
+            if !drop_slot {
+                break;
+            }
             let Some(slot) = catalog::slot(sql, &slot_name).await? else {
                 break;
             };
             if let Some(pid) = slot.active_pid {
-                // Our own stream that has not noticed yet.
+                // A stream of ours that has not noticed yet: stop it. Never
+                // kill a process we cannot tell is ours.
+                if !catalog::is_own_backend(sql, pid).await? {
+                    return Err(SourceError::Transient(format!(
+                        "replication slot {slot_name} is in use by process {pid}, which is not \
+                         a meili-connect session of this role: stop it, then delete again"
+                    )));
+                }
                 sql.execute("SELECT pg_terminate_backend($1)", &[&pid])
                     .await?;
                 tokio::time::sleep(Duration::from_millis(250)).await;
@@ -642,19 +825,37 @@ impl Source for PostgresSource {
                 .execute("SELECT pg_drop_replication_slot($1)", &[&slot_name])
                 .await
             {
-                Ok(_) => break,
+                Ok(_) => {}
                 // Raced with a reconnect or a concurrent drop: look again.
-                Err(SourceError::Transient(_) | SourceError::Config(_)) if attempt < 19 => {
+                Err(SourceError::Transient(_) | SourceError::Config(_)) => {
                     tokio::time::sleep(Duration::from_millis(250)).await;
                 }
                 Err(e) => return Err(e),
             }
         }
-        sql.simple(&format!(
-            "DROP PUBLICATION IF EXISTS {}",
-            ident::quote_ident(&publication)
-        ))
-        .await?;
+        // Only report success for what is actually gone, and keep the
+        // publication while the slot lives: the slot still decodes with it.
+        if drop_slot && let Some(slot) = catalog::slot(sql, &slot_name).await? {
+            return Err(SourceError::Transient(format!(
+                "replication slot {slot_name} could not be dropped: it is still in use{}",
+                slot.active_pid
+                    .map(|p| format!(" by process {p}"))
+                    .unwrap_or_default()
+            )));
+        }
+        match owned.publication {
+            Some(true) => {
+                sql.simple(&format!(
+                    "DROP PUBLICATION IF EXISTS {}",
+                    ident::quote_ident(&publication)
+                ))
+                .await?;
+            }
+            Some(false) => {
+                tracing::warn!(%publication, "publication not created by this sync: left alone");
+            }
+            None => {}
+        }
         tracing::info!(slot = %slot_name, %publication, "dropped replication slot and publication");
         Ok(())
     }
