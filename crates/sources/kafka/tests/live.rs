@@ -219,6 +219,32 @@ async fn check_reports_brokers_auth_and_topics() {
     assert_eq!(report.items[0].name, "brokers");
 }
 
+/// No topic picked yet: a connection-level check that passes, with one
+/// `topics` item in place of the per-topic checks.
+#[tokio::test]
+async fn check_without_topics_is_a_connection_check() {
+    let Some(b) = brokers() else { return };
+    let mut s = source(&b, &[], json!({}));
+    let report = s.check().await.unwrap();
+    assert!(report.passed(), "{report:?}");
+    let names: Vec<_> = report.items.iter().map(|i| i.name.as_str()).collect();
+    assert_eq!(names, ["brokers", "authentication", "topics"], "{report:?}");
+    let topics = report.items.last().unwrap();
+    assert_eq!(topics.status, CheckStatus::Ok);
+    assert_eq!(
+        topics.message,
+        "no topic selected yet: topic checks run once you pick them"
+    );
+    // An unreachable cluster still fails, without a `topics` item.
+    let mut unreachable = source("127.0.0.1:1", &[], json!({"request_timeout_ms": 1500}));
+    let report = unreachable.check().await.unwrap();
+    assert!(!report.passed());
+    assert!(
+        report.items.iter().all(|i| i.name != "topics"),
+        "{report:?}"
+    );
+}
+
 #[tokio::test]
 async fn discover_lists_topics_but_not_internal_ones() {
     let Some(b) = brokers() else { return };

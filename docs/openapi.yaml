@@ -525,7 +525,11 @@ components:
             properties:
               source: { $ref: "#/components/schemas/SourceSpec" }
               streams:
-                description: Optional mappings; Kafka needs at least one (the topics).
+                description: |
+                  Optional mappings. Without them `check` is a
+                  connection-level pre-flight: the per-collection checks are
+                  one `ok` item (`tables`, `collections` or `topics`), never
+                  a failure.
                 type: array
                 items: { $ref: "#/components/schemas/StreamMapping" }
 

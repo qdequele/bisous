@@ -206,11 +206,28 @@ SOURCE=$(jq -nc --arg url "$ORIGIN_URL" '{kind: "postgres", config: {url: $url}}
 scenario_check_discover() {
   local name="postgres: check and discover"
   local check discover
-  # The checks cover the mapped tables, so pass the streams.
+  # First without streams, like the console's wizard before the tables are
+  # picked: a connection-level check that passes, the table checks one ok item.
+  check=$(api POST /sources/check "$(jq -nc --argjson s "$SOURCE" '{source: $s}')")
+  if [[ "$(tail -n1 <<<"$check")" != 200 ]] || [[ "$(sed '$d' <<<"$check" | jq -r .passed)" != true ]]; then
+    fail "$name" "check without streams: $(sed '$d' <<<"$check")"; return
+  fi
+  if ! sed '$d' <<<"$check" | jq -e '[.items[] | select(.name == "tables")] == [{name: "tables", status: "ok",
+        message: "no table selected yet: table checks run once you pick them"}]
+      and ([.items[] | select(.status == "failed")] | length) == 0' >/dev/null; then
+    fail "$name" "check without streams, items: $(sed '$d' <<<"$check")"; return
+  fi
+  # With the streams, the tables are checked.
   check=$(api POST /sources/check "$(jq -nc --argjson s "$SOURCE" \
     '{source: $s, streams: [{collection: "public.items", index: "items"}]}')")
   if [[ "$(tail -n1 <<<"$check")" != 200 ]] || [[ "$(sed '$d' <<<"$check" | jq -r .passed)" != true ]]; then
     fail "$name" "check: $(sed '$d' <<<"$check")"; return
+  fi
+  check=$(api POST /sources/check "$(jq -nc --argjson s "$SOURCE" \
+    '{source: $s, streams: [{collection: "public.missing", index: "missing"}]}')")
+  if [[ "$(tail -n1 <<<"$check")" != 200 ]] || [[ "$(sed '$d' <<<"$check" | jq -r .passed)" != false ]] \
+      || ! sed '$d' <<<"$check" | jq -e '[.items[] | select(.status == "failed") | .name] == ["table public.missing"]' >/dev/null; then
+    fail "$name" "check of a missing table: $(sed '$d' <<<"$check")"; return
   fi
   discover=$(api_body POST /sources/discover "$(jq -nc --argjson s "$SOURCE" '{source: $s}')")
   if ! jq -e '.collections[] | select(.name == "public.items" and .key == ["id"])' <<<"$discover" >/dev/null; then

@@ -90,11 +90,7 @@ pub fn build_source(
             topics.push(s.collection.clone());
         }
     }
-    if topics.is_empty() {
-        return Err(SourceError::Config(
-            "a kafka sync needs at least one topic mapping".to_owned(),
-        ));
-    }
+    // No topic is fine for `check` and `discover`; `open` refuses it.
     topics.sort();
     Ok(KafkaSource::new(sync_id, config, topics))
 }
@@ -140,7 +136,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_wrong_kind_bad_topics_and_no_mapping() {
+    fn rejects_wrong_kind_and_bad_topics() {
         let ok = json!({"bootstrap_servers": ["b:9092"]});
         let wrong = SourceSpec {
             kind: SourceKind::Postgres,
@@ -151,13 +147,19 @@ mod tests {
             Err(SourceError::Config(_))
         ));
         assert!(matches!(
-            KafkaSourceFactory.build("s", &spec(ok.clone()), &[mapping("public.users x")]),
+            KafkaSourceFactory.build("s", &spec(ok), &[mapping("public.users x")]),
             Err(SourceError::Config(_))
         ));
-        assert!(matches!(
-            KafkaSourceFactory.build("s", &spec(ok), &[]),
-            Err(SourceError::Config(_))
-        ));
+    }
+
+    /// No mapping: `check` and `discover` work (the setup UI tests the
+    /// connection before the topics are picked); `open` refuses it.
+    #[tokio::test]
+    async fn no_mapping_builds_for_check_but_does_not_open() {
+        let mut s = KafkaSourceFactory
+            .build("s", &spec(json!({"bootstrap_servers": ["b:9092"]})), &[])
+            .unwrap();
+        assert!(matches!(s.open(None).await, Err(SourceError::Config(_))));
     }
 
     #[tokio::test]

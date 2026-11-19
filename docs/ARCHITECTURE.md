@@ -123,6 +123,14 @@ the transaction pooler), IPv6, a paused project maps to `SourceError::Paused`,
 an invalidated slot maps to `PositionLost`, and the `supabase_realtime`
 publication is never reused.
 
+`Source::check` built without mappings is a connection-level pre-flight:
+the setup UI tests the connection before the user picks anything. It checks
+what does not depend on the mappings and reports the per-collection checks
+as one `Ok` item (`CheckReport::push_none_selected`: `tables`,
+`collections` or `topics`), never `Failed` or `Warning` for their absence.
+A sync still needs at least one mapping (`SyncSpec::validate`), and `open`
+refuses none.
+
 ## Meilisearch writes (`sink`)
 
 - `Replace` → `POST /indexes/{uid}/documents`, `Merge` → `PUT`, `Delete` →

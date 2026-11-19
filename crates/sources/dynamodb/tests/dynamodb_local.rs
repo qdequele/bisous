@@ -320,6 +320,24 @@ async fn check_reports_prerequisites() {
     assert!(matches!(src.open(None).await, Err(SourceError::Config(_))));
 }
 
+/// No table picked yet: the report passes with one `Ok` `tables` item.
+#[tokio::test]
+async fn check_without_tables_is_a_connection_check() {
+    let Some(ep) = endpoint() else { return };
+    let mut src = source(&ep, &[]);
+    let report = src.check().await.unwrap();
+    assert!(report.passed(), "{report:?}");
+    let tables = report.items.iter().find(|i| i.name == "tables").unwrap();
+    assert_eq!(tables.status, CheckStatus::Ok);
+    assert!(
+        report
+            .items
+            .iter()
+            .all(|i| !i.name.contains(':') && i.status != CheckStatus::Failed),
+        "{report:?}"
+    );
+}
+
 #[tokio::test]
 async fn discover_lists_keys_and_counts() {
     let Some(ep) = endpoint() else { return };

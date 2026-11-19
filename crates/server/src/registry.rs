@@ -96,6 +96,11 @@ mod tests {
             let spec = SourceSpec { kind, config };
             let built = SourceRegistry.build("s1", &spec, &[mapping(collection)]);
             assert!(built.is_ok(), "{kind:?}: {:?}", built.err());
+            // `/sources/check` and `/sources/discover` build without
+            // streams (the setup UI tests the connection before the
+            // collections are picked).
+            let probe = SourceRegistry.build("s1", &spec, &[]);
+            assert!(probe.is_ok(), "{kind:?} without streams: {:?}", probe.err());
         }
     }
 

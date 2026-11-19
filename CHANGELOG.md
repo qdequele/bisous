@@ -101,6 +101,14 @@ All notable changes to meili-connect are listed here. The format follows
 
 ### Fixed
 
+- `POST /sources/check` without `streams` is a connection-level pre-flight,
+  as the Lab console's wizard sends it before the tables are picked: it no
+  longer fails a healthy origin with `tables: no table is mapped`. Every
+  connector reports the per-collection checks as one `ok` item (`tables`,
+  `collections` or `topics`: "no table selected yet: table checks run once
+  you pick them"); MongoDB and DynamoDB no longer warn either. Kafka accepts
+  a check or a discovery without topics (it answered `422 source_config`).
+  With streams nothing changes, and a sync still needs at least one.
 - Every change to a sync (create, update, delete, pause, resume, resync,
   release) runs under the sync's lock on the row read inside it: a `PUT`
   racing a `DELETE` no longer restarts a deleted sync, and a `resume` racing a

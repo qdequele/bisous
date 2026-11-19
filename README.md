@@ -91,7 +91,12 @@ curl -s $API/sources/discover -H "$AUTH" -H 'Content-Type: application/json' -d 
 }' | jq '.collections[] | {name, key, estimated_rows}'
 ```
 
-Both are bounded by `SOURCE_PROBE_TIMEOUT_SECS` (`504 source_timeout`).
+Without `streams`, the check tests the connection and the server settings
+only, before any table is picked: the table checks are one `ok` item
+(`{"name": "tables", "status": "ok", "message": "no table selected yet: table
+checks run once you pick them"}`; `collections` for MongoDB, `topics` for
+Kafka). Both are bounded by `SOURCE_PROBE_TIMEOUT_SECS` (`504
+source_timeout`).
 
 ### Create, read, list
 

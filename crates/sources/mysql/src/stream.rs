@@ -150,6 +150,9 @@ pub(crate) async fn check(src: &mut MysqlSource) -> Result<CheckReport, SourceEr
         );
     }
 
+    if src.tables.is_empty() {
+        report.push_none_selected("tables", "table");
+    }
     for (db, table) in src.tables.clone() {
         let name = format!("{db}.{table}");
         match load_table(&mut conn, &db, &table).await? {

@@ -134,6 +134,18 @@ impl CheckReport {
     pub fn passed(&self) -> bool {
         self.items.iter().all(|i| i.status != CheckStatus::Failed)
     }
+
+    /// The one item a check run without mappings reports in place of its
+    /// per-collection checks: `Ok`, since nothing is wrong yet (the setup
+    /// UI tests the connection before the user picks anything). `name` is
+    /// the item (`tables`), `noun` what is picked (`table`).
+    pub fn push_none_selected(&mut self, name: &str, noun: &str) {
+        self.push(
+            name,
+            CheckStatus::Ok,
+            format!("no {noun} selected yet: {noun} checks run once you pick them"),
+        );
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -191,6 +203,12 @@ pub trait Source: Send {
 
     /// Pre-flight validation for the setup UI. Must not create or change
     /// anything on the origin.
+    ///
+    /// Built without mappings, it is a connection-level pre-flight (the
+    /// setup UI tests the connection before the user picks the
+    /// collections): it checks what does not depend on them and reports the
+    /// per-collection checks as one [`CheckReport::push_none_selected`]
+    /// item, never `Failed` or `Warning` for the absence of mappings.
     async fn check(&mut self) -> Result<CheckReport, SourceError>;
 
     /// List what can be synced. Must not create or change anything.
@@ -255,5 +273,26 @@ pub trait SourceFactory: Send + Sync {
             "the {} connector does not declare the hosts it connects to",
             spec.kind.as_str()
         )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nothing_selected_is_one_ok_item() {
+        let mut report = CheckReport::default();
+        report.push("connection", CheckStatus::Ok, "connected");
+        report.push_none_selected("tables", "table");
+        assert!(report.passed());
+        assert_eq!(
+            report.items[1],
+            CheckItem {
+                name: "tables".into(),
+                status: CheckStatus::Ok,
+                message: "no table selected yet: table checks run once you pick them".into(),
+            }
+        );
     }
 }

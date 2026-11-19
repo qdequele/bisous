@@ -120,7 +120,20 @@ impl Source for FakeSource {
         }
         let mut r = CheckReport::default();
         r.push("connect", CheckStatus::Ok, "connected");
-        r.push("wal_level", CheckStatus::Failed, "set wal_level to logical");
+        if self.config.get("healthy").is_none() {
+            r.push("wal_level", CheckStatus::Failed, "set wal_level to logical");
+            return Ok(r);
+        }
+        // Like the connectors: no mapping is a connection-level check.
+        match self.collection.as_str() {
+            "" => r.push_none_selected("tables", "table"),
+            "public.missing" => r.push(
+                "table public.missing",
+                CheckStatus::Failed,
+                "does not exist (or is not visible)",
+            ),
+            other => r.push(&format!("table {other}"), CheckStatus::Ok, "key (id)"),
+        }
         Ok(r)
     }
 
@@ -943,6 +956,50 @@ async fn check_and_discover_store_nothing_and_time_out() {
         (status, body["code"].as_str()),
         (StatusCode::UNPROCESSABLE_ENTITY, Some("source_config"))
     );
+}
+
+/// The setup UI tests the connection before the tables are picked: a check
+/// without streams passes on a healthy origin; with streams the tables are
+/// checked; a sync without streams is still refused.
+#[tokio::test]
+async fn a_check_without_streams_is_a_connection_check() {
+    let a = app(AuthConfig::open());
+    let source = json!({"kind": "postgres", "config": {"healthy": true}});
+    let (status, body) = call(
+        &a.router,
+        "POST",
+        "/sources/check",
+        &[],
+        Some(json!({ "source": source })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["passed"], true, "{body}");
+    assert_eq!(
+        body["items"][1],
+        json!({"name": "tables", "status": "ok",
+               "message": "no table selected yet: table checks run once you pick them"})
+    );
+    for (collection, passed) in [("public.items", true), ("public.missing", false)] {
+        let (status, body) = call(
+            &a.router,
+            "POST",
+            "/sources/check",
+            &[],
+            Some(json!({"source": source,
+                        "streams": [{"collection": collection, "index": "items"}]})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["passed"], passed, "{collection}: {body}");
+        assert_eq!(body["items"][1]["name"], format!("table {collection}"));
+    }
+    let mut no_streams = sync_body("no-streams");
+    no_streams["source"] = source;
+    no_streams["streams"] = json!([]);
+    let (status, body) = call(&a.router, "POST", "/syncs", &[], Some(no_streams)).await;
+    assert!(status.is_client_error(), "{status}: {body}");
+    assert_eq!(a.store.list_syncs(None).await.unwrap().len(), 0);
 }
 
 // ------------------------------------------------------------- host policy

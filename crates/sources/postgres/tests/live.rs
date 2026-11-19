@@ -321,6 +321,54 @@ async fn check_and_discover() {
     assert_eq!(slots, 0);
 }
 
+/// No table picked yet (the setup UI tests the connection first): every
+/// server-level check runs, the table checks are one `Ok` item, and the
+/// report passes. Nothing is created.
+#[tokio::test]
+async fn check_without_tables_is_a_connection_check() {
+    let Some(url) = url() else { return };
+    let sync_id = unique("chk");
+    let mut src = source(&url, &sync_id, &[]);
+    let report = src.check().await.unwrap();
+    assert!(report.passed(), "{report:#?}");
+    let names: Vec<_> = report.items.iter().map(|i| i.name.as_str()).collect();
+    for name in [
+        "connection",
+        "server_version",
+        "wal_level",
+        "replication_privilege",
+        "replication_slots",
+        "wal_senders",
+        "max_slot_wal_keep_size",
+        "publication",
+    ] {
+        assert!(names.contains(&name), "{name}: {report:#?}");
+    }
+    let tables = report.items.last().unwrap();
+    assert_eq!(tables.name, "tables");
+    assert_eq!(tables.status, CheckStatus::Ok);
+    assert_eq!(
+        tables.message,
+        "no table selected yet: table checks run once you pick them"
+    );
+    assert!(
+        report.items.iter().all(|i| i.status != CheckStatus::Failed),
+        "{report:#?}"
+    );
+    // A sync still needs a table.
+    assert!(matches!(src.open(None).await, Err(SourceError::Config(_))));
+    let db = admin(&url).await;
+    let slots: i64 = db
+        .query_one(
+            "SELECT count(*) FROM pg_replication_slots WHERE slot_name LIKE $1",
+            &[&format!("%{sync_id}%")],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(slots, 0);
+}
+
 #[tokio::test]
 async fn gapless_first_sync_under_concurrent_writes_then_resume() {
     let Some(url) = url() else { return };
