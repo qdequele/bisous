@@ -98,6 +98,7 @@ impl Model {
                 self.truncates.push(collection);
             }
             SourceEvent::SchemaChanged { collection } => self.schema_changes.push(collection),
+            SourceEvent::Skipped { .. } => panic!("postgres never skips: {ev:?}"),
         }
     }
 
