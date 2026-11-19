@@ -373,6 +373,18 @@ fn stream_arn(table: &str, desc: &TableDescription) -> Result<String, SourceErro
     })
 }
 
+/// A snapshot stopped before reading everything: `Ok(())` when the engine
+/// cancelled it or went away (it checks the token itself and never treats
+/// the snapshot as complete), an error for any other reason.
+fn interrupted(events: &EventSender, cancel: &CancellationToken) -> Result<(), SourceError> {
+    if cancel.is_cancelled() || events.is_closed() {
+        return Ok(());
+    }
+    Err(SourceError::Transient(
+        "snapshot stopped before reading every item".into(),
+    ))
+}
+
 fn scalar_type(t: &ScalarAttributeType) -> String {
     t.as_str().to_owned()
 }
@@ -568,13 +580,7 @@ impl Source for DynamoSource {
             let complete =
                 scan_table(&clients.dynamo, &table, &self.config.scan, &events, &cancel).await?;
             if !complete {
-                if events.is_closed() {
-                    return Ok(());
-                }
-                // Never report an interrupted snapshot as complete.
-                return Err(SourceError::Transient(
-                    "snapshot cancelled before completion".into(),
-                ));
+                return interrupted(&events, &cancel);
             }
         }
         Ok(())
@@ -699,6 +705,52 @@ mod tests {
             f.build("s1", &spec, &[mapping(" ")]),
             Err(SourceError::Config(_))
         ));
+    }
+
+    fn opened_source() -> DynamoSource {
+        let config = DynamoConfig::from_value(&json!({
+            "region": "us-east-1",
+            "endpoint_url": "http://127.0.0.1:9",
+            "credentials": {"type": "static", "access_key_id": "x", "secret_access_key": "y"}
+        }))
+        .unwrap();
+        let mut s = DynamoSource::new("s", config, vec!["t".into()]);
+        s.opened = Some(BTreeMap::from([(
+            "t".to_owned(),
+            TableState {
+                info: Arc::new(TableInfo {
+                    name: "t".into(),
+                    key_names: vec!["pk".into()],
+                }),
+                stream_arn: "arn:s".into(),
+                lineage: Lineage::default(),
+            },
+        )]));
+        s
+    }
+
+    #[tokio::test]
+    async fn snapshot_returns_ok_when_cancelled() {
+        let mut s = opened_source();
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let r = s.snapshot(tx, cancel).await;
+        assert!(r.is_ok(), "{r:?}");
+    }
+
+    #[test]
+    fn an_incomplete_snapshot_is_an_error_unless_cancelled_or_closed() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<meili_connect_core::SourceEvent>(1);
+        let cancel = CancellationToken::new();
+        assert!(matches!(
+            interrupted(&tx, &cancel),
+            Err(SourceError::Transient(_))
+        ));
+        cancel.cancel();
+        assert!(interrupted(&tx, &cancel).is_ok());
+        drop(rx);
+        assert!(interrupted(&tx, &CancellationToken::new()).is_ok());
     }
 
     #[tokio::test]
