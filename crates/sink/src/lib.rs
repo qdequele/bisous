@@ -76,6 +76,12 @@ impl Default for SinkOptions {
 }
 
 /// The Meilisearch [`Sink`].
+///
+/// Cancellation: every method may be dropped at any await point. The sink
+/// holds no mutable state (only the HTTP client and its options), so a
+/// dropped call leaves nothing behind but tasks already enqueued on
+/// Meilisearch, which a replay rewrites idempotently. A gzip running on the
+/// blocking pool finishes and is discarded.
 pub struct MeiliSink {
     client: Client,
 }

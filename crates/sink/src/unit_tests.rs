@@ -683,6 +683,50 @@ fn jitter_stays_in_range() {
 }
 
 #[tokio::test]
+async fn dropping_calls_at_any_point_leaves_the_sink_usable() {
+    let server = MockServer::start().await;
+    let fake = Fake::default();
+    fake.mount(&server).await;
+    mount_embedders(&server, json!({})).await;
+    let s = sink(
+        &server,
+        SinkOptions {
+            gzip: true,
+            suspect_backoff: Duration::from_millis(5),
+            ..opts()
+        },
+    );
+    // Big enough to gzip on the blocking pool, with a document that needs
+    // bisection and resends: the drops land in every await point.
+    let batch = || -> Vec<DocOp> {
+        let mut ops: Vec<DocOp> = (0..20)
+            .map(|i| replace(&i.to_string(), json!({"t": "x".repeat(8 * 1024)})))
+            .collect();
+        ops.push(replace("flaky", json!({"flaky": 6})));
+        ops.push(delete("3"));
+        ops
+    };
+    for micros in [0, 50, 200, 500, 1_000, 2_000, 5_000, 10_000] {
+        let _ =
+            tokio::time::timeout(Duration::from_micros(micros), s.apply(&target(), batch())).await;
+    }
+    // A call that never finishes (task stuck processing) is dropped too.
+    fake.0.lock().unwrap().processing_polls = usize::MAX;
+    let dropped =
+        tokio::time::timeout(Duration::from_millis(30), s.apply(&target(), batch())).await;
+    assert!(dropped.is_err());
+    {
+        let mut st = fake.0.lock().unwrap();
+        st.processing_polls = 0;
+        st.attempts.clear();
+    }
+    let report = s.apply(&target(), batch()).await.unwrap();
+    assert_eq!(report.written, 21);
+    assert_eq!(report.deleted, 1);
+    assert!(report.rejected.is_empty());
+}
+
+#[tokio::test]
 async fn polls_until_terminal() {
     let server = MockServer::start().await;
     let fake = Fake::default();
