@@ -5,7 +5,7 @@
 #   scripts/e2e.sh            # Postgres scenarios, then MongoDB
 #   E2E_SKIP_MONGO=1 scripts/e2e.sh
 #
-# Needs: docker, curl, jq, cargo. Starts containers named `mc-e2e-<pid>-*`
+# Needs: docker, curl, jq, python3, cargo. Starts containers named `mc-e2e-<pid>-*`
 # on random host ports and removes them (and the server) on exit, whatever
 # happens. Each scenario reports PASS or FAIL; the script goes on after a
 # failure where it can and exits non-zero if any scenario failed.
@@ -44,7 +44,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-for bin in docker curl jq cargo; do
+for bin in docker curl jq cargo python3; do
   command -v "$bin" >/dev/null || { echo "missing: $bin" >&2; exit 2; }
 done
 
@@ -373,6 +373,20 @@ scenario_mongo() {
 if [[ -z "${E2E_SKIP_MONGO:-}" ]]; then
   scenario_mongo
 fi
+
+scenario_sigterm() {
+  local name="SIGTERM stops the server gracefully"
+  kill -TERM "$SERVER_PID"
+  local deadline=$((SECONDS + 40))
+  while (( SECONDS < deadline )) && kill -0 "$SERVER_PID" 2>/dev/null; do sleep 0.5; done
+  if kill -0 "$SERVER_PID" 2>/dev/null; then fail "$name" "still running 40 s after SIGTERM"; return; fi
+  wait "$SERVER_PID"; local rc=$?
+  SERVER_PID=""
+  [[ "$rc" == 0 ]] || { fail "$name" "exit code $rc"; return; }
+  tail -n 3 "$WORK/server.log" | grep -q "stopped" || { fail "$name" "no clean stop in the log"; return; }
+  pass "$name"
+}
+scenario_sigterm
 
 # ------------------------------------------------------------------ report
 

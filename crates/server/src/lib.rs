@@ -137,7 +137,10 @@ pub async fn boot_syncs(state: &AppState) -> Result<usize, meili_connect_store::
 fn init_tracing(config: &Config) {
     let filter = tracing_subscriber::EnvFilter::try_new(&config.log_filter)
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    let builder = tracing_subscriber::fmt().with_env_filter(filter);
+    let ansi = std::io::IsTerminal::is_terminal(&std::io::stdout());
+    let builder = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_ansi(ansi);
     match config.log_format {
         LogFormat::Json => builder.json().init(),
         LogFormat::Pretty => builder.init(),
