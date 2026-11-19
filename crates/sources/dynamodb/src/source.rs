@@ -11,7 +11,7 @@ use aws_sdk_dynamodbstreams::types::ShardIteratorType;
 use futures::StreamExt;
 use meili_connect_core::{
     AckReceiver, Capabilities, CheckReport, CheckStatus, CollectionInfo, EventSender, FieldInfo,
-    Opened, Source, SourceError, SourceFactory, SourceKind, SourceSpec, StreamMapping,
+    LagReporter, Opened, Source, SourceError, SourceFactory, SourceKind, SourceSpec, StreamMapping,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -48,7 +48,43 @@ pub struct TableState {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DynamoSourceFactory;
 
+#[async_trait::async_trait]
 impl SourceFactory for DynamoSourceFactory {
+    /// The custom `endpoint_url` (DynamoDB Local, LocalStack) when set.
+    /// Without it the SDK only talks to AWS's own regional endpoints, built
+    /// from `region`, which must then look like an AWS region.
+    async fn endpoints(
+        &self,
+        spec: &SourceSpec,
+    ) -> Result<Vec<meili_connect_core::Endpoint>, SourceError> {
+        if spec.kind != SourceKind::Dynamodb {
+            return Err(SourceError::Config(format!(
+                "the dynamodb connector cannot read a `{}` config",
+                spec.kind.as_str()
+            )));
+        }
+        let config = DynamoConfig::from_value(&spec.config)?;
+        match &config.endpoint_url {
+            Some(url) => Ok(vec![endpoint_of_url(url)?]),
+            None => {
+                let region = config.region.trim();
+                let valid = region.len() <= 64
+                    && region
+                        .bytes()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+                    && !region.starts_with('-')
+                    && !region.ends_with('-');
+                if valid {
+                    Ok(Vec::new())
+                } else {
+                    Err(SourceError::Config(
+                        "`region` must be an AWS region name such as eu-west-1".into(),
+                    ))
+                }
+            }
+        }
+    }
+
     fn build(
         &self,
         sync_id: &str,
@@ -88,6 +124,7 @@ pub struct DynamoSource {
     tables: Vec<String>,
     clients: Option<Clients>,
     opened: Option<BTreeMap<String, TableState>>,
+    lag: Option<LagReporter>,
 }
 
 impl std::fmt::Debug for DynamoSource {
@@ -108,6 +145,7 @@ impl DynamoSource {
             tables,
             clients: None,
             opened: None,
+            lag: None,
         }
     }
 
@@ -373,6 +411,18 @@ fn stream_arn(table: &str, desc: &TableDescription) -> Result<String, SourceErro
     })
 }
 
+/// A snapshot stopped before reading everything: `Ok(())` when the engine
+/// cancelled it or went away (it checks the token itself and never treats
+/// the snapshot as complete), an error for any other reason.
+fn interrupted(events: &EventSender, cancel: &CancellationToken) -> Result<(), SourceError> {
+    if cancel.is_cancelled() || events.is_closed() {
+        return Ok(());
+    }
+    Err(SourceError::Transient(
+        "snapshot stopped before reading every item".into(),
+    ))
+}
+
 fn scalar_type(t: &ScalarAttributeType) -> String {
     t.as_str().to_owned()
 }
@@ -568,13 +618,7 @@ impl Source for DynamoSource {
             let complete =
                 scan_table(&clients.dynamo, &table, &self.config.scan, &events, &cancel).await?;
             if !complete {
-                if events.is_closed() {
-                    return Ok(());
-                }
-                // Never report an interrupted snapshot as complete.
-                return Err(SourceError::Transient(
-                    "snapshot cancelled before completion".into(),
-                ));
+                return interrupted(&events, &cancel);
             }
         }
         Ok(())
@@ -591,7 +635,19 @@ impl Source for DynamoSource {
         let Some(opened) = self.opened.as_mut() else {
             return Err(SourceError::Fatal("stream called before open".into()));
         };
-        stream::run(clients.streams, &opts, opened, events, cancel).await
+        stream::run(
+            clients.streams,
+            &opts,
+            opened,
+            events,
+            self.lag.clone(),
+            cancel,
+        )
+        .await
+    }
+
+    fn report_lag(&mut self, reporter: LagReporter) {
+        self.lag = Some(reporter);
     }
 
     async fn teardown(&mut self) -> Result<(), SourceError> {
@@ -600,12 +656,73 @@ impl Source for DynamoSource {
     }
 }
 
+/// `scheme://[user@]host[:port][/path]` → the host and port (80/443 by
+/// default).
+fn endpoint_of_url(url: &str) -> Result<meili_connect_core::Endpoint, SourceError> {
+    let bad = || SourceError::Config("`endpoint_url` must be http(s)://host[:port]".into());
+    let (scheme, rest) = url.trim().split_once("://").ok_or_else(bad)?;
+    let default_port = match scheme.to_ascii_lowercase().as_str() {
+        "http" => 80,
+        "https" => 443,
+        _ => return Err(bad()),
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let host_port = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    meili_connect_core::Endpoint::parse(host_port, default_port).ok_or_else(bad)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use aws_sdk_dynamodb::types::{KeySchemaElement, StreamSpecification};
+    use meili_connect_core::Endpoint;
     use serde_json::json;
+
+    async fn endpoints_of(config: serde_json::Value) -> Result<Vec<Endpoint>, SourceError> {
+        DynamoSourceFactory
+            .endpoints(&SourceSpec {
+                kind: SourceKind::Dynamodb,
+                config,
+            })
+            .await
+    }
+
+    #[tokio::test]
+    async fn endpoints_are_the_custom_endpoint_or_nothing() {
+        assert_eq!(
+            endpoints_of(json!({"region": "eu-west-1"})).await.unwrap(),
+            vec![]
+        );
+        assert_eq!(
+            endpoints_of(json!({"region": "x", "endpoint_url": "http://Localhost:8000/"}))
+                .await
+                .unwrap(),
+            vec![Endpoint::new("localhost", 8000)]
+        );
+        assert_eq!(
+            endpoints_of(json!({"region": "x", "endpoint_url": "https://u@169.254.169.254"}))
+                .await
+                .unwrap(),
+            vec![Endpoint::new("169.254.169.254", 443)]
+        );
+        assert_eq!(
+            endpoints_of(json!({"region": "x", "endpoint_url": "http://[fd00::1]:9/p"}))
+                .await
+                .unwrap(),
+            vec![Endpoint::new("fd00::1", 9)]
+        );
+        // The region becomes part of AWS host names.
+        for region in ["evil.com#", "a/b", "-x", "EU-WEST-1"] {
+            assert!(
+                matches!(
+                    endpoints_of(json!({"region": region})).await,
+                    Err(SourceError::Config(_))
+                ),
+                "{region}"
+            );
+        }
+    }
 
     fn table(view: Option<StreamViewType>, enabled: bool) -> TableDescription {
         let mut spec = StreamSpecification::builder().stream_enabled(enabled);
@@ -699,6 +816,52 @@ mod tests {
             f.build("s1", &spec, &[mapping(" ")]),
             Err(SourceError::Config(_))
         ));
+    }
+
+    fn opened_source() -> DynamoSource {
+        let config = DynamoConfig::from_value(&json!({
+            "region": "us-east-1",
+            "endpoint_url": "http://127.0.0.1:9",
+            "credentials": {"type": "static", "access_key_id": "x", "secret_access_key": "y"}
+        }))
+        .unwrap();
+        let mut s = DynamoSource::new("s", config, vec!["t".into()]);
+        s.opened = Some(BTreeMap::from([(
+            "t".to_owned(),
+            TableState {
+                info: Arc::new(TableInfo {
+                    name: "t".into(),
+                    key_names: vec!["pk".into()],
+                }),
+                stream_arn: "arn:s".into(),
+                lineage: Lineage::default(),
+            },
+        )]));
+        s
+    }
+
+    #[tokio::test]
+    async fn snapshot_returns_ok_when_cancelled() {
+        let mut s = opened_source();
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let r = s.snapshot(tx, cancel).await;
+        assert!(r.is_ok(), "{r:?}");
+    }
+
+    #[test]
+    fn an_incomplete_snapshot_is_an_error_unless_cancelled_or_closed() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<meili_connect_core::SourceEvent>(1);
+        let cancel = CancellationToken::new();
+        assert!(matches!(
+            interrupted(&tx, &cancel),
+            Err(SourceError::Transient(_))
+        ));
+        cancel.cancel();
+        assert!(interrupted(&tx, &cancel).is_ok());
+        drop(rx);
+        assert!(interrupted(&tx, &CancellationToken::new()).is_ok());
     }
 
     #[tokio::test]

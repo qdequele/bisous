@@ -5,18 +5,20 @@
 
 mod client;
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use meili_connect_core::{
-    ApplyReport, DocOp, Document, IndexTarget, MeiliDestination, RejectedDoc, Sink, SinkError,
+    ApplyReport, DocOp, Document, HostPolicy, IndexTarget, MeiliDestination, RejectedDoc, Sink,
+    SinkError,
 };
 use reqwest::{Method, StatusCode};
 use serde::Deserialize;
 use serde::ser::{Serialize, SerializeMap, Serializer};
 use serde_json::json;
 
-use client::{Client, DocFailure, Payload, TaskStatus, classify_doc_failure, map_api_error};
+use client::{Client, DocFailure, Payload, Retry, TaskStatus, classify_doc_failure, map_api_error};
 
 /// Meilisearch's default `http_payload_size_limit` is 100 MiB; stay under.
 pub const DEFAULT_MAX_PAYLOAD_BYTES: usize = 90 * 1024 * 1024;
@@ -39,6 +41,28 @@ pub struct SinkOptions {
     pub connect_timeout: Duration,
     /// Send document payloads with `Content-Encoding: gzip`.
     pub gzip: bool,
+    /// How many more times a single document is sent after a failure that
+    /// may be transient (`internal`, `vector_embedding_error`) before the
+    /// whole `apply` fails with `SinkError::Transient`.
+    pub suspect_retries: u32,
+    /// First delay before resending such a document; doubled each time,
+    /// jittered.
+    pub suspect_backoff: Duration,
+    /// How many more times one HTTP request is sent after a 408, 429, 5xx
+    /// or transport error before the call fails with `Transient`. Document
+    /// writes are idempotent by id, so resending them is safe.
+    pub request_retries: u32,
+    /// First delay between two attempts; doubled each time, jittered.
+    pub request_backoff: Duration,
+    /// Cap of one delay, `Retry-After` included.
+    pub max_request_backoff: Duration,
+    /// Which addresses the sink may connect to. Unless it is `any`, the
+    /// HTTP client resolves names through the policy and connects only to
+    /// the vetted addresses (no second lookup a DNS rebinding could
+    /// change), never through a proxy; a literal IP in the URL is vetted
+    /// when the sink is built. Redirects are never followed, whatever the
+    /// policy. Default: `any` (tests, trusted standalone use).
+    pub host_policy: Arc<HostPolicy>,
 }
 
 impl Default for SinkOptions {
@@ -51,11 +75,23 @@ impl Default for SinkOptions {
             request_timeout: Duration::from_secs(120),
             connect_timeout: Duration::from_secs(10),
             gzip: true,
+            suspect_retries: 3,
+            suspect_backoff: Duration::from_secs(1),
+            request_retries: 5,
+            request_backoff: Duration::from_millis(200),
+            max_request_backoff: Duration::from_secs(30),
+            host_policy: Arc::new(HostPolicy::any()),
         }
     }
 }
 
 /// The Meilisearch [`Sink`].
+///
+/// Cancellation: every method may be dropped at any await point. The sink
+/// holds no mutable state (only the HTTP client and its options), so a
+/// dropped call leaves nothing behind but tasks already enqueued on
+/// Meilisearch, which a replay rewrites idempotently. A gzip running on the
+/// blocking pool finishes and is discarded.
 pub struct MeiliSink {
     client: Client,
 }
@@ -178,11 +214,76 @@ impl Chunk {
     }
 }
 
-/// Rejections and successes of one run, before the suspect check.
+/// Successes and deterministic rejections (index into the run, reason) of
+/// one run.
 #[derive(Default)]
 struct RunTally {
     ok: u64,
-    rejected: Vec<(usize, String, bool)>,
+    /// Wire bytes of the accepted lines, one separator each.
+    ok_bytes: u64,
+    rejected: Vec<(usize, String)>,
+}
+
+/// Wire bytes of some lines, one separator (newline or comma) each.
+fn wire_bytes(lines: &[Vec<u8>]) -> u64 {
+    lines.iter().map(|l| l.len() as u64 + 1).sum()
+}
+
+/// Deepest JSON nesting Meilisearch accepts in a document, the top-level
+/// object counting as one (serde_json's recursion limit is 128).
+const MAX_DOC_DEPTH: usize = 127;
+
+fn json_depth(v: &serde_json::Value) -> usize {
+    match v {
+        serde_json::Value::Array(a) => 1 + a.iter().map(json_depth).max().unwrap_or(0),
+        serde_json::Value::Object(o) => 1 + o.values().map(json_depth).max().unwrap_or(0),
+        _ => 0,
+    }
+}
+
+/// Why Meilisearch will always refuse this document although it reports
+/// the failure as `internal` (no stable error code). Checked on the
+/// document itself, never on the error message.
+fn shape_problem(op: &DocOp) -> Option<String> {
+    let doc = match op {
+        DocOp::Replace { doc, .. } | DocOp::Merge { doc, .. } => doc,
+        DocOp::Delete { .. } => return None,
+    };
+    match doc.get("_vectors") {
+        None | Some(serde_json::Value::Null | serde_json::Value::Object(_)) => {}
+        Some(_) => return Some("`_vectors` must be an object".into()),
+    }
+    let depth = 1 + doc.values().map(json_depth).max().unwrap_or(0);
+    (depth > MAX_DOC_DEPTH).then(|| {
+        format!("document nests {depth} levels deep, over Meilisearch's limit of {MAX_DOC_DEPTH}")
+    })
+}
+
+/// The first embedder of `settings` that holds an `apiKey`, at any depth
+/// (composite embedders nest theirs). `GET /settings` always redacts API
+/// keys (`"sk-XXXXX..."`), so any key found there cannot be copied.
+fn embedder_with_api_key(settings: &serde_json::Value) -> Option<&str> {
+    fn has_key(v: &serde_json::Value) -> bool {
+        match v {
+            serde_json::Value::Object(o) => o
+                .iter()
+                .any(|(k, v)| (k == "apiKey" && !v.is_null()) || has_key(v)),
+            serde_json::Value::Array(a) => a.iter().any(has_key),
+            _ => false,
+        }
+    }
+    settings
+        .get("embedders")?
+        .as_object()?
+        .iter()
+        .find(|(_, e)| has_key(e))
+        .map(|(name, _)| name.as_str())
+}
+
+/// What became of a document isolated with a possibly transient failure.
+enum Settled {
+    Written,
+    Rejected(String),
 }
 
 impl MeiliSink {
@@ -225,39 +326,27 @@ impl MeiliSink {
                         line.len(),
                         self.client.opts.max_payload_bytes
                     ),
-                    false,
                 ));
                 continue;
             }
             if chunk.bytes + cost > limit {
                 let full = std::mem::replace(&mut chunk, Chunk::new());
-                self.write_bisect(target, kind, full, &mut tally).await?;
+                self.write_bisect(target, kind, run, full, &mut tally)
+                    .await?;
             }
             chunk.idx.push(i);
             chunk.lines.push(line);
             chunk.bytes += cost;
         }
         if !chunk.lines.is_empty() {
-            self.write_bisect(target, kind, chunk, &mut tally).await?;
-        }
-
-        if tally.ok == 0
-            && !tally.rejected.is_empty()
-            && tally.rejected.iter().all(|(_, _, suspect)| *suspect)
-        {
-            let reason = tally
-                .rejected
-                .first()
-                .map(|(_, r, _)| r.clone())
-                .unwrap_or_default();
-            return Err(SinkError::Transient(format!(
-                "every document of the batch failed with a possibly transient error: {reason}"
-            )));
+            self.write_bisect(target, kind, run, chunk, &mut tally)
+                .await?;
         }
         match kind {
             Kind::Delete => report.deleted += tally.ok,
             _ => report.written += tally.ok,
         }
+        report.bytes += tally.ok_bytes;
         if !tally.rejected.is_empty() {
             tracing::warn!(
                 index = %target.uid,
@@ -265,7 +354,7 @@ impl MeiliSink {
                 "Meilisearch rejected documents"
             );
         }
-        for (i, reason, _) in tally.rejected {
+        for (i, reason) in tally.rejected {
             if let Some(op) = run.get(i) {
                 report.rejected.push(RejectedDoc {
                     op: op.clone(),
@@ -277,21 +366,42 @@ impl MeiliSink {
     }
 
     /// Writes a chunk; on refusal, halves it until each refused document is
-    /// isolated. Left halves go first so the run keeps its order.
+    /// isolated. Left halves go first so the run keeps its order. An
+    /// isolated document whose failure may be transient is settled on the
+    /// spot, before anything after it in the batch is written, so the order
+    /// across runs holds.
     async fn write_bisect(
         &self,
         target: &IndexTarget,
         kind: Kind,
+        run: &[DocOp],
         chunk: Chunk,
         tally: &mut RunTally,
     ) -> Result<(), SinkError> {
         let mut stack = vec![(0usize, chunk.lines.len())];
         while let Some((a, b)) = stack.pop() {
             match self.write_once(target, kind, &chunk.lines[a..b]).await? {
-                WriteOutcome::Written => tally.ok += (b - a) as u64,
+                WriteOutcome::Written => {
+                    tally.ok += (b - a) as u64;
+                    tally.ok_bytes += wire_bytes(&chunk.lines[a..b]);
+                }
                 WriteOutcome::Refused { reason, suspect } => {
                     if b - a == 1 {
-                        tally.rejected.push((chunk.idx[a], reason, suspect));
+                        let i = chunk.idx[a];
+                        let settled = match run.get(i) {
+                            Some(op) if suspect => {
+                                self.settle_suspect(target, kind, op, &chunk.lines[a..b], reason)
+                                    .await?
+                            }
+                            _ => Settled::Rejected(reason),
+                        };
+                        match settled {
+                            Settled::Written => {
+                                tally.ok += 1;
+                                tally.ok_bytes += wire_bytes(&chunk.lines[a..b]);
+                            }
+                            Settled::Rejected(reason) => tally.rejected.push((i, reason)),
+                        }
                     } else {
                         let mid = a + (b - a) / 2;
                         tracing::debug!(index = %target.uid, size = b - a, "bisecting refused payload");
@@ -302,6 +412,93 @@ impl MeiliSink {
             }
         }
         Ok(())
+    }
+
+    /// A single document failed with an error that may be transient (an
+    /// embedder or Meilisearch hiccup) or may be its own fault. Resend it a
+    /// few times with backoff; if it keeps failing, reject it only when the
+    /// document itself is provably at fault, otherwise fail the whole call
+    /// with `Transient` so nothing is dead-lettered by mistake.
+    async fn settle_suspect(
+        &self,
+        target: &IndexTarget,
+        kind: Kind,
+        op: &DocOp,
+        line: &[Vec<u8>],
+        mut reason: String,
+    ) -> Result<Settled, SinkError> {
+        if let Some(why) = shape_problem(op) {
+            return Ok(Settled::Rejected(format!("{reason} ({why})")));
+        }
+        let opts = &self.client.opts;
+        let mut delay = opts.suspect_backoff;
+        for attempt in 1..=opts.suspect_retries {
+            tracing::debug!(index = %target.uid, attempt, "resending a document after a possibly transient failure");
+            tokio::time::sleep(client::jitter(delay)).await;
+            delay = delay.saturating_mul(2);
+            match self.write_once(target, kind, line).await? {
+                WriteOutcome::Written => return Ok(Settled::Written),
+                WriteOutcome::Refused {
+                    reason: r,
+                    suspect: false,
+                } => return Ok(Settled::Rejected(r)),
+                WriteOutcome::Refused {
+                    reason: r,
+                    suspect: true,
+                } => reason = r,
+            }
+        }
+        if let Some(embedder) = self.missing_user_provided_vectors(&target.uid, op).await? {
+            return Ok(Settled::Rejected(format!(
+                "{reason} (no `_vectors.{embedder}` for the userProvided embedder `{embedder}`)"
+            )));
+        }
+        Err(SinkError::Transient(format!(
+            "document `{}` still fails after {} retries with a possibly transient error: {reason}",
+            op.id(),
+            opts.suspect_retries
+        )))
+    }
+
+    /// The name of a `userProvided` embedder of the index for which this
+    /// full document has no `_vectors` entry: Meilisearch then fails with
+    /// `vector_embedding_error`, the same code as an embedder outage.
+    async fn missing_user_provided_vectors(
+        &self,
+        uid: &str,
+        op: &DocOp,
+    ) -> Result<Option<String>, SinkError> {
+        // A partial update may rely on the vectors already stored.
+        let DocOp::Replace { doc, .. } = op else {
+            return Ok(None);
+        };
+        let body = match self
+            .client
+            .call(
+                Method::GET,
+                &["indexes", uid, "settings", "embedders"],
+                &[],
+                None,
+            )
+            .await?
+        {
+            Ok(body) => body,
+            Err(api) if api.status == StatusCode::NOT_FOUND => return Ok(None),
+            Err(api) => return Err(map_api_error("reading embedders", &api)),
+        };
+        let embedders =
+            serde_json::from_slice::<Option<serde_json::Map<String, serde_json::Value>>>(&body)
+                .map_err(|e| {
+                    SinkError::Fatal(format!("unexpected embedders from Meilisearch: {e}"))
+                })?
+                .unwrap_or_default();
+        let vectors = doc.get("_vectors").and_then(|v| v.as_object());
+        Ok(embedders
+            .iter()
+            .filter(|(_, e)| e.get("source").and_then(|s| s.as_str()) == Some("userProvided"))
+            .map(|(name, _)| name)
+            .find(|name| !vectors.is_some_and(|v| v.contains_key(name.as_str())))
+            .cloned())
     }
 
     /// One request + its task.
@@ -404,6 +601,7 @@ impl MeiliSink {
     async fn index_task(
         &self,
         context: &str,
+        retry: Retry,
         method: Method,
         segments: &[&str],
         payload: Option<Payload>,
@@ -411,7 +609,7 @@ impl MeiliSink {
     ) -> Result<(), SinkError> {
         let task = self
             .client
-            .run_task(context, method, segments, payload)
+            .run_task(context, retry, method, segments, payload)
             .await?;
         match task.status {
             TaskStatus::Succeeded => Ok(()),
@@ -422,6 +620,36 @@ impl MeiliSink {
             _ => {
                 let error = task.error.unwrap_or_default();
                 if ok_codes.contains(&error.code.as_str()) {
+                    Ok(())
+                } else {
+                    Err(client::map_task_error(context, &error))
+                }
+            }
+        }
+    }
+
+    /// Enqueue + wait for a payload-less task on an index; a missing index
+    /// (404 on enqueue or `index_not_found` on the task) counts as success.
+    async fn task_allow_missing(
+        &self,
+        context: &str,
+        method: Method,
+        segments: &[&str],
+    ) -> Result<(), SinkError> {
+        let task_uid = match self.client.enqueue(method, segments, &[], None).await? {
+            Ok(t) => t,
+            Err(api) if api.status == StatusCode::NOT_FOUND => return Ok(()),
+            Err(api) => return Err(map_api_error(context, &api)),
+        };
+        let task = self.client.wait_task(task_uid).await?;
+        match task.status {
+            TaskStatus::Succeeded => Ok(()),
+            TaskStatus::Canceled => Err(SinkError::Transient(format!(
+                "{context}: task {task_uid} was canceled"
+            ))),
+            _ => {
+                let error = task.error.unwrap_or_default();
+                if error.code == "index_not_found" {
                     Ok(())
                 } else {
                     Err(client::map_task_error(context, &error))
@@ -474,6 +702,7 @@ impl Sink for MeiliSink {
                     return self
                         .index_task(
                             "setting index primary key",
+                            Retry::Idempotent,
                             Method::PATCH,
                             &["indexes", uid],
                             Some(Payload::Json(json!({ "primaryKey": pk }))),
@@ -486,6 +715,9 @@ impl Sink for MeiliSink {
                         .client
                         .run_task(
                             "creating index",
+                            // A duplicate fails with `index_already_exists`,
+                            // handled below.
+                            Retry::Idempotent,
                             Method::POST,
                             &["indexes"],
                             Some(Payload::Json(json!({ "uid": uid, "primaryKey": pk }))),
@@ -532,6 +764,8 @@ impl Sink for MeiliSink {
     async fn swap(&self, a: &str, b: &str) -> Result<(), SinkError> {
         self.index_task(
             "swapping indexes",
+            // A swap enqueued twice swaps back.
+            Retry::ConnectOnly,
             Method::POST,
             &["swap-indexes"],
             Some(Payload::Json(json!([{ "indexes": [a, b] }]))),
@@ -540,31 +774,18 @@ impl Sink for MeiliSink {
         .await
     }
 
+    async fn delete_all_documents(&self, uid: &str) -> Result<(), SinkError> {
+        self.task_allow_missing(
+            "deleting all documents",
+            Method::DELETE,
+            &["indexes", uid, "documents"],
+        )
+        .await
+    }
+
     async fn delete_index(&self, uid: &str) -> Result<(), SinkError> {
-        let enqueued = self
-            .client
-            .enqueue(Method::DELETE, &["indexes", uid], &[], None)
-            .await?;
-        let task_uid = match enqueued {
-            Ok(t) => t,
-            Err(api) if api.status == StatusCode::NOT_FOUND => return Ok(()),
-            Err(api) => return Err(map_api_error("deleting index", &api)),
-        };
-        let task = self.client.wait_task(task_uid).await?;
-        match task.status {
-            TaskStatus::Succeeded => Ok(()),
-            TaskStatus::Canceled => Err(SinkError::Transient(format!(
-                "deleting index: task {task_uid} was canceled"
-            ))),
-            _ => {
-                let error = task.error.unwrap_or_default();
-                if error.code == "index_not_found" {
-                    Ok(())
-                } else {
-                    Err(client::map_task_error("deleting index", &error))
-                }
-            }
-        }
+        self.task_allow_missing("deleting index", Method::DELETE, &["indexes", uid])
+            .await
     }
 
     async fn copy_settings(&self, from: &str, to: &str) -> Result<(), SinkError> {
@@ -579,8 +800,19 @@ impl Sink for MeiliSink {
             Err(api) if api.status == StatusCode::NOT_FOUND => return Ok(()),
             Err(api) => return Err(map_api_error("reading settings", &api)),
         };
+        if let Some(embedder) = embedder_with_api_key(&settings) {
+            return Err(SinkError::Config(format!(
+                "cannot copy the settings of index `{from}` to `{to}`: embedder `{embedder}` has \
+                 an API key, which Meilisearch only returns redacted; copying it would install a \
+                 broken key"
+            )));
+        }
+        // Every key of `GET /settings` is accepted back by `PATCH` (checked
+        // against Meilisearch 1.57, embedders included), and the PATCH
+        // creates `to` when it does not exist yet.
         self.index_task(
             "copying settings",
+            Retry::Idempotent,
             Method::PATCH,
             &["indexes", to, "settings"],
             Some(Payload::Json(settings)),

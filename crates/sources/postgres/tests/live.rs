@@ -26,6 +26,29 @@ fn url() -> Option<String> {
     }
 }
 
+/// Tests that change server-wide settings (`ALTER SYSTEM`) also need
+/// `PG_TEST_ALTER_SYSTEM=1`: run them alone, on a throwaway server.
+fn alter_system_url() -> Option<String> {
+    let url = url()?;
+    if std::env::var("PG_TEST_ALTER_SYSTEM").as_deref() == Ok("1") {
+        Some(url)
+    } else {
+        eprintln!("PG_TEST_ALTER_SYSTEM is not 1: skipping a test that changes server settings");
+        None
+    }
+}
+
+/// A Postgres older than 14 (`PG_OLD_TEST_URL`), for the version gate.
+fn old_url() -> Option<String> {
+    match std::env::var("PG_OLD_TEST_URL") {
+        Ok(u) if !u.is_empty() => Some(u),
+        _ => {
+            eprintln!("PG_OLD_TEST_URL is not set: skipping old-Postgres test");
+            None
+        }
+    }
+}
+
 fn unique(prefix: &str) -> String {
     format!("{prefix}_{:08x}", rand::random::<u32>())
 }
@@ -45,9 +68,18 @@ async fn admin(url: &str) -> tokio_postgres::Client {
 }
 
 fn source(url: &str, sync_id: &str, tables: &[&str]) -> Box<dyn Source> {
+    source_with(url, sync_id, tables, json!({}))
+}
+
+/// `extra` is merged into the config (`slot_name`, `publication_name`).
+fn source_with(url: &str, sync_id: &str, tables: &[&str], extra: Value) -> Box<dyn Source> {
+    let mut config = json!({ "url": url });
+    if let (Some(c), Some(e)) = (config.as_object_mut(), extra.as_object()) {
+        c.extend(e.clone());
+    }
     let spec = SourceSpec {
         kind: SourceKind::Postgres,
-        config: json!({ "url": url }),
+        config,
     };
     let streams: Vec<StreamMapping> = tables
         .iter()
@@ -98,6 +130,7 @@ impl Model {
                 self.truncates.push(collection);
             }
             SourceEvent::SchemaChanged { collection } => self.schema_changes.push(collection),
+            SourceEvent::Skipped { .. } => panic!("postgres never skips: {ev:?}"),
         }
     }
 
@@ -485,10 +518,19 @@ async fn change_kinds_toast_key_change_truncate_types() {
         }
         other => panic!("expected patch, got {other:?}"),
     }
-    // Key change → Delete(old) + new row.
+    // Key change → Delete(old) + the whole new row, TOASTed column
+    // included: a Patch would land on a document that does not exist.
     assert_eq!(c[2].op, Op::Delete);
     assert_eq!(c[2].key, vec![json!(1)]);
     assert_eq!(c[3].key, vec![json!(2)]);
+    match &c[3].op {
+        Op::Upsert { doc } => {
+            assert_eq!(doc["big"].as_str().map(str::len), Some(100_000));
+            assert_eq!(doc["b"], json!(false));
+            assert_eq!(doc["m"], json!("sad"));
+        }
+        other => panic!("expected upsert, got {other:?}"),
+    }
 
     db.batch_execute(&format!("TRUNCATE {table}"))
         .await
@@ -593,6 +635,14 @@ async fn dropped_slot_is_position_lost_and_teardown_is_idempotent() {
     };
     drop(src);
 
+    // A checkpoint ahead of the server's WAL (restored from a backup, a
+    // failover to a server that is behind): the changes in between are
+    // not there to stream.
+    let mut src = source(&url, &sync_id, &[&collection]);
+    let future = Checkpoint(json!({"lsn": "FFFF/0"}));
+    let err = src.open(Some(future)).await.unwrap_err();
+    assert!(matches!(err, SourceError::PositionLost(_)), "{err:?}");
+
     // A slot that confirmed past the checkpoint cannot honour it either.
     let mut src = source(&url, &sync_id, &[&collection]);
     let ahead = Checkpoint(json!({"lsn": "0/1"}));
@@ -665,4 +715,606 @@ async fn teardown_while_streaming_and_bad_credentials() {
         assert!(matches!(err, SourceError::Config(_)), "{err:?}");
         assert!(!err.to_string().contains("hunter2"));
     }
+}
+
+#[tokio::test]
+async fn servers_older_than_14_are_refused_before_anything_is_created() {
+    let Some(url) = old_url() else { return };
+    let db = admin(&url).await;
+    let version: i32 = db
+        .query_one("SELECT current_setting('server_version_num')::int4", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert!(version < 140_000, "PG_OLD_TEST_URL is Postgres {version}");
+    let table = unique("old");
+    create_items(&db, &table).await;
+    let sync_id = unique("old");
+    let name = format!("meili_connect_{sync_id}");
+    let mut src = source(&url, &sync_id, &[&format!("public.{table}")]);
+
+    let report = src.check().await.unwrap();
+    let item = report
+        .items
+        .iter()
+        .find(|i| i.name == "server_version")
+        .unwrap();
+    assert_eq!(item.status, CheckStatus::Failed, "{report:#?}");
+    assert!(item.message.contains("14"), "{}", item.message);
+
+    let err = src.open(None).await.unwrap_err();
+    assert!(matches!(err, SourceError::Config(_)), "{err:?}");
+    let slots: i64 = db
+        .query_one(
+            "SELECT count(*) FROM pg_replication_slots WHERE slot_name = $1",
+            &[&name],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    let pubs: i64 = db
+        .query_one(
+            "SELECT count(*) FROM pg_publication WHERE pubname = $1",
+            &[&name],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!((slots, pubs), (0, 0));
+}
+
+/// A stream that grabs the slot back as soon as it loses it, like an engine
+/// still running the sync would.
+fn stubborn_holder(
+    url: &str,
+    sync_id: &str,
+    collection: &str,
+    from: Checkpoint,
+) -> CancellationToken {
+    let stop = CancellationToken::new();
+    let (url, sync_id, collection, s) = (
+        url.to_owned(),
+        sync_id.to_owned(),
+        collection.to_owned(),
+        stop.clone(),
+    );
+    tokio::spawn(async move {
+        while !s.is_cancelled() {
+            let mut src = source(&url, &sync_id, &[&collection]);
+            if src.open(Some(from.clone())).await.is_err() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                continue;
+            }
+            let (tx, mut rx) = mpsc::channel(64);
+            tokio::spawn(async move { while rx.recv().await.is_some() {} });
+            let (_ack, acks) = ack_channel();
+            let _ = src.stream(tx, acks, s.clone()).await;
+        }
+    });
+    stop
+}
+
+#[tokio::test]
+async fn teardown_never_reports_success_while_the_slot_survives() {
+    let Some(url) = url() else { return };
+    let db = admin(&url).await;
+    let table = unique("held");
+    create_items(&db, &table).await;
+    let sync_id = unique("held");
+    let name = format!("meili_connect_{sync_id}");
+    let collection = format!("public.{table}");
+    let mut src = source(&url, &sync_id, &[&collection]);
+    let Opened::Fresh { start } = src.open(None).await.unwrap() else {
+        panic!()
+    };
+    drop(src);
+    let stop = stubborn_holder(&url, &sync_id, &collection, start);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let mut other = source(&url, &sync_id, &[&collection]);
+    let result = other.teardown().await;
+    let count = |q: &'static str| {
+        let db = &db;
+        let name = name.clone();
+        async move { db.query_one(q, &[&name]).await.unwrap().get::<_, i64>(0) }
+    };
+    let slots = count("SELECT count(*) FROM pg_replication_slots WHERE slot_name = $1").await;
+    let pubs = count("SELECT count(*) FROM pg_publication WHERE pubname = $1").await;
+    if slots > 0 {
+        assert!(
+            matches!(result, Err(SourceError::Transient(_))),
+            "slot survived but teardown said {result:?}"
+        );
+        assert_eq!(pubs, 1, "publication dropped while the slot survived");
+    } else {
+        result.unwrap();
+    }
+
+    // Once nothing holds it any more, teardown finishes.
+    stop.cancel();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    other.teardown().await.unwrap();
+    assert_eq!(
+        count("SELECT count(*) FROM pg_replication_slots WHERE slot_name = $1").await,
+        0
+    );
+    assert_eq!(
+        count("SELECT count(*) FROM pg_publication WHERE pubname = $1").await,
+        0
+    );
+}
+
+#[tokio::test]
+async fn names_taken_by_others_are_never_adopted_or_dropped() {
+    let Some(url) = url() else { return };
+    let db = admin(&url).await;
+    let table = unique("own");
+    let other = unique("own_other");
+    create_items(&db, &table).await;
+    create_items(&db, &other).await;
+    let collection = format!("public.{table}");
+    let foreign_pub = unique("foreign_pub");
+    let foreign_slot = unique("foreign_slot");
+    db.batch_execute(&format!(
+        "CREATE PUBLICATION {foreign_pub} FOR TABLE {other}"
+    ))
+    .await
+    .unwrap();
+    db.execute(
+        "SELECT pg_create_logical_replication_slot($1, 'pgoutput')",
+        &[&foreign_slot],
+    )
+    .await
+    .unwrap();
+    let pub_tables = || async {
+        db.query(
+            "SELECT tablename::text FROM pg_publication_tables WHERE pubname = $1",
+            &[&foreign_pub],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.get::<_, String>(0))
+        .collect::<Vec<_>>()
+    };
+    let slot_exists = || async {
+        db.query_one(
+            "SELECT count(*) FROM pg_replication_slots WHERE slot_name = $1",
+            &[&foreign_slot],
+        )
+        .await
+        .unwrap()
+        .get::<_, i64>(0)
+            == 1
+    };
+
+    for extra in [
+        json!({ "publication_name": foreign_pub }),
+        json!({ "slot_name": foreign_slot }),
+    ] {
+        let sync_id = unique("own");
+        let mut src = source_with(&url, &sync_id, &[&collection], extra.clone());
+        let report = src.check().await.unwrap();
+        assert!(!report.passed(), "{extra}: {report:#?}");
+        let err = src.open(None).await.unwrap_err();
+        assert!(
+            matches!(&err, SourceError::Config(m) if m.contains("taken")),
+            "{extra}: {err:?}"
+        );
+        src.teardown().await.unwrap();
+        assert_eq!(pub_tables().await, vec![other.clone()], "{extra}");
+        assert!(slot_exists().await, "{extra}");
+    }
+
+    // What we create carries our marker; a later open adopts it again.
+    let sync_id = unique("own");
+    let name = format!("meili_connect_{sync_id}");
+    let mut src = source(&url, &sync_id, &[&collection]);
+    assert!(matches!(
+        src.open(None).await.unwrap(),
+        Opened::Fresh { .. }
+    ));
+    drop(src);
+    let comment: Option<String> = db
+        .query_one(
+            "SELECT obj_description(oid, 'pg_publication') FROM pg_publication WHERE pubname = $1",
+            &[&name],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(comment, Some(format!("meili-connect:{sync_id}")));
+    let mut src = source(&url, &sync_id, &[&collection]);
+    assert!(matches!(
+        src.open(None).await.unwrap(),
+        Opened::Fresh { .. }
+    ));
+    src.teardown().await.unwrap();
+
+    // A publication of ours paired with a slot name override: adopted.
+    let sync_id = unique("own");
+    let slot = unique("own_slot");
+    let mut src = source_with(&url, &sync_id, &[&collection], json!({ "slot_name": slot }));
+    assert!(matches!(
+        src.open(None).await.unwrap(),
+        Opened::Fresh { .. }
+    ));
+    drop(src);
+    let mut src = source_with(&url, &sync_id, &[&collection], json!({ "slot_name": slot }));
+    assert!(matches!(
+        src.open(None).await.unwrap(),
+        Opened::Fresh { .. }
+    ));
+    src.teardown().await.unwrap();
+
+    db.batch_execute(&format!(
+        "DROP PUBLICATION {foreign_pub}; SELECT pg_drop_replication_slot('{foreign_slot}');"
+    ))
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn snapshot_survives_role_timeouts_under_back_pressure() {
+    let Some(url) = url() else { return };
+    let db = admin(&url).await;
+    let role = unique("slow");
+    let table = unique("slow");
+    db.batch_execute(&format!(
+        "CREATE ROLE {role} LOGIN REPLICATION PASSWORD 'pw';
+         ALTER ROLE {role} SET idle_in_transaction_session_timeout = '1s';
+         ALTER ROLE {role} SET statement_timeout = '1s';
+         ALTER ROLE {role} SET lock_timeout = '1s';
+         GRANT CREATE ON DATABASE {} TO {role};
+         CREATE TABLE {table} (id int8 PRIMARY KEY, n int4, body text);
+         ALTER TABLE {table} OWNER TO {role};
+         INSERT INTO {table} SELECT g, g, 'row' FROM generate_series(1, 1200) g;",
+        db.query_one("SELECT current_database()::text", &[])
+            .await
+            .unwrap()
+            .get::<_, String>(0)
+    ))
+    .await
+    .unwrap();
+    let mut role_url = url::Url::parse(&url).unwrap();
+    role_url.set_username(&role).unwrap();
+    role_url.set_password(Some("pw")).unwrap();
+    let role_url = role_url.to_string();
+
+    let sync_id = unique("slow");
+    let mut src = source(&role_url, &sync_id, &[&format!("public.{table}")]);
+    assert!(matches!(
+        src.open(None).await.unwrap(),
+        Opened::Fresh { .. }
+    ));
+    // One slot of buffer and a consumer that stalls: the snapshot
+    // transaction sits idle well past the role's 1 s timeouts.
+    let (tx, mut rx) = mpsc::channel(1);
+    let consumer = tokio::spawn(async move {
+        let mut n = 0usize;
+        while let Some(ev) = rx.recv().await {
+            assert!(matches!(ev, SourceEvent::Change(_)));
+            n += 1;
+            if n == 1 || n == 700 {
+                tokio::time::sleep(Duration::from_millis(2500)).await;
+            }
+        }
+        n
+    });
+    let result = src.snapshot(tx, CancellationToken::new()).await;
+    let n = consumer.await.unwrap();
+    result.unwrap();
+    assert_eq!(n, 1200);
+    src.teardown().await.unwrap();
+    db.batch_execute(&format!(
+        "DROP TABLE {table}; REVOKE CREATE ON DATABASE {} FROM {role}; DROP ROLE {role};",
+        db.query_one("SELECT current_database()::text", &[])
+            .await
+            .unwrap()
+            .get::<_, String>(0)
+    ))
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn inheritance_is_refused_partitions_stream_under_the_root() {
+    let Some(url) = url() else { return };
+    let db = admin(&url).await;
+    let parent = unique("inh");
+    let part = unique("part");
+    db.batch_execute(&format!(
+        "CREATE TABLE {parent} (id int8 PRIMARY KEY, n int4, body text);
+         CREATE TABLE {parent}_child () INHERITS ({parent});
+         CREATE TABLE {part} (id int8 PRIMARY KEY, n int4, body text) PARTITION BY RANGE (id);
+         CREATE TABLE {part}_a PARTITION OF {part} FOR VALUES FROM (0) TO (100);
+         CREATE TABLE {part}_b PARTITION OF {part} FOR VALUES FROM (100) TO (200);
+         INSERT INTO {part} VALUES (1, 1, 'a'), (150, 1, 'b');"
+    ))
+    .await
+    .unwrap();
+
+    let mut src = source(&url, &unique("inh"), &[&format!("public.{parent}")]);
+    let report = src.check().await.unwrap();
+    let item = report
+        .items
+        .iter()
+        .find(|i| i.name == format!("table public.{parent}"))
+        .unwrap();
+    assert_eq!(item.status, CheckStatus::Failed, "{report:#?}");
+    assert!(item.message.contains("inherit"), "{}", item.message);
+    let err = src.open(None).await.unwrap_err();
+    assert!(matches!(err, SourceError::Config(_)), "{err:?}");
+
+    let collection = format!("public.{part}");
+    let sync_id = unique("part");
+    let mut src = source(&url, &sync_id, &[&collection]);
+    assert!(src.check().await.unwrap().passed());
+    let Opened::Fresh { start } = src.open(None).await.unwrap() else {
+        panic!()
+    };
+    let via_root: bool = db
+        .query_one(
+            "SELECT pubviaroot FROM pg_publication WHERE pubname = $1",
+            &[&format!("meili_connect_{sync_id}")],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert!(via_root);
+    let mut model = Model::default();
+    let (tx, mut rx) = mpsc::channel(16);
+    src.snapshot(tx, CancellationToken::new()).await.unwrap();
+    while let Some(ev) = rx.recv().await {
+        model.apply(ev);
+    }
+    assert_eq!(model.table(&collection).len(), 2);
+    let mut s = start_stream(src);
+    s.ack.send(Some(start)).unwrap();
+    db.batch_execute(&format!(
+        "INSERT INTO {part} VALUES (2, 2, 'c'), (151, 2, 'd'); UPDATE {part}_b SET n = 9 WHERE id = 150;"
+    ))
+    .await
+    .unwrap();
+    let ok = pump_until(&mut s.rx, &mut model, Duration::from_secs(30), |m| {
+        m.table(&collection).len() == 4 && m.table(&collection)["150"]["n"] == json!(9)
+    })
+    .await;
+    assert!(ok, "{model:#?}");
+    let mut src = s.stop().await;
+    src.teardown().await.unwrap();
+}
+
+#[tokio::test]
+async fn renaming_a_mapped_table_mid_stream_is_a_config_error() {
+    let Some(url) = url() else { return };
+    let db = admin(&url).await;
+    let table = unique("ren");
+    create_items(&db, &table).await;
+    let sync_id = unique("ren");
+    let mut src = source(&url, &sync_id, &[&format!("public.{table}")]);
+    let Opened::Fresh { start } = src.open(None).await.unwrap() else {
+        panic!()
+    };
+    let (tx, _rx) = mpsc::channel(4);
+    src.snapshot(tx, CancellationToken::new()).await.unwrap();
+    let mut s = start_stream(src);
+    s.ack.send(Some(start)).unwrap();
+    let mut model = Model::default();
+    db.batch_execute(&format!(
+        "INSERT INTO {table} VALUES (1, 1, 'a');
+         ALTER TABLE {table} RENAME TO {table}_new;
+         INSERT INTO {table}_new VALUES (2, 2, 'b');"
+    ))
+    .await
+    .unwrap();
+    pump_until(&mut s.rx, &mut model, Duration::from_secs(10), |_| false).await;
+    let (mut src, result) = tokio::time::timeout(Duration::from_secs(20), s.task)
+        .await
+        .expect("the stream stops by itself")
+        .unwrap();
+    assert!(
+        matches!(&result, Err(SourceError::Config(m)) if m.contains("renamed")),
+        "{result:?}"
+    );
+    src.teardown().await.unwrap();
+}
+
+#[tokio::test]
+async fn covering_indexes_key_on_their_key_columns_only() {
+    let Some(url) = url() else { return };
+    let db = admin(&url).await;
+    let pk = unique("cpk");
+    let ri = unique("cri");
+    db.batch_execute(&format!(
+        "CREATE TABLE {pk} (id int4, name text, PRIMARY KEY (id) INCLUDE (name));
+         CREATE TABLE {ri} (code text NOT NULL, name text, n int4);
+         CREATE UNIQUE INDEX {ri}_code ON {ri} (code) INCLUDE (name);
+         ALTER TABLE {ri} REPLICA IDENTITY USING INDEX {ri}_code;"
+    ))
+    .await
+    .unwrap();
+    let (cp, cr) = (format!("public.{pk}"), format!("public.{ri}"));
+    let sync_id = unique("cov");
+    let mut src = source(&url, &sync_id, &[&cp, &cr]);
+    let all = src.discover().await.unwrap();
+    let key = |c: &str| all.iter().find(|i| i.name == c).unwrap().key.clone();
+    assert_eq!(key(&cp), vec!["id"]);
+    assert_eq!(key(&cr), vec!["code"]);
+
+    let Opened::Fresh { start } = src.open(None).await.unwrap() else {
+        panic!()
+    };
+    let (tx, _rx) = mpsc::channel(4);
+    src.snapshot(tx, CancellationToken::new()).await.unwrap();
+    let mut s = start_stream(src);
+    s.ack.send(Some(start)).unwrap();
+    let mut model = Model::default();
+    db.batch_execute(&format!(
+        "INSERT INTO {pk} VALUES (1, 'a'); UPDATE {pk} SET name = 'b' WHERE id = 1;
+         INSERT INTO {pk} VALUES (2, 'x'); DELETE FROM {pk} WHERE id = 2;
+         INSERT INTO {ri} VALUES ('c1', 'a', 0); UPDATE {ri} SET name = 'b' WHERE code = 'c1';
+         INSERT INTO {ri} VALUES ('c2', 'x', 0); DELETE FROM {ri} WHERE code = 'c2';"
+    ))
+    .await
+    .unwrap();
+    let ok = pump_until(&mut s.rx, &mut model, Duration::from_secs(30), |m| {
+        m.changes.len() >= 8
+    })
+    .await;
+    assert!(ok, "{model:#?}");
+    assert_eq!(
+        model.table(&cp),
+        HashMap::from([(
+            "1".to_owned(),
+            json!({"id": 1, "name": "b"}).as_object().cloned().unwrap()
+        )])
+    );
+    assert_eq!(
+        model.table(&cr),
+        HashMap::from([(
+            "c1".to_owned(),
+            json!({"code": "c1", "name": "b", "n": 0})
+                .as_object()
+                .cloned()
+                .unwrap()
+        )])
+    );
+    assert!(model.changes.iter().all(|c| c.key.len() == 1), "{model:#?}");
+    let mut src = s.stop().await;
+    src.teardown().await.unwrap();
+}
+
+#[tokio::test]
+async fn key_change_with_unchanged_toast_gives_whole_documents() {
+    let Some(url) = url() else { return };
+    let db = admin(&url).await;
+    let def = unique("ktd");
+    let full = unique("ktf");
+    for t in [&def, &full] {
+        db.batch_execute(&format!(
+            "CREATE TABLE {t} (id int4 PRIMARY KEY, n int4, big text);
+             ALTER TABLE {t} ALTER COLUMN big SET STORAGE EXTERNAL;"
+        ))
+        .await
+        .unwrap();
+    }
+    db.batch_execute(&format!("ALTER TABLE {full} REPLICA IDENTITY FULL"))
+        .await
+        .unwrap();
+    let (cd, cf) = (format!("public.{def}"), format!("public.{full}"));
+    let sync_id = unique("kt");
+    let mut src = source(&url, &sync_id, &[&cd, &cf]);
+    let Opened::Fresh { start } = src.open(None).await.unwrap() else {
+        panic!()
+    };
+    let (tx, _rx) = mpsc::channel(4);
+    src.snapshot(tx, CancellationToken::new()).await.unwrap();
+    let mut s = start_stream(src);
+    s.ack.send(Some(start)).unwrap();
+    let mut model = Model::default();
+
+    for t in [&def, &full] {
+        db.batch_execute(&format!(
+            "INSERT INTO {t} VALUES (1, 0, repeat('x', 100000));
+             UPDATE {t} SET id = 2, n = 1 WHERE id = 1;
+             INSERT INTO {t} VALUES (10, 0, repeat('y', 100000));
+             BEGIN; UPDATE {t} SET id = 11 WHERE id = 10; DELETE FROM {t} WHERE id = 11; COMMIT;"
+        ))
+        .await
+        .unwrap();
+    }
+    let ok = pump_until(&mut s.rx, &mut model, Duration::from_secs(30), |m| {
+        m.changes
+            .iter()
+            .filter(|c| c.key == vec![json!(11)] && c.op == Op::Delete)
+            .count()
+            == 2
+    })
+    .await;
+    assert!(ok, "{model:#?}");
+    for c in [&cd, &cf] {
+        let docs = model.table(c);
+        assert_eq!(docs.len(), 1, "{c}: {docs:?}");
+        let doc = &docs["2"];
+        assert_eq!(doc["n"], json!(1), "{c}");
+        assert_eq!(doc["big"].as_str().map(str::len), Some(100_000), "{c}");
+        assert!(
+            model
+                .changes
+                .iter()
+                .filter(|ch| &ch.collection == c)
+                .all(|ch| !matches!(ch.op, Op::Patch { .. })),
+            "{c}: a key change produced a patch"
+        );
+    }
+    let mut src = s.stop().await;
+    src.teardown().await.unwrap();
+}
+
+/// The slot is invalidated after `open` checked it and before
+/// START_REPLICATION: the server says only "can no longer get changes"
+/// (SQLSTATE 55000), the reason being in the DETAIL.
+#[tokio::test]
+async fn slot_invalidated_before_start_replication_is_position_lost() {
+    let Some(url) = alter_system_url() else {
+        return;
+    };
+    let db = admin(&url).await;
+    let table = unique("inv");
+    create_items(&db, &table).await;
+    let sync_id = unique("inv");
+    let slot = format!("meili_connect_{sync_id}");
+    let collection = format!("public.{table}");
+    let mut src = source(&url, &sync_id, &[&collection]);
+    let Opened::Fresh { start } = src.open(None).await.unwrap() else {
+        panic!()
+    };
+    drop(src);
+    let mut src = source(&url, &sync_id, &[&collection]);
+    assert_eq!(src.open(Some(start)).await.unwrap(), Opened::Resumed);
+
+    db.batch_execute("ALTER SYSTEM SET max_slot_wal_keep_size = '1MB'")
+        .await
+        .unwrap();
+    db.batch_execute("SELECT pg_reload_conf()").await.unwrap();
+    let mut lost = false;
+    for i in 0..10 {
+        db.batch_execute(&format!(
+            "INSERT INTO {table} VALUES ({i}, 0, repeat('x', 10000))"
+        ))
+        .await
+        .unwrap();
+        db.batch_execute("SELECT pg_switch_wal()").await.unwrap();
+        db.batch_execute("CHECKPOINT").await.unwrap();
+        let status: Option<String> = db
+            .query_one(
+                "SELECT wal_status FROM pg_replication_slots WHERE slot_name = $1",
+                &[&slot],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        if status.as_deref() == Some("lost") {
+            lost = true;
+            break;
+        }
+    }
+    db.batch_execute("ALTER SYSTEM RESET max_slot_wal_keep_size")
+        .await
+        .unwrap();
+    db.batch_execute("SELECT pg_reload_conf()").await.unwrap();
+    assert!(lost, "could not invalidate the slot");
+
+    let (tx, _rx) = mpsc::channel(4);
+    let (_ack, acks) = ack_channel();
+    let err = tokio::time::timeout(
+        Duration::from_secs(20),
+        src.stream(tx, acks, CancellationToken::new()),
+    )
+    .await
+    .expect("stream fails fast")
+    .unwrap_err();
+    assert!(matches!(err, SourceError::PositionLost(_)), "{err:?}");
+    src.teardown().await.unwrap();
 }

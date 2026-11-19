@@ -6,7 +6,9 @@ mod common;
 use std::time::Duration;
 
 use common::*;
-use meili_connect_core::{SinkError, SourceError, StoreError, SyncPhase, SyncSpec};
+use meili_connect_core::{
+    ResyncReason, SinkError, SourceError, StoreError, SyncPhase, SyncSpec, SyncState, Usage,
+};
 use meili_connect_engine::{EngineError, SyncOptions, run_sync, shadow_index_uid};
 use serde_json::json;
 use tokio::task::JoinHandle;
@@ -422,6 +424,15 @@ async fn truncate_is_held_then_released() {
         json!({"rankingRules": ["words"]}),
         "settings survive the truncate"
     );
+    // Cleared in place: no shadow index to leak on a crash.
+    let calls = h.sink.calls();
+    assert!(calls.contains(&format!("delete_all {INDEX}")), "{calls:?}");
+    assert!(
+        !calls
+            .iter()
+            .any(|c| c.starts_with("swap") || c.contains("__connect_")),
+        "{calls:?}"
+    );
     assert!(h.store.state(SYNC_ID).expect("state").message.is_none());
     h.assert_acks_sound();
 }
@@ -578,8 +589,9 @@ async fn unmapped_collections_and_patches() {
     stop(cancel, handle).await;
     let docs = h.sink.docs(INDEX);
     assert_eq!(docs.len(), 1);
-    // Upsert + patch coalesced into one replace: `b` is gone, not null.
-    assert_eq!(docs["2"], doc(json!({"id": "2", "a": 5})));
+    // Upsert + patch coalesced into one replace: `b` is null, as when the
+    // two land in separate batches.
+    assert_eq!(docs["2"], doc(json!({"id": "2", "a": 5, "b": null})));
     assert_eq!(h.sink.state().batch_sizes.last(), Some(&1));
 }
 
@@ -590,4 +602,220 @@ async fn a_spec_without_streams_is_rejected() {
     spec.streams.clear();
     let result = finish(spawn(&h, spec, options()).1).await;
     assert!(matches!(result, Err(EngineError::Spec(_))), "{result:?}");
+}
+
+#[tokio::test]
+async fn a_spec_sharing_an_index_is_rejected() {
+    let h = Harness::new();
+    let mut spec = spec();
+    let mut other = spec.streams[0].clone();
+    other.collection = "public.other".into();
+    spec.streams.push(other);
+    let result = finish(spawn(&h, spec, options()).1).await;
+    assert!(matches!(result, Err(EngineError::Spec(_))), "{result:?}");
+    assert!(h.origin.state().opens.is_empty(), "nothing ran");
+}
+
+#[tokio::test]
+async fn skipped_records_are_dead_lettered_and_do_not_block_checkpoints() {
+    let h = Harness::new();
+    let (cancel, handle) = spawn(&h, spec(), options());
+    wait_synced(&h).await;
+
+    h.origin
+        .skipped(COLLECTION, "products/0@17", "undecodable payload");
+    h.origin
+        .skipped("public.unmapped", "unmapped/1@3", "no key");
+    h.origin.tx(vec![upsert(1, json!({}))]);
+    wait_synced(&h).await;
+    assert!(!handle.is_finished());
+    stop(cancel, handle).await;
+
+    let st = h.store.inner();
+    assert_eq!(st.dead.len(), 2, "{:?}", st.dead);
+    assert_eq!(st.dead[0].index, INDEX);
+    assert_eq!(st.dead[0].document_id, "products/0@17");
+    assert_eq!(st.dead[0].payload, json!(null));
+    assert_eq!(st.dead[0].reason, "undecodable payload");
+    assert_eq!(st.dead[1].index, "public.unmapped");
+    assert_eq!(st.progress[SYNC_ID], (1, 0, 2));
+    drop(st);
+    h.assert_acks_sound();
+}
+
+#[tokio::test]
+async fn a_source_may_drop_its_ack_receiver() {
+    let h = Harness::new();
+    h.origin.state().drop_acks = true;
+    let (cancel, handle) = spawn(&h, spec(), options());
+    wait_synced(&h).await;
+    h.origin.tx(vec![upsert(1, json!({}))]);
+    wait_synced(&h).await;
+    h.origin.tx(vec![upsert(2, json!({}))]);
+    wait_synced(&h).await;
+    assert!(!handle.is_finished());
+    stop(cancel, handle).await;
+}
+
+#[tokio::test]
+async fn an_index_keyed_differently_is_refused_before_any_shadow() {
+    let h = Harness::new();
+    seed_rows(&h, 1..=3);
+    h.sink.create(
+        INDEX,
+        json!({}),
+        vec![("x".into(), doc(json!({"sku": "x"})))],
+    );
+    h.sink
+        .state()
+        .indexes
+        .get_mut(INDEX)
+        .expect("live")
+        .primary_key = "sku".into();
+
+    let result = finish(spawn(&h, spec(), options()).1).await;
+    assert!(
+        matches!(result, Err(EngineError::Sink(SinkError::Config(_)))),
+        "{result:?}"
+    );
+    let calls = h.sink.calls();
+    assert!(
+        !calls.iter().any(|c| c.contains("__connect_")),
+        "no shadow built: {calls:?}"
+    );
+    assert_eq!(h.sink.state().indexes[INDEX].primary_key, "sku");
+    assert_eq!(h.sink.docs(INDEX).len(), 1, "live index untouched");
+    assert_eq!(h.origin.state().snapshots, 0);
+}
+
+// ---------------------------------------------------------------- metering
+
+fn metered(h: &Harness) -> Usage {
+    h.store
+        .inner()
+        .usage
+        .get(SYNC_ID)
+        .copied()
+        .unwrap_or_default()
+}
+
+#[tokio::test]
+async fn accepted_documents_are_metered_by_kind_with_their_bytes() {
+    let h = Harness::new();
+    seed_rows(&h, 1..=3);
+    // Rejected documents are never metered.
+    h.sink.state().reject.insert("2".into());
+    let (cancel, handle) = spawn(&h, spec(), options());
+    wait_for("snapshot applied", 5, || {
+        h.store.phase(SYNC_ID) == Some(SyncPhase::Streaming)
+    })
+    .await;
+    let u = metered(&h);
+    assert_eq!(
+        (
+            u.documents_snapshot,
+            u.documents_streamed,
+            u.documents_resync
+        ),
+        (2, 0, 0)
+    );
+    assert_eq!(u.bytes, 2 * BYTES_PER_DOC);
+
+    h.origin
+        .tx(vec![upsert(4, json!({"name": "p4"})), delete(1)]);
+    wait_for("streamed", 5, || metered(&h).documents_streamed == 2).await;
+    stop(cancel, handle).await;
+    let u = metered(&h);
+    assert_eq!(u.documents_snapshot, 2, "{u:?}");
+    assert_eq!(u.documents_resync, 0);
+    assert_eq!(u.bytes, 4 * BYTES_PER_DOC);
+    assert_eq!(
+        h.store.inner().progress[SYNC_ID].2,
+        1,
+        "the rejection is counted apart"
+    );
+}
+
+#[tokio::test]
+async fn a_user_resync_is_a_snapshot_and_a_lost_position_a_free_resync() {
+    let h = Harness::new();
+    seed_rows(&h, 1..=3);
+    let (cancel, handle) = spawn(&h, spec(), options());
+    wait_synced(&h).await;
+    stop(cancel, handle).await;
+    assert_eq!(metered(&h).documents_snapshot, 3);
+
+    // The user asks.
+    let mut opts = options();
+    opts.resync = true;
+    let (cancel, handle) = spawn(&h, spec(), opts);
+    wait_for("user resync", 5, || h.origin.state().snapshots == 2).await;
+    wait_synced(&h).await;
+    stop(cancel, handle).await;
+    let u = metered(&h);
+    assert_eq!((u.documents_snapshot, u.documents_resync), (6, 0));
+
+    // The origin lost the position: the engine resyncs on its own.
+    h.origin.state().min_resume = 1_000;
+    let (cancel, handle) = spawn(&h, spec(), options());
+    wait_for("system resync", 5, || h.origin.state().snapshots == 3).await;
+    wait_for("resynced", 5, || {
+        h.store
+            .state(SYNC_ID)
+            .is_some_and(|s| !s.resyncing && s.phase == SyncPhase::Streaming)
+    })
+    .await;
+    stop(cancel, handle).await;
+    let u = metered(&h);
+    assert_eq!((u.documents_snapshot, u.documents_resync), (6, 3), "{u:?}");
+    let state = h.store.state(SYNC_ID).expect("state");
+    assert_eq!(state.resync_reason, None, "cleared once done");
+}
+
+fn interrupted_resync(reason: ResyncReason) -> SyncState {
+    SyncState {
+        sync_id: SYNC_ID.into(),
+        phase: SyncPhase::Snapshotting,
+        checkpoint: None,
+        message: None,
+        resyncing: true,
+        resync_reason: Some(reason),
+        updated_at: chrono::Utc::now(),
+    }
+}
+
+#[tokio::test]
+async fn a_resync_interrupted_by_a_crash_keeps_its_reason() {
+    let h = Harness::new();
+    seed_rows(&h, 1..=3);
+    // What a crash in the middle of a system resync leaves behind.
+    h.store
+        .inner()
+        .states
+        .insert(SYNC_ID.into(), interrupted_resync(ResyncReason::System));
+    let (cancel, handle) = spawn(&h, spec(), options());
+    wait_synced(&h).await;
+    stop(cancel, handle).await;
+    let u = metered(&h);
+    assert_eq!((u.documents_snapshot, u.documents_resync), (0, 3), "{u:?}");
+
+    // A user resync interrupted the same way stays billed.
+    h.store
+        .inner()
+        .states
+        .insert(SYNC_ID.into(), interrupted_resync(ResyncReason::User));
+    let (cancel, handle) = spawn(&h, spec(), options());
+    wait_for("resynced", 5, || metered(&h).documents_snapshot == 3).await;
+    stop(cancel, handle).await;
+    assert_eq!(metered(&h).documents_resync, 3);
+}
+
+#[test]
+fn a_state_saved_before_the_reason_existed_still_reads() {
+    let old = json!({
+        "sync_id": "s", "phase": "snapshotting", "checkpoint": null, "message": null,
+        "resyncing": true, "updated_at": "2026-11-19T10:00:00Z"
+    });
+    let state: SyncState = serde_json::from_value(old).expect("old state");
+    assert_eq!(state.resync_reason, None);
 }

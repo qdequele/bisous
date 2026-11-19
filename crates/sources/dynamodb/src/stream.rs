@@ -16,7 +16,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aws_sdk_dynamodbstreams::types::{ShardIteratorType, StreamStatus};
-use meili_connect_core::{Change, Checkpoint, EventSender, SourceError, SourceEvent};
+use meili_connect_core::{
+    Change, Checkpoint, EventSender, Lag, LagReporter, SourceError, SourceEvent,
+    seconds_since_unix_millis,
+};
 use tokio::task::JoinSet;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -124,6 +127,8 @@ enum StepOutcome {
         last_seq: Option<String>,
         next: Option<String>,
         polled_at: u64,
+        /// `ApproximateCreationDateTime` of the newest record, unix ms.
+        newest_ms: Option<i64>,
     },
     Expired,
     Retry(String),
@@ -164,6 +169,11 @@ impl Step {
                 let records = out.records.unwrap_or_default();
                 let mut changes = Vec::with_capacity(records.len());
                 let mut last_seq = None;
+                let newest_ms = records
+                    .iter()
+                    .filter_map(|r| r.dynamodb()?.approximate_creation_date_time())
+                    .filter_map(|t| t.to_millis().ok())
+                    .max();
                 for r in &records {
                     let (change, seq) =
                         record_to_change(&self.table.name, &self.table.key_names, r)?;
@@ -177,6 +187,7 @@ impl Step {
                     last_seq,
                     next: out.next_shard_iterator,
                     polled_at,
+                    newest_ms,
                 })
             }
             Err(e) => {
@@ -236,14 +247,41 @@ impl Step {
     }
 }
 
+/// The lag of every shard read so far: `now − ApproximateCreationDateTime`
+/// of its newest record, `0` once a read returns nothing. The stream's lag
+/// is the worst shard's.
+#[derive(Default)]
+struct ShardLags(HashMap<Key, f64>);
+
+impl ShardLags {
+    fn observe(&mut self, key: &Key, had_records: bool, newest_ms: Option<i64>) {
+        let seconds = match (had_records, newest_ms) {
+            (false, _) => 0.0,
+            (true, Some(ms)) => seconds_since_unix_millis(ms),
+            (true, None) => return,
+        };
+        self.0.insert(key.clone(), seconds);
+    }
+
+    fn forget(&mut self, key: &Key) {
+        self.0.remove(key);
+    }
+
+    fn worst(&self) -> Option<f64> {
+        self.0.values().copied().reduce(f64::max)
+    }
+}
+
 /// Run until cancelled or the engine goes away.
 pub async fn run(
     client: aws_sdk_dynamodbstreams::Client,
     opts: &StreamOptions,
     tables: &mut BTreeMap<String, TableState>,
     events: EventSender,
+    lag: Option<LagReporter>,
     cancel: CancellationToken,
 ) -> Result<(), SourceError> {
+    let mut lags = ShardLags::default();
     let mut cursors: HashMap<Key, Cursor> = HashMap::new();
     // Shards queued or in flight.
     let mut scheduled: HashSet<Key> = HashSet::new();
@@ -317,8 +355,12 @@ pub async fn run(
                         let wait = backoff(cursor.failures, Duration::from_millis(500), Duration::from_secs(30));
                         pending.push_back((key, wait));
                     }
-                    StepOutcome::Records { changes, last_seq, next, polled_at } => {
+                    StepOutcome::Records { changes, last_seq, next, polled_at, newest_ms } => {
                         let had_records = !changes.is_empty();
+                        lags.observe(&key, had_records, newest_ms);
+                        if let (Some(r), Some(seconds)) = (&lag, lags.worst()) {
+                            r.report(Lag { seconds: Some(seconds), bytes: None, records: None });
+                        }
                         for change in changes {
                             if !send(&events, SourceEvent::Change(change), &cancel).await {
                                 return Ok(());
@@ -335,6 +377,7 @@ pub async fn run(
                             None => {
                                 tracing::debug!(table = %key.0, shard = %key.1, "shard fully read");
                                 st.lineage.finish(&key.1);
+                                lags.forget(&key);
                                 dirty = true;
                                 scheduled.remove(&key);
                                 cursors.remove(&key);
@@ -416,4 +459,36 @@ async fn refresh(
         }
     }
     Ok(changed)
+}
+
+#[cfg(test)]
+mod lag_tests {
+    use super::*;
+
+    fn key(shard: &str) -> Key {
+        ("t".to_owned(), shard.to_owned())
+    }
+
+    #[test]
+    fn the_stream_lag_is_the_worst_shard() {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let mut lags = ShardLags::default();
+        assert_eq!(lags.worst(), None, "nothing read yet");
+        lags.observe(&key("a"), true, Some(now_ms - 60_000));
+        lags.observe(&key("b"), false, None);
+        let worst = lags.worst().unwrap_or(-1.0);
+        assert!((59.0..62.0).contains(&worst), "{worst}");
+        // Shard a caught up.
+        lags.observe(&key("a"), false, None);
+        assert_eq!(lags.worst(), Some(0.0));
+        // Records without a creation time leave the shard as it was.
+        lags.observe(&key("c"), true, None);
+        assert_eq!(lags.worst(), Some(0.0));
+        lags.forget(&key("a"));
+        lags.forget(&key("b"));
+        assert_eq!(lags.worst(), None);
+    }
 }

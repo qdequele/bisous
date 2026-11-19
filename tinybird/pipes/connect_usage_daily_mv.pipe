@@ -1,0 +1,29 @@
+#
+# connect_usage → connect_usage_daily (materialized on every insert).
+#
+# The source is aliased `u` and every raw column inside an aggregate is
+# qualified: the output aliases reuse the raw column names, and an
+# unqualified name would resolve to the aggregate's alias instead.
+#
+
+NODE connect_usage_daily_rollup
+DESCRIPTION >
+    Daily sums per tenant, sync and source kind.
+
+SQL >
+    SELECT
+        toDate(u.occurred_at) AS day,
+        u.tenant_id AS tenant_id,
+        u.sync_id AS sync_id,
+        u.source_kind AS source_kind,
+        toUInt64(count()) AS rows_count,
+        sum(u.documents_streamed) AS documents_streamed,
+        sum(u.documents_snapshot) AS documents_snapshot,
+        sum(u.documents_resync) AS documents_resync,
+        sum(u.bytes) AS bytes,
+        sum(u.sync_seconds) AS sync_seconds
+    FROM connect_usage AS u
+    GROUP BY day, tenant_id, sync_id, source_kind
+
+TYPE MATERIALIZED
+DATASOURCE connect_usage_daily

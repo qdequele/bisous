@@ -1,11 +1,13 @@
 //! The contract every source connector implements.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
-use crate::{Checkpoint, SourceError, SourceEvent, SourceSpec, StreamMapping};
+use crate::{Checkpoint, Endpoint, SourceError, SourceEvent, SourceSpec, StreamMapping};
 
 /// Bounded channel from the source to the engine. Back-pressure is the
 /// channel being full: a source must `send().await` and never buffer
@@ -22,6 +24,59 @@ pub type AckSender = watch::Sender<Option<Checkpoint>>;
 
 pub fn ack_channel() -> (AckSender, AckReceiver) {
     watch::channel(None)
+}
+
+/// How far a streaming source is behind its origin, as the source sees it.
+/// Each field is `None` when the source cannot tell.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub struct Lag {
+    /// Age of the newest change seen, or `0` once caught up (Postgres
+    /// commit timestamps, MongoDB cluster time, Kafka record timestamps,
+    /// DynamoDB `ApproximateCreationDateTime`).
+    pub seconds: Option<f64>,
+    /// Origin bytes not yet confirmed (Postgres: WAL between the slot's
+    /// confirmed position and the server's current position).
+    pub bytes: Option<u64>,
+    /// Records not yet read (Kafka: the sum of high watermark − position
+    /// over the assigned partitions).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub records: Option<u64>,
+}
+
+/// Where a source publishes its latest [`Lag`]: a `watch` cell, so
+/// publishing never blocks and reading it needs nothing from the source
+/// (no `&mut` on a source busy streaming). Cheap to clone; clones publish to
+/// the same cell.
+#[derive(Debug, Clone)]
+pub struct LagReporter(Arc<watch::Sender<Option<Lag>>>);
+
+/// Reads what a [`LagReporter`] published.
+pub type LagWatch = watch::Receiver<Option<Lag>>;
+
+impl LagReporter {
+    pub fn new() -> (Self, LagWatch) {
+        let (tx, rx) = watch::channel(None);
+        (Self(Arc::new(tx)), rx)
+    }
+
+    pub fn report(&self, lag: Lag) {
+        self.0.send_replace(Some(lag));
+    }
+
+    /// Nothing known (not streaming).
+    pub fn clear(&self) {
+        self.0.send_replace(None);
+    }
+}
+
+/// Seconds since a unix timestamp in milliseconds, never negative (clocks
+/// drift).
+pub fn seconds_since_unix_millis(millis: i64) -> f64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    (now.saturating_sub(millis)).max(0) as f64 / 1000.0
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -161,10 +216,19 @@ pub trait Source: Send {
     /// Remove what `open` created on the origin (slot, publication,
     /// consumer group). Called when the sync is deleted. Idempotent.
     async fn teardown(&mut self) -> Result<(), SourceError>;
+
+    /// Where to publish how far behind the origin `stream` is. The engine
+    /// calls it once, before `open`; a source that can tell reports as it
+    /// streams (cheaply: no extra round trip per event). The default
+    /// ignores it: the lag is then unknown.
+    fn report_lag(&mut self, reporter: LagReporter) {
+        let _ = reporter;
+    }
 }
 
 /// Builds a [`Source`] from the stored spec. One implementation per
 /// connector crate; the server registers them by [`crate::SourceKind`].
+#[async_trait]
 pub trait SourceFactory: Send + Sync {
     /// `sync_id` is stable for the life of the sync and safe to embed in
     /// origin-side names (slot, publication, consumer group).
@@ -174,4 +238,22 @@ pub trait SourceFactory: Send + Sync {
         spec: &SourceSpec,
         streams: &[StreamMapping],
     ) -> Result<Box<dyn Source>, SourceError>;
+
+    /// Every host and port a source built from `spec` connects to: the
+    /// server vets them against its [`crate::HostPolicy`] before each
+    /// connection (check, discover, every engine attempt, teardown).
+    /// Includes the hosts a seed list expands to when the connector expands
+    /// it itself (MongoDB `mongodb+srv` SRV records). Must not connect to
+    /// the origin. A config without a host is a `Config` error; an empty
+    /// list means the connector only talks to a provider's own endpoints
+    /// (AWS without `endpoint_url`).
+    ///
+    /// The default refuses, so a connector that does not declare its
+    /// endpoints cannot be used by the server.
+    async fn endpoints(&self, spec: &SourceSpec) -> Result<Vec<Endpoint>, SourceError> {
+        Err(SourceError::Config(format!(
+            "the {} connector does not declare the hosts it connects to",
+            spec.kind.as_str()
+        )))
+    }
 }

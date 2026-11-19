@@ -16,8 +16,10 @@
 //! - `invalidate` → the stream is reopened with `startAfter`.
 //! - Anything else (DDL events, unmapped namespaces) is skipped.
 //!
-//! The `_id` is the key (one JSON value: an ObjectId as its hex string, a
-//! compound `_id` as a JSON object) and also stays in the document body,
+//! The `_id` is the key, encoded by [`crate::key::key_of`] so that `_id`s of
+//! different types never share a document id (an ObjectId as its hex
+//! string, an integer as a number, other types as typed wrappers), and it
+//! also stays in the document body,
 //! converted to JSON like any other field. The engine injects the mapping's
 //! primary key separately, so the two never collide unless the mapping's
 //! primary key is literally `_id`, in which case the injected id wins.
@@ -28,7 +30,8 @@ use meili_connect_core::{Change, Op, SourceError, SourceEvent};
 use mongodb::bson::{Bson, Document};
 
 use crate::config::Target;
-use crate::convert::{bson_to_json, document_to_json};
+use crate::convert::document_to_json;
+use crate::key::key_of;
 
 /// Mapped namespaces, `(db, coll)` → the name the engine knows.
 #[derive(Debug, Clone, Default)]
@@ -153,7 +156,7 @@ pub fn map_event(ev: &Document, names: &Namespaces) -> Result<Mapped, SourceErro
                 "{op} event on {collection} without documentKey._id"
             ))
         })?;
-    let key = vec![bson_to_json(&id)];
+    let key = vec![key_of(&id)];
     let change = |op: Op| {
         Mapped::Events(vec![SourceEvent::Change(Change {
             collection: collection.clone(),
@@ -378,11 +381,54 @@ mod tests {
     }
 
     #[test]
-    fn compound_id_is_one_json_object() {
+    fn compound_id_is_one_typed_key() {
         let mut e = ev("delete", doc! {});
         e.insert("documentKey", doc! {"_id": {"tenant": 1_i32, "n": "a"}});
         let c = one_change(map_event(&e, &names()).unwrap());
-        assert_eq!(c.key, vec![json!({"tenant": 1, "n": "a"})]);
+        assert_eq!(
+            c.key,
+            vec![json!({"$document": [["tenant", 1], ["n", "a"]]})]
+        );
+    }
+
+    /// Mixed `_id` types in one collection: each document keeps its own
+    /// Meilisearch id, and its delete event targets that same id.
+    #[test]
+    fn mixed_id_types_never_collide_and_deletes_match_inserts() {
+        use meili_connect_core::document_id;
+        use mongodb::bson::{Binary, DateTime, spec::BinarySubtype};
+        let date = DateTime::from_millis(1_700_000_000_123);
+        let uuid = Binary {
+            subtype: BinarySubtype::Uuid,
+            bytes: hex::decode("0123456789abcdef0123456789abcdef").unwrap(),
+        };
+        let pairs: Vec<(Bson, Bson)> = vec![
+            (Bson::Int32(1), Bson::String("1".into())),
+            (Bson::ObjectId(oid()), Bson::String(oid().to_hex())),
+            (Bson::Int32(1), Bson::Double(1.0)),
+            (
+                Bson::DateTime(date),
+                Bson::String("2023-11-14T22:13:20.123Z".into()),
+            ),
+            (
+                Bson::Binary(uuid),
+                Bson::String("01234567-89ab-cdef-0123-456789abcdef".into()),
+            ),
+        ];
+        let id_of = |op: &str, id: &Bson| {
+            let mut e = ev(op, doc! {});
+            e.insert("documentKey", doc! {"_id": id.clone()});
+            if op == "insert" {
+                e.insert("fullDocument", doc! {"_id": id.clone()});
+            }
+            document_id(&one_change(map_event(&e, &names()).unwrap()).key)
+        };
+        for (a, b) in pairs {
+            assert_ne!(id_of("insert", &a), id_of("insert", &b), "{a:?} vs {b:?}");
+            for x in [&a, &b] {
+                assert_eq!(id_of("insert", x), id_of("delete", x), "{x:?}");
+            }
+        }
     }
 
     #[test]

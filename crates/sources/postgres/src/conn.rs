@@ -17,8 +17,13 @@ use crate::config::{ConnParams, SslMode};
 use crate::error::{self, Context};
 use crate::ident;
 
-/// Pinned so text output is the same everywhere (see `convert`).
-pub const SESSION_OPTIONS: &str = "-c datestyle=ISO,YMD -c timezone=UTC -c intervalstyle=iso_8601 -c bytea_output=hex -c extra_float_digits=3";
+/// Pinned so text output is the same everywhere (see `convert`), and so
+/// role or database timeouts never kill our long-lived sessions: slot
+/// creation waits for running transactions, the snapshot transaction idles
+/// under back-pressure. Startup options win over `ALTER ROLE ... SET`.
+/// (`idle_session_timeout` is set after connecting: it only exists from
+/// Postgres 14, and an unknown option would fail the connection.)
+pub const SESSION_OPTIONS: &str = "-c datestyle=ISO,YMD -c timezone=UTC -c intervalstyle=iso_8601 -c bytea_output=hex -c extra_float_digits=3 -c statement_timeout=0 -c idle_in_transaction_session_timeout=0";
 
 pub const APPLICATION_NAME: &str = "meili-connect";
 

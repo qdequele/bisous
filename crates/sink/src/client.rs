@@ -2,12 +2,17 @@
 //! polling. Never logs the API key (sent as a sensitive header) nor request
 //! bodies.
 
+use std::hash::{BuildHasher as _, Hasher as _};
 use std::io::Write as _;
-use std::time::Instant;
+use std::net::IpAddr;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use meili_connect_core::{MeiliDestination, SinkError};
-use reqwest::header::{AUTHORIZATION, CONTENT_ENCODING, CONTENT_TYPE, HeaderMap, HeaderValue};
+use meili_connect_core::{HostPolicy, MeiliDestination, SinkError};
+use reqwest::header::{
+    AUTHORIZATION, CONTENT_ENCODING, CONTENT_TYPE, HeaderMap, HeaderValue, RETRY_AFTER,
+};
 use reqwest::{Method, StatusCode, Url};
 use serde::Deserialize;
 
@@ -15,8 +20,30 @@ use crate::SinkOptions;
 
 /// Bodies above this size are gzipped on the blocking pool.
 const INLINE_GZIP_LIMIT: usize = 64 * 1024;
-/// Longest excerpt of an unparseable error body kept in a message.
-const RAW_ERROR_EXCERPT: usize = 200;
+
+/// Resolves the destination's name through the [`HostPolicy`] and hands
+/// hyper only the vetted addresses, so the connection goes where the policy
+/// looked (no second lookup for a DNS rebinding to change).
+struct PolicyResolver {
+    policy: Arc<HostPolicy>,
+    /// The destination URL's port: the client only ever talks to it.
+    port: u16,
+}
+
+impl reqwest::dns::Resolve for PolicyResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let policy = Arc::clone(&self.policy);
+        let host = name.as_str().to_owned();
+        let port = self.port;
+        Box::pin(async move {
+            let addrs = policy.resolve(&host, port).await.map_err(|e| {
+                tracing::warn!(error = %e, "Meilisearch destination refused by the host policy");
+                Box::new(e) as Box<dyn std::error::Error + Send + Sync>
+            })?;
+            Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
 
 /// Meilisearch's error object (`{message, code, type, link}`).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
@@ -44,6 +71,27 @@ impl std::fmt::Display for MeiliError {
 pub(crate) struct ApiError {
     pub status: StatusCode,
     pub error: MeiliError,
+    /// `Retry-After` in seconds, when the server sent one.
+    pub retry_after: Option<Duration>,
+}
+
+/// Which failures of one request are resent before surfacing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Retry {
+    /// Safe to repeat: 408, 429, 5xx and transport errors are retried.
+    Idempotent,
+    /// Repeating may apply it twice (an index swap swaps back): only
+    /// failures to connect, where nothing reached the server, are retried.
+    ConnectOnly,
+    /// The caller has its own retry loop.
+    Never,
+}
+
+/// A request body, serialized (and compressed) once and resent as is.
+struct Prepared {
+    body: Bytes,
+    content_type: &'static str,
+    gzip: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -109,11 +157,37 @@ impl Client {
             value.set_sensitive(true);
             headers.insert(AUTHORIZATION, value);
         }
-        let http = reqwest::Client::builder()
+        let policy = Arc::clone(&opts.host_policy);
+        let port = base.port_or_known_default().unwrap_or(80);
+        let host = base
+            .host_str()
+            .ok_or_else(|| SinkError::Config("invalid Meilisearch URL: no host".into()))?;
+        // hyper connects to a literal address without asking the resolver:
+        // vet it here, once (the URL never changes).
+        if let Ok(ip) = host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<IpAddr>()
+        {
+            policy
+                .check_ip(ip, Some(port))
+                .map_err(|e| SinkError::Config(format!("Meilisearch URL: {e}")))?;
+        }
+        let mut builder = reqwest::Client::builder()
             .default_headers(headers)
             .timeout(opts.request_timeout)
             .connect_timeout(opts.connect_timeout.min(opts.request_timeout))
             .user_agent(concat!("meili-connect/", env!("CARGO_PKG_VERSION")))
+            // A redirect would send the API key and the documents to a host
+            // nobody vetted.
+            .redirect(reqwest::redirect::Policy::none());
+        if !policy.is_any() {
+            // A proxy would resolve the name itself.
+            builder = builder
+                .no_proxy()
+                .dns_resolver(Arc::new(PolicyResolver { policy, port }));
+        }
+        let http = builder
             .build()
             .map_err(|e| SinkError::Config(format!("cannot build HTTP client: {e}")))?;
         Ok(Self { http, base, opts })
@@ -131,8 +205,7 @@ impl Client {
         Ok(url)
     }
 
-    /// Sends one request. Transport failures are `Err(SinkError::Transient)`;
-    /// HTTP failures come back as `Ok(Err(ApiError))` for the caller to map.
+    /// Sends one idempotent request, see [`Client::call_with`].
     pub async fn call(
         &self,
         method: Method,
@@ -140,46 +213,125 @@ impl Client {
         query: &[(&str, &str)],
         payload: Option<Payload>,
     ) -> Result<Reply, SinkError> {
+        self.call_with(Retry::Idempotent, method, segments, query, payload)
+            .await
+    }
+
+    /// Sends one request, resending it per `retry` up to `request_retries`
+    /// times with jittered exponential backoff (or the server's
+    /// `Retry-After`, capped at `max_request_backoff`). Transport failures
+    /// are `Err(SinkError::Transient)`; HTTP failures come back as
+    /// `Ok(Err(ApiError))` for the caller to map.
+    pub async fn call_with(
+        &self,
+        retry: Retry,
+        method: Method,
+        segments: &[&str],
+        query: &[(&str, &str)],
+        payload: Option<Payload>,
+    ) -> Result<Reply, SinkError> {
         let url = self.url(segments)?;
+        let path = segments.join("/");
+        let prepared = match payload {
+            None => None,
+            Some(Payload::Json(value)) => Some(Prepared {
+                body: serde_json::to_vec(&value)
+                    .map_err(|e| SinkError::Fatal(format!("cannot serialize request: {e}")))?
+                    .into(),
+                content_type: "application/json",
+                gzip: false,
+            }),
+            Some(Payload::Raw { body, content_type }) => Some(if self.opts.gzip {
+                Prepared {
+                    body: gzip(body).await?.into(),
+                    content_type,
+                    gzip: true,
+                }
+            } else {
+                Prepared {
+                    body: body.into(),
+                    content_type,
+                    gzip: false,
+                }
+            }),
+        };
+        let max_delay = self.opts.max_request_backoff;
+        let mut delay = self.opts.request_backoff.min(max_delay);
+        let mut attempt = 0;
+        loop {
+            let outcome = self
+                .send_once(method.clone(), url.clone(), query, prepared.as_ref())
+                .await;
+            let wait = match &outcome {
+                Err((_, connect)) if retry == Retry::Idempotent || *connect => None,
+                Ok(Err(api)) if retry == Retry::Idempotent && retryable_status(api.status) => {
+                    api.retry_after
+                }
+                _ => return outcome.map_err(|(e, _)| transport_error(&path, e)),
+            };
+            if attempt >= self.opts.request_retries || retry == Retry::Never {
+                return outcome.map_err(|(e, _)| transport_error(&path, e));
+            }
+            attempt += 1;
+            let wait = wait.unwrap_or_else(|| jitter(delay)).min(max_delay);
+            tracing::debug!(%path, attempt, ?wait, "retrying a failed request");
+            tokio::time::sleep(wait).await;
+            delay = delay.saturating_mul(2).min(max_delay);
+        }
+    }
+
+    /// One attempt. A transport error comes with whether it failed to
+    /// connect (nothing reached the server).
+    async fn send_once(
+        &self,
+        method: Method,
+        url: Url,
+        query: &[(&str, &str)],
+        prepared: Option<&Prepared>,
+    ) -> Result<Reply, (reqwest::Error, bool)> {
         let mut req = self.http.request(method, url);
         if !query.is_empty() {
             req = req.query(query);
         }
-        match payload {
-            None => {}
-            Some(Payload::Json(value)) => {
-                let body = serde_json::to_vec(&value)
-                    .map_err(|e| SinkError::Fatal(format!("cannot serialize request: {e}")))?;
-                req = req.header(CONTENT_TYPE, "application/json").body(body);
-            }
-            Some(Payload::Raw { body, content_type }) => {
-                req = req.header(CONTENT_TYPE, content_type);
-                if self.opts.gzip {
-                    req = req.header(CONTENT_ENCODING, "gzip").body(gzip(body).await?);
-                } else {
-                    req = req.body(body);
-                }
+        if let Some(p) = prepared {
+            req = req
+                .header(CONTENT_TYPE, p.content_type)
+                .body(p.body.clone());
+            if p.gzip {
+                req = req.header(CONTENT_ENCODING, "gzip");
             }
         }
-        let path = segments.join("/");
-        let resp = req.send().await.map_err(|e| transport_error(&path, e))?;
+        let resp = req.send().await.map_err(|e| {
+            let connect = e.is_connect();
+            (e, connect)
+        })?;
         let status = resp.status();
-        let body = resp.bytes().await.map_err(|e| transport_error(&path, e))?;
+        let retry_after = resp
+            .headers()
+            .get(RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map(Duration::from_secs);
+        let body = resp.bytes().await.map_err(|e| (e, false))?;
         if status.is_success() {
             return Ok(Ok(body));
         }
-        let error = serde_json::from_slice::<MeiliError>(&body).unwrap_or_else(|_| {
-            let text = String::from_utf8_lossy(&body);
-            let excerpt: String = text.chars().take(RAW_ERROR_EXCERPT).collect();
-            MeiliError {
-                message: format!("HTTP {status}: {excerpt}"),
-                ..MeiliError::default()
-            }
+        // A body that is not Meilisearch's error object is never echoed: the
+        // URL may point at something else, whose replies must not reach the
+        // tenant through error messages.
+        let error = serde_json::from_slice::<MeiliError>(&body).unwrap_or_else(|_| MeiliError {
+            message: format!("HTTP {status}: the reply is not a Meilisearch error"),
+            ..MeiliError::default()
         });
-        Ok(Err(ApiError { status, error }))
+        Ok(Err(ApiError {
+            status,
+            error,
+            retry_after,
+        }))
     }
 
-    /// `call` for routes that enqueue a task; returns the task uid.
+    /// An idempotent `call` for routes that enqueue a task; returns the
+    /// task uid.
     pub async fn enqueue(
         &self,
         method: Method,
@@ -187,7 +339,22 @@ impl Client {
         query: &[(&str, &str)],
         payload: Option<Payload>,
     ) -> Result<Result<u64, ApiError>, SinkError> {
-        match self.call(method, segments, query, payload).await? {
+        self.enqueue_with(Retry::Idempotent, method, segments, query, payload)
+            .await
+    }
+
+    pub async fn enqueue_with(
+        &self,
+        retry: Retry,
+        method: Method,
+        segments: &[&str],
+        query: &[(&str, &str)],
+        payload: Option<Payload>,
+    ) -> Result<Result<u64, ApiError>, SinkError> {
+        match self
+            .call_with(retry, method, segments, query, payload)
+            .await?
+        {
             Ok(body) => {
                 let e: Enqueued = serde_json::from_slice(&body).map_err(|e| {
                     SinkError::Fatal(format!("unexpected reply from Meilisearch: {e}"))
@@ -206,7 +373,10 @@ impl Client {
         let mut delay = self.opts.poll_interval;
         let uid_s = uid.to_string();
         loop {
-            let last_error = match self.call(Method::GET, &["tasks", &uid_s], &[], None).await {
+            let last_error = match self
+                .call_with(Retry::Never, Method::GET, &["tasks", &uid_s], &[], None)
+                .await
+            {
                 Ok(Ok(body)) => {
                     let task: Task = serde_json::from_slice(&body).map_err(|e| {
                         SinkError::Fatal(format!("unexpected task from Meilisearch: {e}"))
@@ -243,11 +413,15 @@ impl Client {
     pub async fn run_task(
         &self,
         context: &str,
+        retry: Retry,
         method: Method,
         segments: &[&str],
         payload: Option<Payload>,
     ) -> Result<Task, SinkError> {
-        let uid = match self.enqueue(method, segments, &[], payload).await? {
+        let uid = match self
+            .enqueue_with(retry, method, segments, &[], payload)
+            .await?
+        {
             Ok(uid) => uid,
             Err(api) => return Err(map_api_error(context, &api)),
         };
@@ -282,6 +456,25 @@ async fn gzip(body: Vec<u8>) -> Result<Vec<u8>, SinkError> {
             .map_err(|e| SinkError::Fatal(format!("gzip task panicked: {e}")))?
     };
     out.map_err(|e| SinkError::Fatal(format!("gzip failed: {e}")))
+}
+
+/// Statuses worth resending an idempotent request for.
+fn retryable_status(status: StatusCode) -> bool {
+    status == StatusCode::REQUEST_TIMEOUT
+        || status == StatusCode::TOO_MANY_REQUESTS
+        || status.is_server_error()
+}
+
+/// A delay drawn uniformly in `[d/2, d]`, so the retries of many clients
+/// spread out.
+pub(crate) fn jitter(d: Duration) -> Duration {
+    // A fresh RandomState is randomly keyed: enough randomness for this.
+    let r = std::collections::hash_map::RandomState::new()
+        .build_hasher()
+        .finish();
+    let half = d / 2;
+    let span = u64::try_from((d - half).as_nanos()).unwrap_or(u64::MAX);
+    half + Duration::from_nanos(r % span.saturating_add(1))
 }
 
 fn is_config_code(code: &str) -> bool {
@@ -325,9 +518,9 @@ pub(crate) enum DocFailure {
     PerDocument(String),
     /// Could be one document or an outage: `vector_embedding_error` (bad
     /// document or embedder down) and `internal` (Meilisearch reports some
-    /// malformed fields, e.g. a non-object `_vectors`, as internal errors).
-    /// Bisected like a per-document error, but turned into a transient error
-    /// when no document of the run got through.
+    /// malformed documents, e.g. a non-object `_vectors`, as internal
+    /// errors). Bisected like a per-document error; an isolated document is
+    /// resent, and rejected only when it is provably at fault.
     Suspect(String),
     /// Not the documents' fault.
     Global(SinkError),
@@ -349,7 +542,6 @@ pub(crate) fn classify_doc_failure(error: &MeiliError) -> DocFailure {
                 "index_not_found"
                     | "index_already_exists"
                     | "index_creation_failed"
-                    | "malformed_payload"
                     | "payload_too_large"
             ) {
                 DocFailure::Global(SinkError::Fatal(msg()))

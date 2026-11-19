@@ -1,0 +1,87 @@
+# Local stack: meili-connect, its state database, a Meilisearch, and a demo
+# origin Postgres with logical replication on and a `products` table.
+#
+#   cp .env.example .env    # then set CONNECT_SECRET_KEY (openssl rand -base64 32)
+#   docker compose up -d --build
+#   curl localhost:8080/health
+#
+# The API is published on 127.0.0.1 only and requires the dev admin key
+# (`Authorization: Bearer $ADMIN_API_KEY`, default `dev-admin-key-change-me`).
+#
+# The README walks through creating a sync from `origin` to `meilisearch`.
+
+name: meili-connect
+
+services:
+  connect:
+    build: .
+    image: meili-connect:local
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      LISTEN_ADDR: 0.0.0.0:8080
+      ADMIN_API_KEY: ${ADMIN_API_KEY:-dev-admin-key-change-me}
+      DATABASE_URL: postgres://connect:connect@state:5432/connect
+      CONNECT_SECRET_KEY: ${CONNECT_SECRET_KEY:?set CONNECT_SECRET_KEY in .env (openssl rand -base64 32)}
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      state:
+        condition: service_healthy
+    restart: unless-stopped
+
+  state:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: connect
+      POSTGRES_PASSWORD: connect
+      POSTGRES_DB: connect
+    volumes:
+      - state:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U connect -d connect"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  meilisearch:
+    image: getmeili/meilisearch:v1.54.3
+    environment:
+      MEILI_MASTER_KEY: ${MEILI_MASTER_KEY:-dev-master-key-change-me}
+      MEILI_NO_ANALYTICS: "true"
+    ports:
+      - "127.0.0.1:7700:7700"
+    volumes:
+      - meili:/meili_data
+
+  # A demo origin. wal_level=logical is what CDC from Postgres needs.
+  origin:
+    image: postgres:17
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - max_replication_slots=10
+      - -c
+      - max_wal_senders=10
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app
+      POSTGRES_DB: app
+    ports:
+      - "127.0.0.1:5433:5432"
+    volumes:
+      - origin:/var/lib/postgresql/data
+      - ./scripts/demo-origin.sql:/docker-entrypoint-initdb.d/demo.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d app"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  state:
+  meili:
+  origin:

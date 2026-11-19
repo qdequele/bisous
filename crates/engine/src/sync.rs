@@ -8,14 +8,15 @@
 //! the ack channel.
 
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use chrono::Utc;
 use meili_connect_core::{
-    AckReceiver, AckSender, Checkpoint, DeadLetter, DocOp, IndexTarget, Opened, Sink, SinkError,
-    Source, SourceError, SourceEvent, SourceFactory, StateStore, StoreError, SyncPhase, SyncSpec,
-    SyncState, ack_channel,
+    AckReceiver, AckSender, Checkpoint, DeadLetter, DocOp, DocumentKind, IndexTarget, Lag,
+    LagReporter, LagWatch, Opened, Progress, ResyncReason, Sink, SinkError, Source, SourceError,
+    SourceEvent, SourceFactory, StateStore, StoreError, SyncPhase, SyncSpec, SyncState, Usage,
+    ack_channel,
 };
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
@@ -55,6 +56,9 @@ pub struct SyncOptions {
     /// Ignore the saved checkpoint and rebuild every index from a fresh
     /// snapshot, through shadow indexes when the live ones hold data.
     pub resync: bool,
+    /// Who asked for `resync`: the user (metered as `documents_snapshot`)
+    /// or the engine after a lost position (`documents_resync`).
+    pub resync_reason: ResyncReason,
 }
 
 impl Default for SyncOptions {
@@ -67,6 +71,7 @@ impl Default for SyncOptions {
             shutdown_grace: Duration::from_secs(10),
             release_hold: false,
             resync: false,
+            resync_reason: ResyncReason::User,
         }
     }
 }
@@ -77,25 +82,213 @@ pub fn shadow_index_uid(index: &str, sync_id: &str) -> String {
     format!("{index}__connect_{short}")
 }
 
-/// How many `PositionLost` in a row one call turns into a resync before
-/// handing the error to the caller.
+/// How many `PositionLost` in a row a plain [`run_sync`] call turns into a
+/// resync before holding the sync.
 const MAX_RESYNCS_PER_RUN: u32 = 3;
+
+/// What the runs of one supervised sync share across attempts: the budget
+/// of consecutive resyncs and which one-shot requests a run consumed.
+/// Cheap to clone; clones share their state.
+#[derive(Debug, Clone)]
+pub struct RunMonitor {
+    inner: Arc<Mutex<MonitorState>>,
+    max_consecutive_resyncs: u32,
+    healthy_after: Duration,
+    /// Handed to every source built: its lag while it streams.
+    lag: LagReporter,
+    lag_watch: LagWatch,
+}
+
+#[derive(Debug, Default)]
+struct MonitorState {
+    consecutive_resyncs: u32,
+    /// Start of the current streaming period, while one is running.
+    streaming_since: Option<Instant>,
+    /// A streaming period lasted `healthy_after` since the last
+    /// [`RunMonitor::take_streamed_healthily`].
+    streamed_healthily: bool,
+    resync_consumed: bool,
+    release_consumed: bool,
+    /// Start of the current period in `snapshotting` or `streaming`.
+    active_since: Option<Instant>,
+    /// Time spent active and not yet taken by
+    /// [`RunMonitor::take_active_seconds`].
+    active: Duration,
+    /// When a checkpoint was last saved.
+    last_checkpoint: Option<Instant>,
+}
+
+impl MonitorState {
+    /// Folds a streaming period that is already healthy into the counters.
+    fn settle(&mut self, healthy_after: Duration) {
+        if self
+            .streaming_since
+            .is_some_and(|since| since.elapsed() >= healthy_after)
+        {
+            self.consecutive_resyncs = 0;
+            self.streamed_healthily = true;
+        }
+    }
+}
+
+impl RunMonitor {
+    /// A resync caused by `PositionLost` counts as consecutive until the
+    /// sync has streamed for `healthy_after` without interruption; past
+    /// `max_consecutive_resyncs` the sync is held instead.
+    pub fn new(max_consecutive_resyncs: u32, healthy_after: Duration) -> Self {
+        let (lag, lag_watch) = LagReporter::new();
+        Self {
+            inner: Arc::new(Mutex::new(MonitorState {
+                // Progress is measured from the start of supervision.
+                last_checkpoint: Some(Instant::now()),
+                ..MonitorState::default()
+            })),
+            max_consecutive_resyncs,
+            healthy_after,
+            lag,
+            lag_watch,
+        }
+    }
+
+    /// How far behind its origin the running source is, when it can tell
+    /// (`None` while not streaming).
+    pub fn lag(&self) -> Option<Lag> {
+        *self.lag_watch.borrow()
+    }
+
+    fn state(&self) -> MutexGuard<'_, MonitorState> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Resyncs started after a lost position since the last healthy
+    /// streaming period.
+    pub fn consecutive_resyncs(&self) -> u32 {
+        let mut st = self.state();
+        st.settle(self.healthy_after);
+        st.consecutive_resyncs
+    }
+
+    /// Whether a run reached the point where the requested resync is
+    /// persisted (`SyncState::resyncing`). Resets the flag.
+    pub fn take_resync_consumed(&self) -> bool {
+        std::mem::take(&mut self.state().resync_consumed)
+    }
+
+    /// Whether a run applied the action a guard had held. Resets the flag.
+    pub fn take_release_consumed(&self) -> bool {
+        std::mem::take(&mut self.state().release_consumed)
+    }
+
+    /// Whether a streaming period lasted `healthy_after`. Resets the flag.
+    pub fn take_streamed_healthily(&self) -> bool {
+        let mut st = self.state();
+        st.settle(self.healthy_after);
+        std::mem::take(&mut st.streamed_healthily)
+    }
+
+    fn streaming_started(&self) {
+        self.state().streaming_since = Some(Instant::now());
+    }
+
+    fn streaming_stopped(&self) {
+        let mut st = self.state();
+        st.settle(self.healthy_after);
+        st.streaming_since = None;
+    }
+
+    /// Takes one resync from the budget; `false` once it is spent.
+    fn begin_resync(&self) -> bool {
+        let mut st = self.state();
+        st.settle(self.healthy_after);
+        st.streaming_since = None;
+        if st.consecutive_resyncs >= self.max_consecutive_resyncs {
+            return false;
+        }
+        st.consecutive_resyncs += 1;
+        true
+    }
+
+    fn resync_persisted(&self) {
+        self.state().resync_consumed = true;
+    }
+
+    /// A period in `snapshotting` or `streaming` starts (idempotent).
+    fn activate(&self) {
+        let mut st = self.state();
+        if st.active_since.is_none() {
+            st.active_since = Some(Instant::now());
+        }
+    }
+
+    /// The active period ends; its time waits for
+    /// [`RunMonitor::take_active_seconds`].
+    fn deactivate(&self) {
+        let mut st = self.state();
+        if let Some(since) = st.active_since.take() {
+            st.active += since.elapsed();
+        }
+    }
+
+    /// Whole seconds spent in `snapshotting` or `streaming` since the last
+    /// call (the fraction is carried over): the `sync_seconds` unit.
+    pub fn take_active_seconds(&self) -> u64 {
+        let mut st = self.state();
+        if let Some(since) = st.active_since {
+            let now = Instant::now();
+            st.active += now.saturating_duration_since(since);
+            st.active_since = Some(now);
+        }
+        let whole = st.active.as_secs();
+        st.active -= Duration::from_secs(whole);
+        whole
+    }
+
+    /// A checkpoint was saved.
+    fn checkpointed(&self) {
+        self.state().last_checkpoint = Some(Instant::now());
+    }
+
+    /// How long ago a run of this monitor last saved a checkpoint (or,
+    /// before the first one, since the monitor was created).
+    pub fn since_last_checkpoint(&self) -> Option<Duration> {
+        self.state().last_checkpoint.map(|t| t.elapsed())
+    }
+
+    fn release_applied(&self) {
+        self.state().release_consumed = true;
+    }
+}
 
 /// Runs one sync until it is cancelled (`Ok`) or an error stops it.
 ///
 /// `PositionLost` (from `open` or `stream`) and `options.resync` are handled
-/// here by a resync into shadow indexes. Guards save the state as `Held`
-/// and return [`EngineError::Held`]. Every other error is returned as is;
-/// mapping it to a phase and a retry policy is the supervisor's job.
+/// here by a resync into shadow indexes, at most three in a row; past that
+/// the sync is held. Guards save the state as `Held` and return
+/// [`EngineError::Held`]. Every other error is returned as is; mapping it
+/// to a phase and a retry policy is the supervisor's job.
 pub async fn run_sync(
     spec: SyncSpec,
     deps: SyncDeps,
     options: SyncOptions,
     cancel: CancellationToken,
 ) -> Result<(), EngineError> {
-    if spec.streams.is_empty() {
-        return Err(EngineError::Spec("the sync has no streams".into()));
-    }
+    let monitor = RunMonitor::new(MAX_RESYNCS_PER_RUN, Duration::MAX);
+    run_sync_monitored(spec, deps, options, cancel, &monitor).await
+}
+
+/// [`run_sync`] with a [`RunMonitor`] shared across calls, so the resync
+/// budget spans attempts and the caller learns which one-shot requests
+/// (`options.resync`, `options.release_hold`) were consumed.
+pub async fn run_sync_monitored(
+    spec: SyncSpec,
+    deps: SyncDeps,
+    options: SyncOptions,
+    cancel: CancellationToken,
+    monitor: &RunMonitor,
+) -> Result<(), EngineError> {
+    spec.validate().map_err(EngineError::Spec)?;
     let loaded = match guarded(&cancel, deps.store.load(&spec.id)).await {
         Ok(state) => state,
         Err(Halt::Cancelled) => return Ok(()),
@@ -107,6 +300,7 @@ pub async fn run_sync(
         checkpoint: None,
         message: None,
         resyncing: false,
+        resync_reason: None,
         updated_at: Utc::now(),
     });
     let live = spec
@@ -118,27 +312,58 @@ pub async fn run_sync(
         })
         .collect();
     let mut resync = options.resync || state.resyncing;
+    // A resync persisted without its reason predates the field: free.
+    let mut reason = if options.resync {
+        options.resync_reason
+    } else {
+        state.resync_reason.unwrap_or(ResyncReason::System)
+    };
     let mut runner = Runner {
         mapper: Mapper::new(&spec.streams),
         spec: &spec,
         deps: &deps,
         opts: &options,
         cancel: &cancel,
+        monitor,
         live,
         state,
         release: options.release_hold,
     };
 
-    let mut lost = 0;
     loop {
-        match runner.attempt(resync).await {
+        let attempted = runner.attempt(resync, reason).await;
+        monitor.deactivate();
+        // Not streaming any more: whatever the source last said is stale.
+        monitor.lag.clear();
+        match attempted {
             Ok(()) | Err(Halt::Cancelled) => return Ok(()),
-            Err(Halt::Error(EngineError::Source(SourceError::PositionLost(reason))))
-                if lost < MAX_RESYNCS_PER_RUN =>
-            {
-                lost += 1;
-                warn!(sync_id = %spec.id, %reason, "source position lost, resyncing");
-                resync = true;
+            Err(Halt::Error(EngineError::Source(SourceError::PositionLost(lost)))) => {
+                if monitor.begin_resync() {
+                    warn!(sync_id = %spec.id, reason = %lost, "source position lost, resyncing");
+                    resync = true;
+                    reason = ResyncReason::System;
+                    continue;
+                }
+                let message = format!(
+                    "the source position was lost again after {} resyncs in a row ({reason}): \
+                     the origin keeps its changes for less time than a snapshot takes. Raise \
+                     the origin's retention (replication slot WAL limit, binlog expiry, oplog \
+                     size, stream retention), then resync",
+                    monitor.max_consecutive_resyncs,
+                    reason = lost,
+                );
+                warn!(sync_id = %spec.id, %message, "sync held");
+                let saved = message.clone();
+                let persisted = runner
+                    .update(move |s| {
+                        s.phase = SyncPhase::Held;
+                        s.message = Some(saved);
+                    })
+                    .await;
+                if let Err(Halt::Error(e)) = persisted {
+                    warn!(sync_id = %spec.id, error = %e, "could not persist the hold");
+                }
+                return Err(EngineError::Held(message));
             }
             Err(Halt::Error(e)) => return Err(e),
         }
@@ -192,8 +417,8 @@ type SourceTask = JoinHandle<(Box<dyn Source>, Result<(), SourceError>)>;
 
 #[derive(Clone, Copy)]
 enum Mode<'a> {
-    /// Writes only; no checkpoints, no guards.
-    Snapshot,
+    /// Writes only; no checkpoints, no guards. Metered as this kind.
+    Snapshot(DocumentKind),
     /// Writes, guards, checkpoints and acks.
     Stream(&'a AckSender),
 }
@@ -202,6 +427,9 @@ enum Mode<'a> {
 /// checkpoint is kept.
 struct Batch {
     ops: Vec<Vec<DocOp>>,
+    /// Records the source skipped (`SourceEvent::Skipped`), dead-lettered
+    /// with the batch.
+    skipped: Vec<DeadLetter>,
     docs: usize,
     bytes: usize,
     checkpoint: Option<Checkpoint>,
@@ -212,6 +440,7 @@ impl Batch {
     fn new(indexes: usize) -> Self {
         Self {
             ops: vec![Vec::new(); indexes],
+            skipped: Vec::new(),
             docs: 0,
             bytes: 0,
             checkpoint: None,
@@ -238,6 +467,13 @@ impl Batch {
         self.touch();
     }
 
+    fn skip(&mut self, letter: DeadLetter) {
+        self.bytes += letter.document_id.len() + letter.reason.len();
+        self.docs += 1;
+        self.skipped.push(letter);
+        self.touch();
+    }
+
     fn age(&self) -> Duration {
         self.started.map(|s| s.elapsed()).unwrap_or_default()
     }
@@ -252,6 +488,7 @@ struct Runner<'a> {
     deps: &'a SyncDeps,
     opts: &'a SyncOptions,
     cancel: &'a CancellationToken,
+    monitor: &'a RunMonitor,
     mapper: Mapper,
     /// Live targets, one per mapping, same order as `spec.streams`.
     live: Vec<IndexTarget>,
@@ -271,23 +508,37 @@ impl Runner<'_> {
         Ok(())
     }
 
-    async fn attempt(&mut self, resync: bool) -> Result<(), Halt> {
+    async fn attempt(&mut self, resync: bool, reason: ResyncReason) -> Result<(), Halt> {
         let mut source =
             self.deps
                 .sources
                 .build(&self.spec.id, &self.spec.source, &self.spec.streams)?;
+        self.monitor.lag.clear();
+        source.report_lag(self.monitor.lag.clone());
         let resume = if resync {
             None
         } else {
             self.state.checkpoint.clone()
         };
-        if resync && !self.state.resyncing {
+        if resync && (!self.state.resyncing || self.state.resync_reason != Some(reason)) {
             self.update(|s| {
                 s.resyncing = true;
+                s.resync_reason = Some(reason);
                 s.phase = SyncPhase::Snapshotting;
                 s.message = None;
             })
             .await?;
+        }
+        // A first sync, or a resync the user asked for, is a snapshot; a
+        // resync the engine started is metered apart (free).
+        let kind = if resync && reason == ResyncReason::System {
+            DocumentKind::Resync
+        } else {
+            DocumentKind::Snapshot
+        };
+        if resync {
+            // From here on the saved state carries the resync.
+            self.monitor.resync_persisted();
         }
 
         let opened = guarded(self.cancel, source.open(resume.clone())).await?;
@@ -295,15 +546,17 @@ impl Runner<'_> {
         match opened {
             Opened::Fresh { start } => {
                 info!(sync_id = %self.spec.id, resync, "fresh start");
-                source = self.initial_load(source).await?;
+                source = self.initial_load(source, kind).await?;
                 let saved = start.clone();
                 self.update(move |s| {
                     s.checkpoint = Some(saved);
                     s.phase = SyncPhase::Streaming;
                     s.message = None;
                     s.resyncing = false;
+                    s.resync_reason = None;
                 })
                 .await?;
+                self.monitor.checkpointed();
                 acks.send_replace(Some(start));
             }
             Opened::Resumed => {
@@ -320,6 +573,7 @@ impl Runner<'_> {
                         s.phase = SyncPhase::Streaming;
                         s.message = None;
                         s.resyncing = false;
+                        s.resync_reason = None;
                     })
                     .await?;
                 }
@@ -327,24 +581,34 @@ impl Runner<'_> {
         }
 
         let live = self.live.clone();
-        self.pump(source, &live, Mode::Stream(&acks), Some(acks_rx))
-            .await
-            .map(|_| ())
+        self.monitor.activate();
+        self.monitor.streaming_started();
+        let streamed = self
+            .pump(source, &live, Mode::Stream(&acks), Some(acks_rx))
+            .await;
+        self.monitor.streaming_stopped();
+        streamed.map(|_| ())
     }
 
     /// Prepares the targets (shadow indexes for live indexes that hold
     /// data), runs the snapshot when the source can, then swaps the shadows
     /// in.
-    async fn initial_load(&mut self, source: Box<dyn Source>) -> Result<Box<dyn Source>, Halt> {
+    async fn initial_load(
+        &mut self,
+        source: Box<dyn Source>,
+        kind: DocumentKind,
+    ) -> Result<Box<dyn Source>, Halt> {
         let snapshot = source.capabilities().snapshot;
         let sink = Arc::clone(&self.deps.sink);
         let mut targets = Vec::with_capacity(self.live.len());
         let mut swaps: Vec<(IndexTarget, IndexTarget)> = Vec::new();
+        // Every live index first: one keyed differently fails with the
+        // sink's `Config` error before any shadow is built, since a swap
+        // would otherwise replace it.
+        for live in &self.live {
+            guarded(self.cancel, sink.ensure_index(live)).await?;
+        }
         for live in self.live.clone() {
-            if let Some((_, shadow)) = swaps.iter().find(|(l, _)| l.uid == live.uid) {
-                targets.push(shadow.clone());
-                continue;
-            }
             let populated = snapshot
                 && guarded(self.cancel, sink.document_count(&live.uid))
                     .await?
@@ -363,7 +627,6 @@ impl Runner<'_> {
                 targets.push(shadow.clone());
                 swaps.push((live, shadow));
             } else {
-                guarded(self.cancel, sink.ensure_index(&live)).await?;
                 targets.push(live);
             }
         }
@@ -373,12 +636,30 @@ impl Runner<'_> {
             s.phase = SyncPhase::Snapshotting;
             s.message = None;
             s.resyncing = resyncing;
+            if !resyncing {
+                s.resync_reason = None;
+            } else if s.resync_reason.is_none() {
+                // Shadows for a first sync into populated indexes (a PUT
+                // that changed the streams): the user's doing.
+                s.resync_reason = Some(match kind {
+                    DocumentKind::Resync => ResyncReason::System,
+                    _ => ResyncReason::User,
+                });
+            }
         })
         .await?;
+        self.monitor.activate();
 
         let source = if snapshot {
             info!(sync_id = %self.spec.id, shadows = swaps.len(), "snapshot started");
-            let source = self.pump(source, &targets, Mode::Snapshot, None).await?;
+            let source = self
+                .pump(source, &targets, Mode::Snapshot(kind), None)
+                .await?;
+            // A source returns `Ok` from a cancelled snapshot: never take
+            // that for a complete one.
+            if self.cancel.is_cancelled() {
+                return Err(Halt::Cancelled);
+            }
             info!(sync_id = %self.spec.id, "snapshot done");
             source
         } else {
@@ -437,7 +718,7 @@ impl Runner<'_> {
             return Err(Halt::Cancelled);
         }
         match mode {
-            Mode::Snapshot => {
+            Mode::Snapshot(_) => {
                 self.flush(&mut batch, targets, mode).await?;
                 Ok(source)
             }
@@ -528,6 +809,29 @@ impl Runner<'_> {
             SourceEvent::SchemaChanged { collection } => {
                 debug!(sync_id = %self.spec.id, %collection, "schema changed");
             }
+            SourceEvent::Skipped {
+                collection,
+                position,
+                reason,
+            } => {
+                let index = self
+                    .mapper
+                    .indexes_for(&collection)
+                    .first()
+                    .and_then(|&i| self.live.get(i))
+                    .map_or(collection, |t| t.uid.clone());
+                batch.skip(DeadLetter {
+                    sync_id: self.spec.id.clone(),
+                    index,
+                    document_id: position,
+                    payload: Value::Null,
+                    reason,
+                    created_at: Utc::now(),
+                });
+                if batch.docs >= self.opts.max_docs || batch.bytes >= self.opts.max_bytes {
+                    self.flush(batch, targets, mode).await?;
+                }
+            }
         }
         Ok(())
     }
@@ -544,16 +848,26 @@ impl Runner<'_> {
             return Ok(());
         }
         let Batch {
-            ops, checkpoint, ..
+            ops,
+            skipped,
+            checkpoint,
+            started,
+            ..
         } = batch.take();
         let ops: Vec<Vec<DocOp>> = ops.into_iter().map(coalesce).collect();
 
-        if let Mode::Stream(_) = mode {
-            self.mass_delete_guard(&ops, targets).await?;
-        }
+        let released = match mode {
+            Mode::Stream(_) => self.mass_delete_guard(&ops, targets).await?,
+            Mode::Snapshot(_) => false,
+        };
+        let kind = match mode {
+            Mode::Stream(_) => DocumentKind::Streamed,
+            Mode::Snapshot(kind) => kind,
+        };
 
-        let (mut written, mut deleted, mut rejected) = (0u64, 0u64, 0u64);
-        let mut letters = Vec::new();
+        let (mut written, mut deleted, mut bytes) = (0u64, 0u64, 0u64);
+        let mut rejected = skipped.len() as u64;
+        let mut letters = skipped;
         for (index, ops) in ops.into_iter().enumerate() {
             if ops.is_empty() {
                 continue;
@@ -564,6 +878,7 @@ impl Runner<'_> {
             let report = guarded(self.cancel, self.deps.sink.apply(target, ops)).await?;
             written += report.written;
             deleted += report.deleted;
+            bytes = bytes.saturating_add(report.bytes);
             rejected += report.rejected.len() as u64;
             let live_uid = self.live.get(index).map_or(&target.uid, |t| &t.uid);
             for doc in report.rejected {
@@ -577,19 +892,30 @@ impl Runner<'_> {
                 });
             }
         }
+        if released {
+            self.monitor.release_applied();
+        }
         if !letters.is_empty() {
-            warn!(sync_id = %self.spec.id, count = letters.len(), "documents rejected, dead-lettered");
+            warn!(sync_id = %self.spec.id, count = letters.len(), "documents rejected or skipped, dead-lettered");
             guarded(self.cancel, self.deps.store.push_dead_letters(&letters)).await?;
         }
         if written + deleted + rejected > 0 {
+            // Only what Meilisearch accepted is metered.
+            let mut usage = Usage::documents(kind, written.saturating_add(deleted));
+            usage.bytes = bytes;
+            let progress = Progress {
+                written,
+                deleted,
+                rejected,
+                usage,
+                batch_age: started.map(|s| s.elapsed()),
+            };
             guarded(
                 self.cancel,
-                self.deps
-                    .store
-                    .record_progress(&self.spec.id, written, deleted, rejected),
+                self.deps.store.record_progress(&self.spec.id, &progress),
             )
             .await?;
-            debug!(sync_id = %self.spec.id, written, deleted, rejected, "batch applied");
+            debug!(sync_id = %self.spec.id, written, deleted, rejected, bytes, ?kind, "batch applied");
         }
 
         if let (Mode::Stream(acks), Some(checkpoint)) = (mode, checkpoint)
@@ -597,19 +923,22 @@ impl Runner<'_> {
         {
             let saved = checkpoint.clone();
             self.update(move |s| s.checkpoint = Some(saved)).await?;
+            self.monitor.checkpointed();
             // Only now is the position durable.
             acks.send_replace(Some(checkpoint));
         }
         Ok(())
     }
 
+    /// `Ok(true)` when the guard tripped and a pending release let the
+    /// batch through.
     async fn mass_delete_guard(
         &mut self,
         ops: &[Vec<DocOp>],
         targets: &[IndexTarget],
-    ) -> Result<(), Halt> {
+    ) -> Result<bool, Halt> {
         let Some(limit) = self.spec.mass_delete_guard else {
-            return Ok(());
+            return Ok(false);
         };
         let mut tripped = None;
         for (index, ops) in ops.iter().enumerate() {
@@ -638,19 +967,19 @@ impl Runner<'_> {
         }
         match tripped {
             Some(message) => self.hold_or_release(message).await,
-            None => Ok(()),
+            None => Ok(false),
         }
     }
 
+    /// Empties the index of a truncated collection, keeping its settings.
+    /// `SyncSpec::validate` guarantees one index per collection and one
+    /// collection per index, so nothing else lives in it.
     async fn truncate(&mut self, collection: &str) -> Result<(), Halt> {
         let mut to_clear: Vec<(IndexTarget, u64)> = Vec::new();
         for &index in self.mapper.indexes_for(collection) {
             let Some(target) = self.live.get(index).cloned() else {
                 continue;
             };
-            if to_clear.iter().any(|(t, _)| t.uid == target.uid) {
-                continue;
-            }
             let count = guarded(self.cancel, self.deps.sink.document_count(&target.uid)).await?;
             if let Some(count) = count
                 && count > 0
@@ -661,6 +990,7 @@ impl Runner<'_> {
         if to_clear.is_empty() {
             return Ok(());
         }
+        let mut released = false;
         if let Some(limit) = self.spec.mass_delete_guard
             && let Some((target, count)) = to_clear.iter().find(|(_, c)| exceeds(*c, *c, limit))
         {
@@ -669,36 +999,29 @@ impl Runner<'_> {
                  of index `{}`",
                 target.uid
             );
-            self.hold_or_release(message).await?;
+            released = self.hold_or_release(message).await?;
         }
         for (target, _) in to_clear {
-            self.clear_index(&target).await?;
+            guarded(
+                self.cancel,
+                self.deps.sink.delete_all_documents(&target.uid),
+            )
+            .await?;
+            info!(sync_id = %self.spec.id, index = %target.uid, "index cleared after a truncate");
+        }
+        if released {
+            self.monitor.release_applied();
         }
         Ok(())
     }
 
-    /// Empties an index but keeps its settings: swap in an empty shadow
-    /// built with the same settings, then drop the old content.
-    async fn clear_index(&mut self, live: &IndexTarget) -> Result<(), Halt> {
-        let sink = Arc::clone(&self.deps.sink);
-        let shadow = IndexTarget {
-            uid: shadow_index_uid(&live.uid, &self.spec.id),
-            primary_key: live.primary_key.clone(),
-        };
-        guarded(self.cancel, sink.delete_index(&shadow.uid)).await?;
-        guarded(self.cancel, sink.ensure_index(&shadow)).await?;
-        guarded(self.cancel, sink.copy_settings(&live.uid, &shadow.uid)).await?;
-        guarded(self.cancel, sink.swap(&live.uid, &shadow.uid)).await?;
-        guarded(self.cancel, sink.delete_index(&shadow.uid)).await?;
-        info!(sync_id = %self.spec.id, index = %live.uid, "index cleared after a truncate");
-        Ok(())
-    }
-
-    async fn hold_or_release(&mut self, message: String) -> Result<(), Halt> {
+    /// Holds the sync, or returns `Ok(true)` when a pending release lets
+    /// the action through (once per run).
+    async fn hold_or_release(&mut self, message: String) -> Result<bool, Halt> {
         if self.release {
             self.release = false;
             info!(sync_id = %self.spec.id, %message, "hold released, applying");
-            return Ok(());
+            return Ok(true);
         }
         warn!(sync_id = %self.spec.id, %message, "sync held");
         let saved = message.clone();
@@ -788,5 +1111,43 @@ mod tests {
         };
         assert!(op_size(&big) > 1000);
         assert!(op_size(&small) < 10);
+    }
+
+    #[tokio::test]
+    async fn only_active_time_is_metered_in_whole_seconds() {
+        let monitor = RunMonitor::new(1, Duration::MAX);
+        assert_eq!(monitor.take_active_seconds(), 0);
+        monitor.activate();
+        monitor.activate(); // idempotent
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert_eq!(monitor.take_active_seconds(), 1, "taken while running");
+        monitor.deactivate();
+        assert_eq!(monitor.take_active_seconds(), 0, "the fraction waits");
+        // Inactive (held, paused): nothing accrues.
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        assert_eq!(monitor.take_active_seconds(), 0);
+    }
+
+    #[tokio::test]
+    async fn the_resync_budget_resets_after_healthy_streaming() {
+        let monitor = RunMonitor::new(2, Duration::from_millis(20));
+        assert!(monitor.begin_resync());
+        assert!(monitor.begin_resync());
+        assert!(!monitor.begin_resync(), "budget spent");
+
+        // A short streaming period does not count as healthy.
+        monitor.streaming_started();
+        monitor.streaming_stopped();
+        assert!(!monitor.begin_resync());
+        assert!(!monitor.take_streamed_healthily());
+
+        monitor.streaming_started();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        monitor.streaming_stopped();
+        assert_eq!(monitor.consecutive_resyncs(), 0);
+        assert!(monitor.take_streamed_healthily());
+        assert!(!monitor.take_streamed_healthily(), "reset once taken");
+        assert!(monitor.begin_resync());
+        assert_eq!(monitor.consecutive_resyncs(), 1);
     }
 }

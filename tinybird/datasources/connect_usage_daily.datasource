@@ -1,0 +1,24 @@
+#
+# connect_usage_daily — daily rollup of connect_usage per tenant, sync and
+# source kind, kept up to date by the connect_usage_daily_mv materialized
+# pipe. For dashboards: a materialized view is a trigger on INSERT and does
+# not see the raw table's deduplication, so a redelivered row is counted
+# twice here. Reconciliation reads connect_usage FINAL (the
+# connect_tenant_usage pipe).
+#
+
+SCHEMA >
+    `day` Date,
+    `tenant_id` String,
+    `sync_id` String,
+    `source_kind` LowCardinality(String),
+    `rows_count` SimpleAggregateFunction(sum, UInt64),
+    `documents_streamed` SimpleAggregateFunction(sum, UInt64),
+    `documents_snapshot` SimpleAggregateFunction(sum, UInt64),
+    `documents_resync` SimpleAggregateFunction(sum, UInt64),
+    `bytes` SimpleAggregateFunction(sum, UInt64),
+    `sync_seconds` SimpleAggregateFunction(sum, UInt64)
+
+ENGINE "AggregatingMergeTree"
+ENGINE_SORTING_KEY "tenant_id, day, sync_id, source_kind"
+ENGINE_PARTITION_KEY "toYYYYMM(day)"

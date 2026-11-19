@@ -265,6 +265,205 @@ async fn index_operations() {
     s.delete_index(&live_ix.uid).await.unwrap();
 }
 
+async fn patch_settings(l: &Live, index: &str, settings: Value) {
+    let resp = reqwest::Client::new()
+        .patch(format!("{}/indexes/{index}/settings", l.url))
+        .bearer_auth(&l.key)
+        .json(&settings)
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "{}", resp.text().await.unwrap());
+    let task: Value = resp.json().await.unwrap();
+    wait_task(l, task["taskUid"].as_u64().unwrap()).await;
+}
+
+/// Documents Meilisearch refuses for good are rejected, including those it
+/// reports as `internal` or `vector_embedding_error`; good ones are written.
+#[tokio::test]
+async fn poison_vectors_are_rejected() {
+    let Some(l) = live() else { return };
+    let s = sink(
+        &l,
+        SinkOptions {
+            suspect_backoff: Duration::from_millis(10),
+            ..opts()
+        },
+    );
+    let target = IndexTarget {
+        uid: uid("vectors"),
+        primary_key: "id".into(),
+    };
+    s.ensure_index(&target).await.unwrap();
+    patch_settings(
+        &l,
+        &target.uid,
+        json!({"embedders": {"up": {"source": "userProvided", "dimensions": 3}}}),
+    )
+    .await;
+
+    // Alone in its run: `internal` from Meilisearch.
+    let report = s
+        .apply(&target, vec![replace("alone", json!({"_vectors": "x"}))])
+        .await
+        .unwrap();
+    assert_eq!(report.rejected.len(), 1, "{report:?}");
+
+    let mut deep = json!(1);
+    for _ in 0..200 {
+        deep = json!([deep]);
+    }
+    let good = |i: u32| replace(&format!("g{i}"), json!({"_vectors": {"up": [1, 2, 3]}}));
+    let ops = vec![
+        good(0),
+        replace("str", json!({"_vectors": "not an object"})),
+        good(1),
+        replace("arr", json!({"_vectors": [1, 2, 3]})),
+        replace("dims", json!({"_vectors": {"up": [1, 2]}})),
+        good(2),
+        replace("type", json!({"_vectors": {"up": "x"}})),
+        replace("none", json!({"title": "no vectors"})),
+        replace("deep", json!({"_vectors": {"up": [1, 2, 3]}, "x": deep})),
+        good(3),
+    ];
+    let report = s.apply(&target, ops).await.unwrap();
+    let mut rejected: Vec<&str> = report.rejected.iter().map(|r| r.op.id()).collect();
+    rejected.sort();
+    assert_eq!(
+        rejected,
+        vec!["arr", "deep", "dims", "none", "str", "type"],
+        "{report:?}"
+    );
+    assert_eq!(report.written, 4);
+    assert_eq!(s.document_count(&target.uid).await.unwrap(), Some(4));
+    s.delete_index(&target.uid).await.unwrap();
+}
+
+async fn get_settings(l: &Live, index: &str) -> Value {
+    reqwest::Client::new()
+        .get(format!("{}/indexes/{index}/settings", l.url))
+        .bearer_auth(&l.key)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
+}
+
+/// Meilisearch returns embedder API keys redacted (`"sk-XXXXX..."`): such
+/// settings are refused, keyless ones are copied verbatim onto an index
+/// that does not exist yet.
+#[tokio::test]
+async fn copy_settings_with_embedders() {
+    let Some(l) = live() else { return };
+    let s = sink(&l, opts());
+    let rest = |key: Option<&str>| {
+        let mut e = json!({
+            "source": "rest",
+            "url": "http://127.0.0.1:9/embed",
+            "dimensions": 3,
+            "request": {"input": "{{text}}"},
+            "response": {"embedding": "{{embedding}}"},
+            "headers": {"X-Custom": "v"},
+        });
+        if let Some(k) = key {
+            e["apiKey"] = json!(k);
+        }
+        e
+    };
+
+    let keyed = uid("keyed");
+    patch_settings(
+        &l,
+        &keyed,
+        json!({"embedders": {"remote": rest(Some("secret-api-key-123456"))}}),
+    )
+    .await;
+    let raw = get_settings(&l, &keyed).await;
+    let shown = raw["embedders"]["remote"]["apiKey"].as_str().unwrap();
+    assert_ne!(shown, "secret-api-key-123456");
+    assert!(shown.contains("XXX"), "{shown}");
+    let target = uid("keyed_copy");
+    let e = s.copy_settings(&keyed, &target).await.unwrap_err();
+    assert!(
+        matches!(&e, SinkError::Config(m) if m.contains("`remote`")),
+        "{e:?}"
+    );
+    assert_eq!(s.document_count(&target).await.unwrap(), None);
+
+    let keyless = uid("keyless");
+    patch_settings(
+        &l,
+        &keyless,
+        json!({
+            "filterableAttributes": ["a", {"attributePatterns": ["b*"],
+                "features": {"facetSearch": true, "filter": {"equality": true, "comparison": true}}}],
+            "localizedAttributes": [{"attributePatterns": ["t"], "locales": ["fra"]}],
+            "embedders": {
+                "up": {"source": "userProvided", "dimensions": 3, "binaryQuantized": true},
+                "remote": rest(None),
+            },
+        }),
+    )
+    .await;
+    let copy = uid("keyless_copy");
+    s.copy_settings(&keyless, &copy).await.unwrap();
+    assert_eq!(
+        get_settings(&l, &copy).await,
+        get_settings(&l, &keyless).await
+    );
+
+    for ix in [keyed, keyless, copy] {
+        s.delete_index(&ix).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn delete_all_documents_keeps_settings() {
+    let Some(l) = live() else { return };
+    let s = sink(&l, opts());
+    let target = IndexTarget {
+        uid: uid("clear"),
+        primary_key: "id".into(),
+    };
+    s.ensure_index(&target).await.unwrap();
+    let resp = reqwest::Client::new()
+        .patch(format!("{}/indexes/{}/settings", l.url, target.uid))
+        .bearer_auth(&l.key)
+        .json(&json!({"filterableAttributes": ["v"]}))
+        .send()
+        .await
+        .unwrap();
+    let task: Value = resp.json().await.unwrap();
+    wait_task(&l, task["taskUid"].as_u64().unwrap()).await;
+    s.apply(
+        &target,
+        (0..10)
+            .map(|i| replace(&i.to_string(), json!({"v": i})))
+            .collect(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(s.document_count(&target.uid).await.unwrap(), Some(10));
+
+    s.delete_all_documents(&target.uid).await.unwrap();
+    assert_eq!(s.document_count(&target.uid).await.unwrap(), Some(0));
+    let settings: Value = reqwest::Client::new()
+        .get(format!("{}/indexes/{}/settings", l.url, target.uid))
+        .bearer_auth(&l.key)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(settings["filterableAttributes"], json!(["v"]));
+
+    s.delete_all_documents(&uid("missing")).await.unwrap();
+    s.delete_index(&target.uid).await.unwrap();
+}
+
 #[tokio::test]
 async fn wrong_key_is_config() {
     let Some(l) = live() else { return };

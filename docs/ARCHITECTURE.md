@@ -25,10 +25,10 @@ Crawler (scrapix).
 
 | Crate | Role |
 |---|---|
-| `core` | Contracts only: `Change`, `Checkpoint`, `Source`, `Sink`, `StateStore`, `SyncSpec`, errors, `Secret`, `document_id`. No I/O. |
+| `core` | Contracts only: `Change`, `Checkpoint`, `Source` (with `report_lag`), `SourceFactory` (with `endpoints`), `Sink`, `StateStore` (`record_progress` takes a `Progress` with its `Usage`), `SyncSpec`, errors, `Secret`, `document_id`, `Lag` / `LagReporter`, and `HostPolicy`. No I/O but the DNS lookup of `HostPolicy`. |
 | `sink` | `MeiliSink`: NDJSON batches, task polling, poison-document bisection, swap, settings copy. |
 | `engine` | `run_sync`: drives one sync through its lifecycle; `Supervisor`: runs many, restarts with backoff. Depends on the three traits only. |
-| `store` | Postgres (`sqlx`): sync specs with sealed secrets, `SyncState`, dead letters, progress counters, Lab usage outbox. Also an in-memory store for tests and single-node trials. |
+| `store` | Postgres (`sqlx`): sync specs with sealed secrets, `SyncState`, dead letters, progress counters and units, pending usage, the events outbox (one lane per consumer). Also an in-memory store for tests and single-node trials. |
 | `sources/*` | One crate per origin, each exporting a `SourceFactory`. |
 | `server` | Binary `meili-connect`: axum API, auth, supervisor wiring, Lab seams. |
 
@@ -69,6 +69,45 @@ Rules the engine enforces:
   `copy_settings(live → shadow)` happens before the snapshot,
   `swap(live, shadow)` after, then `delete_index(shadow)`.
 
+## Metering
+
+The units of `docs/LAB_INTEGRATION.md` ("Pricing") are measured in the
+engine and recorded with each batch's progress (`core::Progress`, carrying a
+`core::Usage`):
+
+- `documents_streamed` / `documents_snapshot` / `documents_resync`: the
+  documents Meilisearch accepted (`ApplyReport.written + deleted`, never the
+  rejected or skipped ones), by why they were written: the change stream, a
+  first sync or a resync the user asked for, a resync the engine started
+  after `PositionLost`. Why a resync runs is persisted with it
+  (`SyncState::resync_reason`), so a crash in the middle of it does not
+  change how the rest is metered.
+- `bytes`: `ApplyReport.bytes`, the uncompressed wire form of each accepted
+  document plus a separator, counted once whatever the retries.
+- `sync_seconds`: time in `snapshotting` or `streaming`, accumulated by the
+  run monitor and recorded by the supervisor every `seconds_interval` and at
+  the end of each run. A paused or held sync accrues nothing.
+
+`Progress::batch_age` (first event of the batch to tasks succeeded) feeds
+`connect_batch_seconds` and is never stored.
+
+## Lag
+
+`Source::report_lag` hands a source a `LagReporter` (a `watch` cell, shared
+by the attempts of one supervised sync) before `open`: publishing never
+blocks and reading needs nothing from a source busy streaming. The default
+implementation ignores it (lag unknown: MySQL today). Postgres reports the
+WAL between the slot's confirmed position and the server's (from
+keep-alives, data and commits; no extra query) and the age of the last
+commit; MongoDB the age of each event's cluster time; Kafka the records
+behind the high watermarks (measured every 15 s off the event loop: the
+watermark requests block) and the last record's age; DynamoDB the worst
+shard's `ApproximateCreationDateTime` age. Each reports 0 once caught up.
+The engine clears it whenever a run stops streaming; `SyncStatus` carries it
+with the time since the last checkpoint, which the server's lag guard
+(`MAX_LAG_HOLD_*`) uses to warn about a stuck sync. Nothing is dropped
+automatically.
+
 ## Sources
 
 | Kind | Mechanism | Checkpoint | Snapshot |
@@ -106,13 +145,97 @@ Standalone works with none of the `LAB_*` variables set. With them:
 - **Every sync belongs to a tenant** (or the global scope standalone). All
   store queries are tenant-scoped.
 - **Usage events** go to the Lab through an outbox: `usage.recorded` with
-  `product: "connect"`, `operation: "sync"`, `units: {documents}`, signed
+  `product: "connect"`, `operation: "sync"`, the five units of
+  `docs/LAB_INTEGRATION.md`, `job_id` (the sync) and a description, signed
   `X-Lab-Signature: sha256=HMAC(LAB_INSTANCE_SECRET, "<ts>.<body>")`, batches
   of at most 500. The Lab must add `connect` to `lab-events.schema.json`
-  first (Lab-owned contract).
+  first (Lab-owned contract). Usage is durable end to end
+  (`store::UsageLedger`): `record_progress` adds a batch's units to a
+  `usage_pending` row per lane (Lab, Tinybird) in the same transaction as
+  the progress counters, and the flush moves pending rows into the lane's
+  outbox in one transaction. The one double count left: a crash after
+  Meilisearch accepted a batch and before its progress and checkpoint were
+  saved replays (and records) that batch once more.
 - **Secrets at rest** are sealed with ChaCha20-Poly1305
   (`version(1)‖nonce(12)‖ciphertext`, key from `CONNECT_SECRET_KEY`), same
   layout as glutony's connections.
+
+## Telemetry (`server::metrics`)
+
+`GET /metrics` is Prometheus text from a registry per server (the
+`prometheus` crate, no global recorder). Counters are updated where things
+happen (`MeteredStore` for documents, bytes, seconds, batch time and dead
+letters, `InstrumentedSink` for sink errors, `GuardedSource` for source
+errors, the senders for their results); the phases, the outbox backlogs and
+the `connect_lag_seconds` histogram are computed when scraped. No label
+carries a tenant or a sync id. Only `METRICS_TOKEN` is accepted.
+
+## Credits (`server::credits`, Lab mode)
+
+`CreditCache` asks `GET <LAB_URL>/internal/accounts/{id}` (30 s fresh; when
+the Lab cannot answer, the last known answer stands, quietly for 300 s then
+with a warning, and a team never answered for runs). Every
+`CREDITS_CHECK_INTERVAL_SECS` the manager holds the running syncs of a team
+that cannot spend (`Held`, message `out_of_credits`, supervisor stopped,
+nothing torn down) and restarts the syncs it held once the team can spend;
+the state survives a restart (boot leaves them idle). Starting a sync of
+such a team (`resume`, `resync`, `release`) answers `402`.
+
+## Host policy
+
+Sources and destinations are tenant-supplied addresses that the server
+connects to from inside its network. `core::HostPolicy`
+(`CONNECT_HOST_POLICY`: `public` by default with `LAB_SERVICE_TOKEN`, `any`
+standalone, `allowlist`) decides which addresses may be used; every resolved
+address of a name must pass. The state database is refused as a source origin
+in every mode.
+
+- Each connector declares where it connects: `SourceFactory::endpoints`
+  (Postgres/MySQL host, every MongoDB seed host and the hosts of a
+  `mongodb+srv` SRV record, every Kafka bootstrap server, DynamoDB's
+  `endpoint_url`).
+- The server vets them at `check`, `discover`, `POST` and `PUT`, and wraps
+  the registry (`server::guard::GuardedSources`) so that every source the
+  engine builds, one per attempt, vets them again before its first call
+  that may connect. A refusal is a `Config` error: the sync is held.
+- The sink resolves through the policy (a custom reqwest resolver), so its
+  connections go to the vetted addresses only; literal IPs are vetted when
+  the sink is built; no proxy, no redirects.
+- Errors of a tenant's source and sink, and of Lab calls, are reduced to
+  their class and a fixed description (`server::guard`).
+
+Residual risk: database drivers resolve DNS themselves, so between vetting
+and the driver's connect a rebinding window remains for sources (not for the
+sink); Kafka brokers advertised in metadata and MongoDB members discovered
+from the seeds are not vetted. A hosted deployment must also restrict egress
+at the network level.
+
+On a hosted server (`LAB_SERVICE_TOKEN` or `CONNECT_HOST_POLICY=public`) a
+tenant's source may not use the server's own identity, files or
+environment (`server::ambient`: DynamoDB `credentials: default`, MongoDB URI
+file options and host-identity auth mechanisms, Postgres URL file
+parameters). Refused by the API (`422 ambient_credentials`) and, for a sync
+stored earlier, by `GuardedSources` before its first connection (held).
+
+## Changes to a sync (`server::manager`)
+
+Every mutation (create, update, delete, pause, resume, resync, release) is
+one `SyncManager` entry point: it takes the sync's lock, reads the stored row
+again inside it, writes, then starts or stops the supervisor. The HTTP
+handler runs it detached from the request, so a client that hangs up (or the
+request timeout) never leaves a change half done. Stopping a sync inside the
+lock is bounded by `SHUTDOWN_GRACE_SECS`.
+
+`PUT` diffs the old and the new spec inside the lock: a new origin is torn
+down with the old spec first (nothing changes when that fails, unless
+`force`), then the checkpoint is cleared; new streams or another Meilisearch
+URL clear the checkpoint (full snapshot, into shadow indexes where the live
+ones hold data); anything else restarts. A paused sync stays paused.
+
+Bounds: `MAX_SYNCS_PER_TENANT`, probe slots (global and per tenant), a
+request timeout, dead letters per sync (enforced by the store, overflow
+counted in `sync_progress.dead_letters_dropped`), and the Lab outbox
+(per-event backoff, sender backoff, backlog cap on the enqueue side).
 
 ## Not in the first version
 

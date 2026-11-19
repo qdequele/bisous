@@ -1,0 +1,672 @@
+openapi: 3.1.0
+info:
+  title: meili-connect
+  version: 0.1.0
+  description: |
+    Change-data-capture from Postgres, Supabase, MySQL, MongoDB, Kafka and
+    DynamoDB into Meilisearch.
+
+    **Auth.** `Authorization: Bearer <LAB_SERVICE_TOKEN>` requires
+    `X-Connect-Tenant-Id` and scopes every call to that tenant.
+    `Authorization: Bearer <ADMIN_API_KEY>` is the global scope and may pass
+    `X-Connect-Tenant-Id` to act for a tenant. With neither variable set the
+    server runs in open mode (global scope, no token). `/health` is always
+    open.
+
+    **Tenancy.** A sync of another scope does not exist for the caller: every
+    route answers `404` for it.
+
+    **Secrets are write-only.** Every spec the API returns has its secrets
+    (the Meilisearch API key, source passwords, connection strings with
+    credentials, keys, tokens) replaced by `"<redacted>"`. A `PUT` may send
+    `"<redacted>"` back for any field to keep the stored value, as long as
+    the connection it belongs to is unchanged (`422 secret_required`
+    otherwise).
+
+    **Errors** always have the body `{"code": "...", "message": "..."}`.
+servers:
+  - url: http://localhost:8080
+security:
+  - bearer: []
+
+paths:
+  /health:
+    get:
+      summary: Liveness
+      security: []
+      responses:
+        "200":
+          description: The process is up.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, const: ok }
+
+  /metrics:
+    get:
+      summary: Prometheus metrics (operators)
+      description: |
+        Prometheus text format 0.0.4. Authenticated with
+        `Authorization: Bearer <METRICS_TOKEN>` only: the Lab and admin
+        tokens are refused. `404` when `METRICS_TOKEN` is unset. No label
+        carries a tenant or a sync id.
+
+        Names (a contract with the deploy box's dashboards and alert
+        rules): `connect_syncs{phase}` (gauge), `connect_documents_total{kind}`
+        (`streamed`, `snapshot`, `resync`), `connect_bytes_total`,
+        `connect_batch_seconds` (histogram, one observation per batch),
+        `connect_sink_errors_total{class}`,
+        `connect_source_errors_total{kind,class}`, `connect_lag_seconds`
+        (gauge histogram rebuilt at each scrape from every running sync's
+        lag), `connect_dead_letters_total`, `connect_outbox_backlog` (gauge),
+        `connect_lab_events_sent_total{result}` (`accepted`, `rejected`,
+        `failed`); also `connect_sync_seconds_total`,
+        `connect_tinybird_backlog`, `connect_tinybird_events_sent_total{result}`
+        and, on Linux, `process_*`.
+      security:
+        - metricsToken: []
+      responses:
+        "200":
+          description: The metrics.
+          content:
+            text/plain:
+              schema: { type: string }
+        "401": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+
+  /usage:
+    get:
+      summary: Metered usage of the caller's syncs
+      description: |
+        The units of `docs/LAB_INTEGRATION.md` ("Pricing") per UTC day
+        (`group_by=day`, the default) or per sync (`group_by=sync`) over
+        `from..=to` (default: the last 30 days; at most 366 days), with
+        their totals. Scoped to the caller's tenant (the global scope for
+        the admin key). Days and syncs without usage are absent.
+
+        Served from the Tinybird `connect_tenant_usage` pipe when
+        `TINYBIRD_URL` is set (falling back to the state database when it
+        cannot answer), else from the state database's progress table;
+        `source` says which. The shape is the same either way. The state
+        database counts a batch on the day it was applied; Tinybird on the
+        day it was flushed (at most `USAGE_FLUSH_INTERVAL_SECS` later). The
+        state database forgets a deleted sync's usage; Tinybird keeps it.
+      parameters:
+        - { $ref: "#/components/parameters/TenantId" }
+        - { name: from, in: query, schema: { type: string, format: date } }
+        - { name: to, in: query, schema: { type: string, format: date } }
+        - { name: group_by, in: query, schema: { type: string, enum: [day, sync], default: day } }
+      responses:
+        "200":
+          description: The usage.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  from: { type: string, format: date }
+                  to: { type: string, format: date }
+                  group_by: { type: string, enum: [day, sync] }
+                  source: { type: string, enum: [tinybird, state] }
+                  rows:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        day: { type: string, format: date, description: "With group_by=day." }
+                        sync_id: { type: string, description: "With group_by=sync." }
+                        name: { type: [string, "null"], description: "With group_by=sync: the sync's name, null once deleted." }
+                        units: { $ref: "#/components/schemas/Units" }
+                  totals: { $ref: "#/components/schemas/Units" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+
+  /sources/check:
+    post:
+      summary: Pre-flight checks of a source
+      description: |
+        Connects to the origin and reports what is missing (`wal_level`,
+        privileges, replica set, binlog format…). Creates and stores nothing.
+        Bounded by `SOURCE_PROBE_TIMEOUT_SECS`.
+      parameters: [{ $ref: "#/components/parameters/TenantId" }]
+      requestBody: { $ref: "#/components/requestBodies/Probe" }
+      responses:
+        "200":
+          description: The report. `passed` is false when any item failed.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  passed: { type: boolean }
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/CheckItem" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "422": { $ref: "#/components/responses/Error" }
+        "502": { $ref: "#/components/responses/Error" }
+        "504": { $ref: "#/components/responses/Error" }
+
+  /sources/discover:
+    post:
+      summary: List what a source can sync
+      description: Tables, collections or topics with their keys. Creates and stores nothing.
+      parameters: [{ $ref: "#/components/parameters/TenantId" }]
+      requestBody: { $ref: "#/components/requestBodies/Probe" }
+      responses:
+        "200":
+          description: The collections.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  collections:
+                    type: array
+                    items: { $ref: "#/components/schemas/CollectionInfo" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "422": { $ref: "#/components/responses/Error" }
+        "502": { $ref: "#/components/responses/Error" }
+        "504": { $ref: "#/components/responses/Error" }
+
+  /syncs:
+    post:
+      summary: Create a sync and start it
+      description: |
+        The id is generated by the server (UUIDv7). The sync starts at once;
+        what happens next is in its status. A sync that cannot be started is
+        not kept: the error is returned and nothing is stored.
+      parameters: [{ $ref: "#/components/parameters/TenantId" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SyncInput" }
+      responses:
+        "201":
+          description: Created (secrets redacted).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Sync" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+        "422": { $ref: "#/components/responses/Error" }
+    get:
+      summary: List the syncs of the scope
+      parameters: [{ $ref: "#/components/parameters/TenantId" }]
+      responses:
+        "200":
+          description: The syncs, ordered by name (secrets redacted).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  syncs:
+                    type: array
+                    items: { $ref: "#/components/schemas/Sync" }
+        "401": { $ref: "#/components/responses/Error" }
+
+  /syncs/{id}:
+    parameters:
+      - { $ref: "#/components/parameters/SyncId" }
+      - { $ref: "#/components/parameters/TenantId" }
+    get:
+      summary: Read a sync
+      responses:
+        "200":
+          description: The sync (secrets redacted).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Sync" }
+        "401": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+    put:
+      summary: Replace a sync's spec
+      description: |
+        Stores the new spec. A new origin (kind, host, port, URL, user,
+        database, TLS, slot or publication name) is a fresh sync: the old
+        origin is torn down first with the old spec, and when that fails
+        nothing changes (`502 teardown_failed`) unless `?force=true`. Other
+        streams or another Meilisearch URL clear the checkpoint, so
+        everything is snapshotted again. Any other change restarts the sync.
+        A paused sync stays paused. Send
+        `"<redacted>"` for a secret to keep the stored value. `id`, `tenant`,
+        `created_at` and `updated_at` may be sent (a `GET` body works as is)
+        and are ignored.
+      parameters:
+        - name: force
+          in: query
+          schema: { type: boolean, default: false }
+          description: Go on when the old origin cannot be torn down.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SyncInput" }
+      responses:
+        "200":
+          description: Updated (secrets redacted).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Sync" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+        "422": { $ref: "#/components/responses/Error" }
+        "502": { $ref: "#/components/responses/Error" }
+    delete:
+      summary: Delete a sync
+      description: |
+        Stops the sync, deletes leftover shadow indexes, tears the source down
+        on the origin (replication slot, publication, consumer group), then
+        deletes the sync with its state, dead letters and progress. The
+        Meilisearch indexes are kept. When the teardown fails the answer is
+        `502 teardown_failed` and the sync is kept, paused with the reason as
+        its status message, so the call can be retried; `?force=true` deletes it anyway.
+      parameters:
+        - name: force
+          in: query
+          schema: { type: boolean, default: false }
+      responses:
+        "204": { description: Deleted. }
+        "401": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "502": { $ref: "#/components/responses/Error" }
+
+  /syncs/{id}/pause:
+    parameters:
+      - { $ref: "#/components/parameters/SyncId" }
+      - { $ref: "#/components/parameters/TenantId" }
+    post:
+      summary: Stop a sync (phase `paused`)
+      description: A paused sync stays paused across restarts of the server.
+      responses:
+        "200": { $ref: "#/components/responses/Status" }
+        "401": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+
+  /syncs/{id}/resume:
+    parameters:
+      - { $ref: "#/components/parameters/SyncId" }
+      - { $ref: "#/components/parameters/TenantId" }
+    post:
+      summary: Start a stopped sync again (paused, held or failed)
+      description: A no-op when the sync is running. `402 out_of_credits` while its team cannot spend (Lab mode).
+      responses:
+        "200": { $ref: "#/components/responses/Status" }
+        "401": { $ref: "#/components/responses/Error" }
+        "402": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+
+  /syncs/{id}/resync:
+    parameters:
+      - { $ref: "#/components/parameters/SyncId" }
+      - { $ref: "#/components/parameters/TenantId" }
+    post:
+      summary: Rebuild every index from a fresh snapshot
+      description: |
+        The snapshot goes into shadow indexes that are swapped in when
+        complete, so search keeps serving the old data meanwhile. Its
+        documents are metered as `documents_snapshot`. `402 out_of_credits`
+        while its team cannot spend (Lab mode).
+      responses:
+        "200": { $ref: "#/components/responses/Status" }
+        "401": { $ref: "#/components/responses/Error" }
+        "402": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+
+  /syncs/{id}/release:
+    parameters:
+      - { $ref: "#/components/parameters/SyncId" }
+      - { $ref: "#/components/parameters/TenantId" }
+    post:
+      summary: Let the action that held a sync through, once
+      description: |
+        A `TRUNCATE` or a mass delete above `mass_delete_guard` holds the sync
+        (phase `held`) instead of emptying the index. Releasing applies it.
+        A sync held with `out_of_credits` cannot be released: `402
+        out_of_credits` while its team cannot spend; it resumes by itself
+        once it can.
+      responses:
+        "200": { $ref: "#/components/responses/Status" }
+        "401": { $ref: "#/components/responses/Error" }
+        "402": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+
+  /syncs/{id}/status:
+    parameters:
+      - { $ref: "#/components/parameters/SyncId" }
+      - { $ref: "#/components/parameters/TenantId" }
+    get:
+      summary: Phase, message, checkpoint presence and totals
+      responses:
+        "200": { $ref: "#/components/responses/Status" }
+        "401": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+
+  /syncs/{id}/progress:
+    parameters:
+      - { $ref: "#/components/parameters/SyncId" }
+      - { $ref: "#/components/parameters/TenantId" }
+    get:
+      summary: Daily counters
+      description: UTC days `from..=to`; defaults to the last 30 days; at most 366 days. Days without activity are absent.
+      parameters:
+        - { name: from, in: query, schema: { type: string, format: date } }
+        - { name: to, in: query, schema: { type: string, format: date } }
+      responses:
+        "200":
+          description: The days.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  from: { type: string, format: date }
+                  to: { type: string, format: date }
+                  days:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        day: { type: string, format: date }
+                        written: { type: integer }
+                        deleted: { type: integer }
+                        dead_letters_dropped: { type: integer }
+                        documents_streamed: { type: integer }
+                        documents_snapshot: { type: integer }
+                        documents_resync: { type: integer }
+                        bytes: { type: integer }
+                        sync_seconds: { type: integer }
+                        rejected: { type: integer }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+
+  /syncs/{id}/dead-letters:
+    parameters:
+      - { $ref: "#/components/parameters/SyncId" }
+      - { $ref: "#/components/parameters/TenantId" }
+    get:
+      summary: Documents Meilisearch refused, oldest first
+      parameters:
+        - { name: after, in: query, description: "Return letters with an id greater than this one (`next_after` of the previous page).", schema: { type: integer } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 1000, default: 100 } }
+      responses:
+        "200":
+          description: One page.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: { type: integer }
+                        index: { type: string }
+                        document_id: { type: string }
+                        payload: { description: "The operation as JSON, or null for a record the source skipped." }
+                        reason: { type: string }
+                        created_at: { type: string, format: date-time }
+                  next_after: { type: [integer, "null"] }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+    delete:
+      summary: Delete every dead letter of the sync
+      responses:
+        "200":
+          description: How many went.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  deleted: { type: integer }
+        "401": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+
+components:
+  securitySchemes:
+    bearer:
+      type: http
+      scheme: bearer
+      description: LAB_SERVICE_TOKEN (with X-Connect-Tenant-Id) or ADMIN_API_KEY.
+    metricsToken:
+      type: http
+      scheme: bearer
+      description: METRICS_TOKEN, for `GET /metrics` only.
+
+  parameters:
+    TenantId:
+      name: X-Connect-Tenant-Id
+      in: header
+      required: false
+      description: Required with the Lab service token; optional with the admin key; ignored in open mode.
+      schema: { type: string, maxLength: 128, pattern: "^[A-Za-z0-9_.:-]+$" }
+    SyncId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string }
+
+  requestBodies:
+    Probe:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [source]
+            additionalProperties: false
+            properties:
+              source: { $ref: "#/components/schemas/SourceSpec" }
+              streams:
+                description: Optional mappings; Kafka needs at least one (the topics).
+                type: array
+                items: { $ref: "#/components/schemas/StreamMapping" }
+
+  responses:
+    Error:
+      description: An error.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Status:
+      description: The sync's status.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Status" }
+
+  schemas:
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          description: |
+            `unauthorized`, `invalid_tenant`, `invalid_request`, `not_found`,
+            `conflict`, `source_config`, `source_paused`, `source_unavailable`,
+            `source_error`, `source_timeout`, `teardown_failed`,
+            `store_unavailable`, `shutting_down`, `engine`, `internal`,
+            `sync_unreadable` (409: the stored spec cannot be read; delete it
+            with `?force=true`),             `sync_quota_exceeded` (409: the tenant owns
+            `MAX_SYNCS_PER_TENANT` syncs), `too_many_probes` (429: too many
+            checks or discoveries running; retry), `request_timeout` (503:
+            the request took longer than `REQUEST_TIMEOUT_SECS`; a change to
+            a sync still completes), `secret_required` (422: a
+            `"<redacted>"` placeholder for a secret
+            whose source or destination changed), `ambient_credentials` (422,
+            hosted server: a tenant's source would use the server's own
+            identity or files, e.g. DynamoDB `credentials: default`),
+            `out_of_credits` (402, Lab mode: the team cannot spend; its
+            syncs are held and resume by themselves), `host_not_allowed` (422:
+            the host policy refuses the source or
+            destination; the message names the host, never what it resolved
+            to). For calls with the Lab token, source and Meilisearch errors
+            carry a fixed description of their class, not the driver's
+            text.
+        message: { type: string }
+
+    Units:
+      type: object
+      description: The metered units (`docs/LAB_INTEGRATION.md`, "Pricing").
+      properties:
+        documents_streamed: { type: integer }
+        documents_snapshot: { type: integer }
+        documents_resync: { type: integer }
+        bytes: { type: integer }
+        sync_seconds: { type: integer }
+
+    SyncPhase:
+      type: string
+      enum: [pending, snapshotting, streaming, paused, source_paused, held, failed]
+
+    Status:
+      type: object
+      properties:
+        sync_id: { type: string }
+        phase: { $ref: "#/components/schemas/SyncPhase" }
+        message: { type: [string, "null"], description: "Why the sync is held, failed or source-paused." }
+        has_checkpoint: { type: boolean, description: "False until the first snapshot completed." }
+        resyncing: { type: boolean }
+        updated_at: { type: [string, "null"], format: date-time }
+        running: { type: boolean, description: "A supervision loop is alive (running or waiting to retry)." }
+        consecutive_failures: { type: integer }
+        last_error: { type: [string, "null"] }
+        progress:
+          type: object
+          properties:
+            written: { type: integer }
+            deleted: { type: integer }
+            rejected: { type: integer }
+        dead_letters_overflow:
+          type: integer
+          description: |
+            Rejected documents not kept as dead letters because the sync
+            holds `DEAD_LETTERS_MAX_PER_SYNC` of them already (they are
+            counted in `progress.rejected`). Clear the dead letters to keep
+            new ones.
+        documents:
+          type: object
+          description: The metered document units since the sync was created (`docs/LAB_INTEGRATION.md`, "Pricing"). Only documents Meilisearch accepted.
+          properties:
+            documents_streamed: { type: integer, description: "Writes and deletes applied from the change stream." }
+            documents_snapshot: { type: integer, description: "Written by a first sync or a resync the user asked for." }
+            documents_resync: { type: integer, description: "Rewritten by a resync the engine started (position lost); free." }
+        bytes: { type: integer, description: "Uncompressed payload bytes sent to Meilisearch for accepted documents." }
+        sync_seconds: { type: integer, description: "Seconds spent snapshotting or streaming." }
+        lag:
+          type: [object, "null"]
+          description: How far behind its origin the sync is, while streaming and when the source can tell; `null` otherwise.
+          properties:
+            seconds: { type: [number, "null"], description: "Age of the newest change seen, 0 once caught up (Postgres, MongoDB, Kafka, DynamoDB)." }
+            bytes: { type: [integer, "null"], description: "WAL the replication slot retains past the confirmed position (Postgres)." }
+            records: { type: integer, description: "Records not read yet (Kafka only; absent otherwise)." }
+        lag_warning:
+          type: [string, "null"]
+          description: |
+            Set when the sync is past `MAX_LAG_HOLD_BYTES` or
+            `MAX_LAG_HOLD_SECS` and has saved no checkpoint for 5 minutes.
+            Nothing is dropped automatically: releasing the origin's log
+            (slot, offsets) is an operator decision.
+        dead_letters: { type: integer, description: "Dead letters waiting (GET /syncs/{id}/dead-letters)." }
+
+    SourceSpec:
+      type: object
+      required: [kind, config]
+      properties:
+        kind: { type: string, enum: [postgres, supabase, mysql, mongodb, kafka, dynamodb] }
+        config:
+          type: object
+          description: The connector's own config (see the README, per source).
+
+    StreamMapping:
+      type: object
+      required: [collection, index]
+      properties:
+        collection: { type: string, description: "`schema.table`, `database.collection`, a topic or a table name." }
+        index: { type: string }
+        primary_key: { type: string, default: id }
+        fields:
+          description: '`"all"`, `{"include": [...]}` or `{"exclude": [...]}`.'
+        rename: { type: object, additionalProperties: { type: string } }
+        vector:
+          type: [object, "null"]
+          properties:
+            field: { type: string }
+            embedder: { type: string }
+
+    SyncInput:
+      type: object
+      required: [name, source, destination, streams]
+      properties:
+        name: { type: string, maxLength: 200 }
+        source: { $ref: "#/components/schemas/SourceSpec" }
+        destination:
+          type: object
+          required: [url, api_key]
+          properties:
+            url: { type: string }
+            api_key: { type: string, writeOnly: true }
+        streams:
+          type: array
+          items: { $ref: "#/components/schemas/StreamMapping" }
+        mass_delete_guard:
+          type: [number, "null"]
+          minimum: 0
+          maximum: 1
+          default: 0.5
+          description: Hold the sync instead of applying a TRUNCATE or a batch deleting more than this share of an index; null disables.
+
+    Sync:
+      allOf:
+        - $ref: "#/components/schemas/SyncInput"
+        - type: object
+          properties:
+            id: { type: string }
+            tenant: { type: [string, "null"] }
+            created_at: { type: string, format: date-time }
+            updated_at: { type: string, format: date-time }
+            unreadable:
+              type: boolean
+              description: |
+                Present and `true` when the stored spec cannot be read
+                (another `CONNECT_SECRET_KEY`, a damaged row): only `id`,
+                `tenant`, `name`, `source.kind` and `error` are given. Such a
+                sync answers `409 sync_unreadable` to every change and can
+                only be deleted with `?force=true`.
+
+    CheckItem:
+      type: object
+      properties:
+        name: { type: string }
+        status: { type: string, enum: [ok, warning, failed] }
+        message: { type: string }
+
+    CollectionInfo:
+      type: object
+      properties:
+        name: { type: string }
+        key: { type: array, items: { type: string } }
+        fields:
+          type: array
+          items:
+            type: object
+            properties:
+              name: { type: string }
+              source_type: { type: string }
+              nullable: { type: boolean }
+        estimated_rows: { type: [integer, "null"] }

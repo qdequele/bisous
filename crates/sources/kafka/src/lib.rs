@@ -16,7 +16,7 @@ pub mod decode;
 mod source;
 
 use meili_connect_core::{
-    Source, SourceError, SourceFactory, SourceKind, SourceSpec, StreamMapping,
+    Endpoint, Source, SourceError, SourceFactory, SourceKind, SourceSpec, StreamMapping,
 };
 
 pub use config::{Format, KafkaConfig, StartFrom};
@@ -26,6 +26,7 @@ pub use source::{KafkaSource, RECORD_KEY};
 #[derive(Debug, Clone, Copy, Default)]
 pub struct KafkaSourceFactory;
 
+#[async_trait::async_trait]
 impl SourceFactory for KafkaSourceFactory {
     fn build(
         &self,
@@ -34,6 +35,29 @@ impl SourceFactory for KafkaSourceFactory {
         streams: &[StreamMapping],
     ) -> Result<Box<dyn Source>, SourceError> {
         Ok(Box::new(build_source(sync_id, spec, streams)?))
+    }
+
+    /// Every bootstrap server. The brokers the cluster advertises in its
+    /// metadata are only known once connected and are not listed here.
+    async fn endpoints(&self, spec: &SourceSpec) -> Result<Vec<Endpoint>, SourceError> {
+        if spec.kind != SourceKind::Kafka {
+            return Err(SourceError::Config(format!(
+                "the kafka connector cannot read a `{}` config",
+                spec.kind.as_str()
+            )));
+        }
+        let config = KafkaConfig::from_value(&spec.config)?;
+        config
+            .bootstrap_servers
+            .iter()
+            .map(|server| {
+                // librdkafka accepts `PROTOCOL://host:port` too.
+                let bare = server.split_once("://").map_or(server.as_str(), |(_, b)| b);
+                Endpoint::parse(bare, 9092).ok_or_else(|| {
+                    SourceError::Config(format!("bootstrap server `{server}` is not host:port"))
+                })
+            })
+            .collect()
     }
 }
 
@@ -132,6 +156,31 @@ mod tests {
         ));
         assert!(matches!(
             KafkaSourceFactory.build("s", &spec(ok), &[]),
+            Err(SourceError::Config(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn endpoints_are_the_bootstrap_servers() {
+        let got = KafkaSourceFactory
+            .endpoints(&spec(json!({"bootstrap_servers": [
+                "B1.example.com:9093", "10.0.0.1", "[::1]:9094", "SASL_SSL://k.example.com:9095"
+            ]})))
+            .await
+            .unwrap();
+        assert_eq!(
+            got,
+            vec![
+                Endpoint::new("b1.example.com", 9093),
+                Endpoint::new("10.0.0.1", 9092),
+                Endpoint::new("::1", 9094),
+                Endpoint::new("k.example.com", 9095),
+            ]
+        );
+        assert!(matches!(
+            KafkaSourceFactory
+                .endpoints(&spec(json!({"bootstrap_servers": ["h:notaport"]})))
+                .await,
             Err(SourceError::Config(_))
         ));
     }

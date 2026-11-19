@@ -1,18 +1,20 @@
 //! Folding a batch of `DocOp`s for one index so that each id is written at
 //! most once.
 //!
-//! Semantics (the model the tests check against): `Replace` sets the whole
-//! document, `Merge` sets the fields of `doc` on the existing document (or an
-//! empty one) and then removes the `unset` fields, `Delete` removes the
-//! document. Per id:
+//! Semantics (the model the tests check against, and what the sink does):
+//! `Replace` sets the whole document, `Merge` sets the fields of `doc` on the
+//! existing document (or an empty one) and then sets the `unset` fields to
+//! `null`, `Delete` removes the document. Per id:
 //!
 //! - a `Replace` or a `Delete` overrides whatever came before (last write
 //!   wins);
-//! - a `Merge` after a `Replace` is folded into the `Replace`;
+//! - a `Merge` after a `Replace` is folded into the `Replace`, its `unset`
+//!   fields written as `null`, so the document is the same whether the two
+//!   land in one batch or in two;
 //! - a `Merge` after a `Merge` merges them (the later value wins, a later
 //!   set cancels an earlier unset and the other way round);
 //! - a `Merge` after a `Delete` starts from an empty document, so it becomes
-//!   a `Replace` of the merged fields.
+//!   a `Replace` of the merged fields (`unset` ones as `null`).
 //!
 //! Every id ends up with exactly one op. Ops on different ids commute, so
 //! the output is grouped by kind (deletes, then replaces, then merges, each
@@ -21,7 +23,8 @@
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 
-use meili_connect_core::DocOp;
+use meili_connect_core::{DocOp, Document};
+use serde_json::Value;
 
 pub fn coalesce(ops: Vec<DocOp>) -> Vec<DocOp> {
     let mut order: Vec<String> = Vec::new();
@@ -73,24 +76,19 @@ fn normalize(op: DocOp) -> DocOp {
 fn fold(prev: DocOp, next: DocOp) -> DocOp {
     match (prev, next) {
         (_, next @ (DocOp::Replace { .. } | DocOp::Delete { .. })) => next,
-        (DocOp::Delete { .. }, DocOp::Merge { id, mut doc, unset }) => {
-            for field in &unset {
-                doc.remove(field);
-            }
-            DocOp::Replace { id, doc }
-        }
+        (DocOp::Delete { .. }, DocOp::Merge { id, doc, unset }) => DocOp::Replace {
+            id,
+            doc: merge_into(Document::new(), doc, unset),
+        },
         (
-            DocOp::Replace { id, mut doc },
+            DocOp::Replace { id, doc },
             DocOp::Merge {
                 doc: set, unset, ..
             },
-        ) => {
-            doc.extend(set);
-            for field in &unset {
-                doc.remove(field);
-            }
-            DocOp::Replace { id, doc }
-        }
+        ) => DocOp::Replace {
+            id,
+            doc: merge_into(doc, set, unset),
+        },
         (
             DocOp::Merge {
                 id,
@@ -117,6 +115,16 @@ fn fold(prev: DocOp, next: DocOp) -> DocOp {
             DocOp::Merge { id, doc, unset }
         }
     }
+}
+
+/// What the sink makes of a `Merge` on `base`: set fields, then `unset`
+/// ones as `null`.
+fn merge_into(mut base: Document, set: Document, unset: Vec<String>) -> Document {
+    base.extend(set);
+    for field in unset {
+        base.insert(field, Value::Null);
+    }
+    base
 }
 
 #[cfg(test)]
@@ -152,7 +160,7 @@ mod tests {
         DocOp::Delete { id: id.into() }
     }
 
-    /// The reference semantics.
+    /// The reference semantics: what the sink does (`unset` writes `null`).
     fn apply(model: &mut BTreeMap<String, Document>, ops: &[DocOp]) {
         for op in ops {
             match op {
@@ -165,7 +173,7 @@ mod tests {
                         entry.insert(k.clone(), v.clone());
                     }
                     for f in unset {
-                        entry.remove(f);
+                        entry.insert(f.clone(), Value::Null);
                     }
                 }
                 DocOp::Delete { id } => {
@@ -190,7 +198,8 @@ mod tests {
             replace("1", json!({"a": 1, "b": 1})),
             merge("1", json!({"a": 2}), &["b"]),
         ]);
-        assert_eq!(out, vec![replace("1", json!({"a": 2}))]);
+        // Same document as the sink writes when they land in two batches.
+        assert_eq!(out, vec![replace("1", json!({"a": 2, "b": null}))]);
     }
 
     #[test]
@@ -206,7 +215,7 @@ mod tests {
     fn anything_after_delete_starts_fresh() {
         assert_eq!(
             coalesce(vec![delete("1"), merge("1", json!({"a": 1}), &["b"])]),
-            vec![replace("1", json!({"a": 1}))]
+            vec![replace("1", json!({"a": 1, "b": null}))]
         );
         assert_eq!(
             coalesce(vec![replace("1", json!({"a": 1})), delete("1")]),

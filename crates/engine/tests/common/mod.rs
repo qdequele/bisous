@@ -10,10 +10,10 @@ use std::time::Duration;
 use async_trait::async_trait;
 use meili_connect_core::{
     AckReceiver, ApplyReport, Capabilities, Change, CheckReport, Checkpoint, CollectionInfo,
-    DeadLetter, DocOp, Document, EventSender, FieldSelection, IndexTarget, MeiliDestination, Op,
-    Opened, RejectedDoc, Secret, Sink, SinkError, Source, SourceError, SourceEvent, SourceFactory,
-    SourceKind, SourceSpec, StateStore, StoreError, StreamMapping, SyncPhase, SyncSpec, SyncState,
-    document_id,
+    DeadLetter, DocOp, Document, EventSender, FieldSelection, IndexTarget, Lag, LagReporter,
+    MeiliDestination, Op, Opened, Progress, RejectedDoc, ResyncReason, Secret, Sink, SinkError,
+    Source, SourceError, SourceEvent, SourceFactory, SourceKind, SourceSpec, StateStore,
+    StoreError, StreamMapping, SyncPhase, SyncSpec, SyncState, Usage, document_id,
 };
 use meili_connect_engine::{SyncDeps, SyncOptions};
 use serde_json::{Value, json};
@@ -23,6 +23,8 @@ use tokio_util::sync::CancellationToken;
 pub const COLLECTION: &str = "public.products";
 pub const INDEX: &str = "products";
 pub const SYNC_ID: &str = "0123456789abcdef";
+/// Bytes the fake sink reports per accepted document.
+pub const BYTES_PER_DOC: u64 = 10;
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
@@ -69,6 +71,9 @@ pub struct OriginState {
     pub ack_violations: Vec<String>,
     pub stream_active: bool,
     pub store: Option<Arc<MemStore>>,
+    /// `stream` drops its `AckReceiver` right away.
+    pub drop_acks: bool,
+    pub teardowns: usize,
 }
 
 impl Default for OriginState {
@@ -92,6 +97,8 @@ impl Default for OriginState {
             ack_violations: Vec::new(),
             stream_active: false,
             store: None,
+            drop_acks: false,
+            teardowns: 0,
         }
     }
 }
@@ -207,6 +214,20 @@ impl Origin {
         self.notify.notify_waiters();
     }
 
+    /// A record the source cannot decode, then a commit marker.
+    pub fn skipped(&self, collection: &str, position: &str, reason: &str) {
+        {
+            let mut st = self.state();
+            st.log.push(SourceEvent::Skipped {
+                collection: collection.into(),
+                position: position.into(),
+                reason: reason.into(),
+            });
+            st.log.push(SourceEvent::Checkpoint(Checkpoint(json!(0))));
+        }
+        self.notify.notify_waiters();
+    }
+
     pub fn log_len(&self) -> u64 {
         self.state().log.len() as u64
     }
@@ -253,6 +274,7 @@ impl SourceFactory for FakeFactory {
         Ok(Box::new(FakeSource {
             origin: Arc::clone(&self.0),
             pos: 0,
+            lag: None,
         }))
     }
 }
@@ -260,6 +282,7 @@ impl SourceFactory for FakeFactory {
 pub struct FakeSource {
     origin: Arc<Origin>,
     pos: usize,
+    lag: Option<LagReporter>,
 }
 
 struct Active(Arc<Origin>);
@@ -362,20 +385,39 @@ impl Source for FakeSource {
     async fn stream(
         &mut self,
         events: EventSender,
-        mut acks: AckReceiver,
+        acks: AckReceiver,
         cancel: CancellationToken,
     ) -> Result<(), SourceError> {
         let origin = Arc::clone(&self.origin);
-        let fault = {
+        let (fault, drop_acks) = {
             let mut st = origin.state();
             st.stream_active = true;
-            st.stream_faults.pop_front()
+            (st.stream_faults.pop_front(), st.drop_acks)
+        };
+        let mut acks = if drop_acks {
+            drop(acks);
+            None
+        } else {
+            Some(acks)
         };
         let _active = Active(Arc::clone(&origin));
+        // Reports how many log events it has not sent yet, as seconds.
+        let report = |pos: usize| {
+            if let Some(lag) = &self.lag {
+                let behind = origin.state().log.len().saturating_sub(pos);
+                lag.report(Lag {
+                    seconds: Some(behind as f64),
+                    bytes: Some(behind as u64 * 100),
+                    records: None,
+                });
+            }
+        };
+        report(self.pos);
         let mut fault = fault;
         let mut sent_here = 0usize;
         loop {
-            if acks.has_changed().unwrap_or(false)
+            if let Some(acks) = acks.as_mut()
+                && acks.has_changed().unwrap_or(false)
                 && let Some(ack) = acks.borrow_and_update().clone()
             {
                 origin.check_ack(&ack);
@@ -405,13 +447,17 @@ impl Source for FakeSource {
                     self.pos += 1;
                     sent_here += 1;
                     origin.state().sent += 1;
+                    report(self.pos);
                 }
                 None => {
                     tokio::select! {
                         _ = cancel.cancelled() => return Ok(()),
                         _ = origin.notify.notified() => {}
-                        r = acks.changed() => {
-                            if r.is_ok() && let Some(ack) = acks.borrow_and_update().clone() {
+                        r = async { match acks.as_mut() {
+                            Some(a) => a.changed().await.map(|()| a.borrow_and_update().clone()).ok().flatten(),
+                            None => std::future::pending().await,
+                        } } => {
+                            if let Some(ack) = r {
                                 origin.check_ack(&ack);
                             }
                         }
@@ -423,7 +469,12 @@ impl Source for FakeSource {
     }
 
     async fn teardown(&mut self) -> Result<(), SourceError> {
+        self.origin.state().teardowns += 1;
         Ok(())
+    }
+
+    fn report_lag(&mut self, reporter: LagReporter) {
+        self.lag = Some(reporter);
     }
 }
 
@@ -552,6 +603,7 @@ impl Sink for FakeSink {
                     doc.insert(target.primary_key.clone(), Value::String(id.clone()));
                     index.docs.insert(id, doc);
                     report.written += 1;
+                    report.bytes += BYTES_PER_DOC;
                 }
                 DocOp::Merge { id, doc, unset } => {
                     let entry = index.docs.entry(id.clone()).or_default();
@@ -561,10 +613,12 @@ impl Sink for FakeSink {
                     }
                     entry.insert(target.primary_key.clone(), Value::String(id));
                     report.written += 1;
+                    report.bytes += BYTES_PER_DOC;
                 }
                 DocOp::Delete { id } => {
                     index.docs.remove(&id);
                     report.deleted += 1;
+                    report.bytes += BYTES_PER_DOC;
                 }
             }
         }
@@ -579,6 +633,15 @@ impl Sink for FakeSink {
         };
         st.indexes.insert(a.into(), ib);
         st.indexes.insert(b.into(), ia);
+        Ok(())
+    }
+
+    async fn delete_all_documents(&self, uid: &str) -> Result<(), SinkError> {
+        let mut st = self.state();
+        st.calls.push(format!("delete_all {uid}"));
+        if let Some(index) = st.indexes.get_mut(uid) {
+            index.docs.clear();
+        }
         Ok(())
     }
 
@@ -616,6 +679,8 @@ pub struct StoreState {
     pub history: Vec<SyncState>,
     pub dead: Vec<DeadLetter>,
     pub progress: HashMap<String, (u64, u64, u64)>,
+    /// Metered units per sync.
+    pub usage: HashMap<String, Usage>,
     /// The next save matching this fails once with a transient error.
     pub fail_once: Option<SavePredicate>,
 }
@@ -669,18 +734,13 @@ impl StateStore for MemStore {
         Ok(())
     }
 
-    async fn record_progress(
-        &self,
-        sync_id: &str,
-        written: u64,
-        deleted: u64,
-        rejected: u64,
-    ) -> Result<(), StoreError> {
+    async fn record_progress(&self, sync_id: &str, p: &Progress) -> Result<(), StoreError> {
         let mut st = self.inner();
         let entry = st.progress.entry(sync_id.into()).or_default();
-        entry.0 += written;
-        entry.1 += deleted;
-        entry.2 += rejected;
+        entry.0 += p.written;
+        entry.1 += p.deleted;
+        entry.2 += p.rejected;
+        st.usage.entry(sync_id.into()).or_default().add(&p.usage);
         Ok(())
     }
 }
@@ -755,6 +815,7 @@ pub fn options() -> SyncOptions {
         shutdown_grace: Duration::from_secs(2),
         release_hold: false,
         resync: false,
+        resync_reason: ResyncReason::User,
     }
 }
 
