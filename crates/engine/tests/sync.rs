@@ -1,0 +1,593 @@
+//! `run_sync` against the fakes.
+#![allow(clippy::expect_used, clippy::unwrap_used)]
+
+mod common;
+
+use std::time::Duration;
+
+use common::*;
+use meili_connect_core::{SinkError, SourceError, StoreError, SyncPhase, SyncSpec};
+use meili_connect_engine::{EngineError, SyncOptions, run_sync, shadow_index_uid};
+use serde_json::json;
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
+
+fn spawn(
+    h: &Harness,
+    spec: SyncSpec,
+    opts: SyncOptions,
+) -> (CancellationToken, JoinHandle<Result<(), EngineError>>) {
+    let cancel = CancellationToken::new();
+    let handle = tokio::spawn(run_sync(spec, h.deps(), opts, cancel.clone()));
+    (cancel, handle)
+}
+
+async fn finish(handle: JoinHandle<Result<(), EngineError>>) -> Result<(), EngineError> {
+    match tokio::time::timeout(Duration::from_secs(5), handle).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(e)) => panic!("run_sync panicked: {e}"),
+        Err(_) => panic!("run_sync did not stop"),
+    }
+}
+
+async fn stop(cancel: CancellationToken, handle: JoinHandle<Result<(), EngineError>>) {
+    cancel.cancel();
+    let result = finish(handle).await;
+    assert!(result.is_ok(), "{result:?}");
+}
+
+/// Waits until the destination matches the origin and the whole log is
+/// checkpointed.
+async fn wait_synced(h: &Harness) {
+    wait_for("destination in sync", 5, || {
+        h.sink.docs(INDEX) == h.origin.expected()
+            && h.store.checkpoint(SYNC_ID) == Some(h.origin.log_len())
+            && h.store.phase(SYNC_ID) == Some(SyncPhase::Streaming)
+    })
+    .await;
+}
+
+fn seed_rows(h: &Harness, ids: std::ops::RangeInclusive<i64>) {
+    h.origin.seed(
+        ids.map(|i| upsert(i, json!({"name": format!("p{i}"), "price": i})))
+            .collect(),
+    );
+}
+
+#[tokio::test]
+async fn fresh_sync_is_gapless() {
+    let h = Harness::new();
+    seed_rows(&h, 1..=3);
+    // Written while the snapshot runs: absent from the snapshot, so they
+    // must come from the stream that starts at the position captured first.
+    h.origin.state().during_snapshot = vec![
+        (patch(1, json!({"price": 9}), &[]), true),
+        (upsert(4, json!({"name": "p4"})), true),
+        (delete(2), true),
+    ];
+
+    let (cancel, handle) = spawn(&h, spec(), options());
+    wait_synced(&h).await;
+    stop(cancel, handle).await;
+
+    let docs = h.sink.docs(INDEX);
+    assert_eq!(
+        docs.keys().cloned().collect::<Vec<_>>(),
+        vec!["1", "3", "4"]
+    );
+    assert_eq!(docs["1"]["price"], json!(9));
+    let st = h.origin.state();
+    assert_eq!(st.snapshots, 1);
+    assert_eq!(st.opens, vec![None]);
+    drop(st);
+    // A first sync into a missing index writes directly.
+    assert!(!h.sink.calls().iter().any(|c| c.starts_with("swap")));
+    let state = h.store.state(SYNC_ID).expect("state saved");
+    assert!(!state.resyncing);
+    assert!(state.message.is_none());
+    assert_eq!(h.store.inner().progress[SYNC_ID].1, 1);
+    h.assert_acks_sound();
+}
+
+#[tokio::test]
+async fn first_sync_into_an_empty_index_writes_directly() {
+    let h = Harness::new();
+    h.sink
+        .create(INDEX, json!({"rankingRules": ["words"]}), vec![]);
+    seed_rows(&h, 1..=2);
+    let (cancel, handle) = spawn(&h, spec(), options());
+    wait_synced(&h).await;
+    stop(cancel, handle).await;
+    let calls = h.sink.calls();
+    assert!(
+        !calls
+            .iter()
+            .any(|c| c.starts_with("swap") || c.starts_with("copy"))
+    );
+}
+
+#[tokio::test]
+async fn resume_from_the_saved_checkpoint() {
+    let h = Harness::new();
+    seed_rows(&h, 1..=2);
+    let (cancel, handle) = spawn(&h, spec(), options());
+    wait_synced(&h).await;
+    stop(cancel, handle).await;
+    let saved = h.store.checkpoint(SYNC_ID);
+
+    h.origin
+        .tx(vec![upsert(5, json!({"name": "p5"})), delete(1)]);
+    let (cancel, handle) = spawn(&h, spec(), options());
+    wait_synced(&h).await;
+    stop(cancel, handle).await;
+
+    let st = h.origin.state();
+    assert_eq!(st.snapshots, 1, "no second snapshot on resume");
+    assert_eq!(st.opens.len(), 2);
+    assert_eq!(st.opens[1].as_ref().map(pos), saved);
+    drop(st);
+    h.assert_acks_sound();
+}
+
+#[tokio::test]
+async fn changes_after_the_last_checkpoint_are_applied_but_not_acknowledged() {
+    let h = Harness::new();
+    let (cancel, handle) = spawn(&h, spec(), options());
+    wait_synced(&h).await;
+
+    h.origin
+        .tx(vec![upsert(1, json!({})), upsert(2, json!({}))]); // log 0..3
+    h.origin.uncommitted(vec![upsert(3, json!({}))]); // log 3
+    wait_for("3 docs", 5, || h.sink.docs(INDEX).len() == 3).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(h.store.checkpoint(SYNC_ID), Some(3));
+    assert!(h.origin.state().acks.iter().all(|a| pos(a) <= 3));
+
+    h.origin.tx(vec![upsert(4, json!({}))]);
+    wait_synced(&h).await;
+    assert_eq!(h.store.checkpoint(SYNC_ID), Some(6));
+    stop(cancel, handle).await;
+    h.assert_acks_sound();
+}
+
+#[tokio::test]
+async fn killed_between_apply_and_save_replays_idempotently() {
+    let h = Harness::new();
+    seed_rows(&h, 1..=2);
+    let (_cancel, handle) = spawn(&h, spec(), options());
+    wait_synced(&h).await;
+    let before = h.store.checkpoint(SYNC_ID);
+
+    // The save after the next apply fails: the process "dies" there.
+    h.store.inner().fail_once = Some(Box::new(|s| {
+        s.checkpoint.as_ref().is_some_and(|c| pos(c) > 0)
+    }));
+    h.origin.tx(vec![
+        patch(1, json!({"price": 100}), &[]),
+        upsert(3, json!({})),
+    ]);
+    let result = finish(handle).await;
+    assert!(
+        matches!(result, Err(EngineError::Store(StoreError::Transient(_)))),
+        "{result:?}"
+    );
+    // Applied, but not checkpointed and not acknowledged.
+    assert_eq!(h.sink.docs(INDEX).len(), 3);
+    assert_eq!(h.store.checkpoint(SYNC_ID), before);
+    assert!(h.origin.state().acks.iter().all(|a| Some(pos(a)) <= before));
+    assert!(!h.origin.state().stream_active);
+    let applied_before = h.sink.state().applied_ops;
+
+    let (cancel, handle) = spawn(&h, spec(), options());
+    wait_synced(&h).await;
+    stop(cancel, handle).await;
+    assert!(
+        h.sink.state().applied_ops > applied_before,
+        "the batch was replayed"
+    );
+    assert_eq!(h.sink.docs(INDEX)["1"]["price"], json!(100));
+    h.assert_acks_sound();
+}
+
+#[tokio::test]
+async fn a_sink_error_stops_the_source_and_keeps_the_checkpoint() {
+    let h = Harness::new();
+    let (_cancel, handle) = spawn(&h, spec(), options());
+    wait_synced(&h).await;
+    wait_for("stream running", 5, || h.origin.state().stream_active).await;
+
+    h.sink
+        .state()
+        .apply_faults
+        .push_back(SinkError::Transient("503".into()));
+    h.origin.tx(vec![upsert(1, json!({}))]);
+    let result = finish(handle).await;
+    assert!(
+        matches!(result, Err(EngineError::Sink(SinkError::Transient(_)))),
+        "{result:?}"
+    );
+    assert_eq!(h.store.checkpoint(SYNC_ID), Some(0));
+    assert!(!h.origin.state().stream_active, "source task stopped");
+    h.assert_acks_sound();
+}
+
+#[tokio::test]
+async fn a_source_error_is_returned() {
+    let h = Harness::new();
+    h.origin
+        .state()
+        .stream_faults
+        .push_back((0, SourceError::Fatal("unsupported type".into())));
+    h.origin.tx(vec![upsert(1, json!({}))]);
+    let (_cancel, handle) = spawn(&h, spec(), options());
+    let result = finish(handle).await;
+    assert!(
+        matches!(result, Err(EngineError::Source(SourceError::Fatal(_)))),
+        "{result:?}"
+    );
+}
+
+#[tokio::test]
+async fn rejected_documents_are_dead_lettered_without_failing() {
+    let h = Harness::new();
+    h.sink.state().reject.insert("2".into());
+    let (cancel, handle) = spawn(&h, spec(), options());
+    wait_synced(&h).await;
+
+    h.origin.tx(vec![
+        upsert(1, json!({})),
+        upsert(2, json!({"bad": true})),
+        upsert(3, json!({})),
+    ]);
+    wait_for("checkpoint", 5, || {
+        h.store.checkpoint(SYNC_ID) == Some(h.origin.log_len())
+    })
+    .await;
+    h.origin.tx(vec![upsert(4, json!({}))]);
+    wait_for("later changes", 5, || h.sink.docs(INDEX).len() == 3).await;
+    assert!(!handle.is_finished());
+    stop(cancel, handle).await;
+
+    let st = h.store.inner();
+    assert_eq!(st.dead.len(), 1);
+    let letter = &st.dead[0];
+    assert_eq!(letter.document_id, "2");
+    assert_eq!(letter.index, INDEX);
+    assert_eq!(letter.payload["kind"], json!("replace"));
+    assert_eq!(letter.payload["doc"]["bad"], json!(true));
+    assert_eq!(st.progress[SYNC_ID], (3, 0, 1));
+}
+
+fn resync_calls_ok(h: &Harness) {
+    let shadow = shadow_index_uid(INDEX, SYNC_ID);
+    assert_eq!(shadow, "products__connect_01234567");
+    let calls = h.sink.calls();
+    let idx = |c: &str| {
+        calls
+            .iter()
+            .position(|x| x == c)
+            .unwrap_or_else(|| panic!("missing call `{c}` in {calls:?}"))
+    };
+    let ensure = idx(&format!("ensure {shadow}"));
+    let copy = idx(&format!("copy_settings {INDEX} {shadow}"));
+    let swap = idx(&format!("swap {INDEX} {shadow}"));
+    let delete = calls
+        .iter()
+        .rposition(|x| x == &format!("delete {shadow}"))
+        .unwrap_or(0);
+    assert!(ensure < swap && copy < swap && swap < delete, "{calls:?}");
+    assert!(!h.sink.state().indexes.contains_key(&shadow));
+    assert_eq!(
+        h.sink.state().indexes[INDEX].settings,
+        json!({"rankingRules": ["words"]})
+    );
+    assert!(h.store.inner().history.iter().any(|s| s.resyncing));
+    assert!(!h.store.state(SYNC_ID).expect("state").resyncing);
+}
+
+#[tokio::test]
+async fn position_lost_on_open_resyncs_through_a_shadow_index() {
+    let h = Harness::new();
+    seed_rows(&h, 1..=3);
+    let (cancel, handle) = spawn(&h, spec(), options());
+    wait_synced(&h).await;
+    stop(cancel, handle).await;
+    h.sink
+        .state()
+        .indexes
+        .get_mut(INDEX)
+        .expect("live index")
+        .settings = json!({"rankingRules": ["words"]});
+
+    // Data changed while nobody followed the stream, and the position is gone.
+    h.origin
+        .seed(vec![delete(1), upsert(10, json!({"name": "p10"}))]);
+    h.origin.state().min_resume = 1_000;
+
+    let (cancel, handle) = spawn(&h, spec(), options());
+    wait_for("resynced", 5, || {
+        h.sink.docs(INDEX) == h.origin.expected()
+            && h.store.phase(SYNC_ID) == Some(SyncPhase::Streaming)
+            && h.store.state(SYNC_ID).is_some_and(|s| !s.resyncing)
+    })
+    .await;
+    stop(cancel, handle).await;
+
+    let st = h.origin.state();
+    assert_eq!(st.snapshots, 2);
+    assert_eq!(st.opens.last(), Some(&None));
+    drop(st);
+    resync_calls_ok(&h);
+    h.assert_acks_sound();
+}
+
+#[tokio::test]
+async fn position_lost_while_streaming_resyncs() {
+    let h = Harness::new();
+    seed_rows(&h, 1..=3);
+    h.sink
+        .create(INDEX, json!({"rankingRules": ["words"]}), vec![]);
+    // The first stream loses its position at once; the live index is not
+    // empty by then, so the resync goes through a shadow.
+    h.origin
+        .state()
+        .stream_faults
+        .push_back((0, SourceError::PositionLost("slot invalidated".into())));
+    let (cancel, handle) = spawn(&h, spec(), options());
+    wait_for("resynced", 5, || {
+        h.origin.state().snapshots == 2
+            && h.sink.docs(INDEX) == h.origin.expected()
+            && h.store.state(SYNC_ID).is_some_and(|s| !s.resyncing)
+    })
+    .await;
+    stop(cancel, handle).await;
+    resync_calls_ok(&h);
+}
+
+#[tokio::test]
+async fn explicit_resync_request() {
+    let h = Harness::new();
+    seed_rows(&h, 1..=3);
+    h.sink
+        .create(INDEX, json!({"rankingRules": ["words"]}), vec![]);
+    let (cancel, handle) = spawn(&h, spec(), options());
+    wait_synced(&h).await;
+    stop(cancel, handle).await;
+    // A stale document only a resync removes.
+    h.sink
+        .state()
+        .indexes
+        .get_mut(INDEX)
+        .expect("live")
+        .docs
+        .insert("999".into(), doc(json!({"id": "999"})));
+
+    let mut opts = options();
+    opts.resync = true;
+    let (cancel, handle) = spawn(&h, spec(), opts);
+    wait_for("resynced", 5, || {
+        h.origin.state().snapshots == 2 && h.sink.docs(INDEX) == h.origin.expected()
+    })
+    .await;
+    wait_synced(&h).await;
+    stop(cancel, handle).await;
+    resync_calls_ok(&h);
+}
+
+#[tokio::test]
+async fn truncate_is_held_then_released() {
+    let h = Harness::new();
+    seed_rows(&h, 1..=4);
+    h.sink
+        .create(INDEX, json!({"rankingRules": ["words"]}), vec![]);
+    let (_cancel, handle) = spawn(&h, spec(), options());
+    wait_synced(&h).await;
+
+    h.origin.tx(vec![upsert(5, json!({}))]);
+    wait_synced(&h).await;
+    let before = h.store.checkpoint(SYNC_ID);
+    h.origin.truncate(COLLECTION);
+    h.origin.tx(vec![upsert(7, json!({"name": "p7"}))]);
+
+    let result = finish(handle).await;
+    assert!(matches!(result, Err(EngineError::Held(_))), "{result:?}");
+    let state = h.store.state(SYNC_ID).expect("state");
+    assert_eq!(state.phase, SyncPhase::Held);
+    assert!(
+        state
+            .message
+            .as_deref()
+            .is_some_and(|m| m.contains("truncated")),
+        "{state:?}"
+    );
+    assert_eq!(h.sink.docs(INDEX).len(), 5, "nothing applied");
+    assert_eq!(h.store.checkpoint(SYNC_ID), before);
+
+    // A held sync stays held on a plain restart.
+    let result = finish(spawn(&h, spec(), options()).1).await;
+    assert!(matches!(result, Err(EngineError::Held(_))), "{result:?}");
+    assert_eq!(h.sink.docs(INDEX).len(), 5);
+
+    let mut opts = options();
+    opts.release_hold = true;
+    let (cancel, handle) = spawn(&h, spec(), opts);
+    wait_synced(&h).await;
+    stop(cancel, handle).await;
+    assert_eq!(
+        h.sink.docs(INDEX).keys().cloned().collect::<Vec<_>>(),
+        vec!["7"]
+    );
+    assert_eq!(
+        h.sink.state().indexes[INDEX].settings,
+        json!({"rankingRules": ["words"]}),
+        "settings survive the truncate"
+    );
+    assert!(h.store.state(SYNC_ID).expect("state").message.is_none());
+    h.assert_acks_sound();
+}
+
+#[tokio::test]
+async fn mass_delete_is_held_then_released() {
+    let h = Harness::new();
+    seed_rows(&h, 1..=10);
+    let (_cancel, handle) = spawn(&h, spec(), options());
+    wait_synced(&h).await;
+
+    // 3 of 10: under the 50% guard.
+    h.origin.tx(vec![delete(1), delete(2), delete(3)]);
+    wait_synced(&h).await;
+    let before = h.store.checkpoint(SYNC_ID);
+
+    // 6 of 7: held.
+    h.origin.tx((4..=9).map(delete).collect());
+    let result = finish(handle).await;
+    assert!(matches!(result, Err(EngineError::Held(_))), "{result:?}");
+    assert_eq!(h.store.phase(SYNC_ID), Some(SyncPhase::Held));
+    assert_eq!(h.sink.docs(INDEX).len(), 7);
+    assert_eq!(
+        h.store.checkpoint(SYNC_ID),
+        before,
+        "held batch not checkpointed"
+    );
+
+    let mut opts = options();
+    opts.release_hold = true;
+    let (cancel, handle) = spawn(&h, spec(), opts);
+    wait_synced(&h).await;
+    stop(cancel, handle).await;
+    assert_eq!(h.sink.docs(INDEX).len(), 1);
+    h.assert_acks_sound();
+}
+
+#[tokio::test]
+async fn no_guard_applies_mass_deletes() {
+    let h = Harness::new();
+    seed_rows(&h, 1..=4);
+    let mut spec = spec();
+    spec.mass_delete_guard = None;
+    let (cancel, handle) = spawn(&h, spec, options());
+    wait_synced(&h).await;
+    h.origin.tx((1..=4).map(delete).collect());
+    wait_synced(&h).await;
+    stop(cancel, handle).await;
+    assert!(h.sink.docs(INDEX).is_empty());
+}
+
+#[tokio::test]
+async fn cancellation_mid_snapshot_restarts_the_snapshot() {
+    let h = Harness::new();
+    seed_rows(&h, 1..=200);
+    h.origin.state().snapshot_delay = Duration::from_millis(2);
+    let mut opts = options();
+    opts.max_docs = 10;
+    let (cancel, handle) = spawn(&h, spec(), opts.clone());
+    wait_for("some rows applied", 5, || !h.sink.docs(INDEX).is_empty()).await;
+    let started = tokio::time::Instant::now();
+    stop(cancel, handle).await;
+    assert!(started.elapsed() < Duration::from_secs(1));
+
+    let state = h.store.state(SYNC_ID).expect("state");
+    assert_eq!(state.phase, SyncPhase::Snapshotting);
+    assert!(
+        state.checkpoint.is_none(),
+        "an interrupted snapshot is not checkpointed"
+    );
+    assert!(h.sink.docs(INDEX).len() < 200);
+    assert!(h.origin.state().acks.is_empty());
+
+    h.origin.state().snapshot_delay = Duration::ZERO;
+    let (cancel, handle) = spawn(&h, spec(), opts);
+    wait_synced(&h).await;
+    stop(cancel, handle).await;
+    assert_eq!(h.origin.state().snapshots, 2);
+}
+
+#[tokio::test]
+async fn cancellation_mid_stream_is_prompt() {
+    let h = Harness::new();
+    let (cancel, handle) = spawn(&h, spec(), options());
+    wait_synced(&h).await;
+    wait_for("stream running", 5, || h.origin.state().stream_active).await;
+    let started = tokio::time::Instant::now();
+    stop(cancel, handle).await;
+    assert!(started.elapsed() < Duration::from_millis(500));
+    assert!(!h.origin.state().stream_active);
+}
+
+#[tokio::test]
+async fn cancellation_while_the_sink_is_slow() {
+    let h = Harness::new();
+    let (cancel, handle) = spawn(&h, spec(), options());
+    wait_synced(&h).await;
+    h.sink.state().apply_delay = Duration::from_secs(30);
+    h.origin.tx(vec![upsert(1, json!({}))]);
+    wait_for("apply in flight", 5, || {
+        !h.sink.state().in_flight.is_empty()
+    })
+    .await;
+    let started = tokio::time::Instant::now();
+    stop(cancel, handle).await;
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert_eq!(h.store.checkpoint(SYNC_ID), Some(0));
+}
+
+#[tokio::test]
+async fn a_slow_sink_back_pressures_the_source() {
+    let h = Harness::new();
+    let mut opts = options();
+    opts.channel_capacity = 4;
+    opts.max_docs = 10;
+    opts.max_delay = Duration::from_secs(5);
+    h.sink.state().apply_delay = Duration::from_millis(2);
+    let (cancel, handle) = spawn(&h, spec(), opts);
+    wait_synced(&h).await;
+
+    h.origin
+        .tx((1..=500).map(|i| upsert(i, json!({"n": i}))).collect());
+    wait_for("500 docs", 20, || h.sink.docs(INDEX).len() == 500).await;
+    stop(cancel, handle).await;
+
+    let st = h.sink.state();
+    let max_in_flight = st.in_flight.iter().copied().max().unwrap_or(0);
+    // At most one batch being applied, a full channel, and one event in
+    // the source's hands (plus the commit marker).
+    assert!(max_in_flight <= 10 + 4 + 2, "in flight: {max_in_flight}");
+    assert!(
+        st.batch_sizes.iter().all(|&n| n <= 10),
+        "{:?}",
+        st.batch_sizes
+    );
+}
+
+#[tokio::test]
+async fn unmapped_collections_and_patches() {
+    let h = Harness::new();
+    let (cancel, handle) = spawn(&h, spec(), options());
+    wait_synced(&h).await;
+    let mut other = upsert(1, json!({"x": 1}));
+    other.collection = "public.other".into();
+    h.origin.tx(vec![
+        other,
+        upsert(2, json!({"a": 1, "b": 2})),
+        patch(2, json!({"a": 5}), &["b"]),
+    ]);
+    wait_for("checkpoint", 5, || {
+        h.store.checkpoint(SYNC_ID) == Some(h.origin.log_len())
+    })
+    .await;
+    stop(cancel, handle).await;
+    let docs = h.sink.docs(INDEX);
+    assert_eq!(docs.len(), 1);
+    // Upsert + patch coalesced into one replace: `b` is gone, not null.
+    assert_eq!(docs["2"], doc(json!({"id": "2", "a": 5})));
+    assert_eq!(h.sink.state().batch_sizes.last(), Some(&1));
+}
+
+#[tokio::test]
+async fn a_spec_without_streams_is_rejected() {
+    let h = Harness::new();
+    let mut spec = spec();
+    spec.streams.clear();
+    let result = finish(spawn(&h, spec, options()).1).await;
+    assert!(matches!(result, Err(EngineError::Spec(_))), "{result:?}");
+}
