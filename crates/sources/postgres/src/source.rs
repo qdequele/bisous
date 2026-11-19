@@ -145,6 +145,11 @@ impl PostgresSource {
         if self.sql.is_none() {
             let sql = conn::connect_sql(&self.settings.conn, &CancellationToken::new()).await?;
             self.version = catalog::server_version(&sql).await?;
+            if self.version >= 140_000 {
+                // Between type lookups the stream's SQL session idles for
+                // as long as the stream runs.
+                sql.simple("SET idle_session_timeout = 0").await?;
+            }
             self.sql = Some(sql);
         }
         Ok(())
@@ -353,8 +358,14 @@ impl PostgresSource {
             .sql
             .as_ref()
             .ok_or_else(|| SourceError::Fatal("postgres connection unavailable".into()))?;
+        // The transaction sits idle whenever the engine applies
+        // back-pressure, for as long as it takes: no origin-side timeout may
+        // kill it (a killed snapshot restarts from scratch).
         sql.simple(&format!(
-            "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET TRANSACTION SNAPSHOT {}",
+            "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET TRANSACTION SNAPSHOT {};
+             SET LOCAL idle_in_transaction_session_timeout = 0;
+             SET LOCAL statement_timeout = 0;
+             SET LOCAL lock_timeout = 0",
             ident::quote_literal(snapshot)
         ))
         .await?;

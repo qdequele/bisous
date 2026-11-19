@@ -935,6 +935,69 @@ async fn names_taken_by_others_are_never_adopted_or_dropped() {
 }
 
 #[tokio::test]
+async fn snapshot_survives_role_timeouts_under_back_pressure() {
+    let Some(url) = url() else { return };
+    let db = admin(&url).await;
+    let role = unique("slow");
+    let table = unique("slow");
+    db.batch_execute(&format!(
+        "CREATE ROLE {role} LOGIN REPLICATION PASSWORD 'pw';
+         ALTER ROLE {role} SET idle_in_transaction_session_timeout = '1s';
+         ALTER ROLE {role} SET statement_timeout = '1s';
+         ALTER ROLE {role} SET lock_timeout = '1s';
+         GRANT CREATE ON DATABASE {} TO {role};
+         CREATE TABLE {table} (id int8 PRIMARY KEY, n int4, body text);
+         ALTER TABLE {table} OWNER TO {role};
+         INSERT INTO {table} SELECT g, g, 'row' FROM generate_series(1, 1200) g;",
+        db.query_one("SELECT current_database()::text", &[])
+            .await
+            .unwrap()
+            .get::<_, String>(0)
+    ))
+    .await
+    .unwrap();
+    let mut role_url = url::Url::parse(&url).unwrap();
+    role_url.set_username(&role).unwrap();
+    role_url.set_password(Some("pw")).unwrap();
+    let role_url = role_url.to_string();
+
+    let sync_id = unique("slow");
+    let mut src = source(&role_url, &sync_id, &[&format!("public.{table}")]);
+    assert!(matches!(
+        src.open(None).await.unwrap(),
+        Opened::Fresh { .. }
+    ));
+    // One slot of buffer and a consumer that stalls: the snapshot
+    // transaction sits idle well past the role's 1 s timeouts.
+    let (tx, mut rx) = mpsc::channel(1);
+    let consumer = tokio::spawn(async move {
+        let mut n = 0usize;
+        while let Some(ev) = rx.recv().await {
+            assert!(matches!(ev, SourceEvent::Change(_)));
+            n += 1;
+            if n == 1 || n == 700 {
+                tokio::time::sleep(Duration::from_millis(2500)).await;
+            }
+        }
+        n
+    });
+    let result = src.snapshot(tx, CancellationToken::new()).await;
+    let n = consumer.await.unwrap();
+    result.unwrap();
+    assert_eq!(n, 1200);
+    src.teardown().await.unwrap();
+    db.batch_execute(&format!(
+        "DROP TABLE {table}; REVOKE CREATE ON DATABASE {} FROM {role}; DROP ROLE {role};",
+        db.query_one("SELECT current_database()::text", &[])
+            .await
+            .unwrap()
+            .get::<_, String>(0)
+    ))
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn covering_indexes_key_on_their_key_columns_only() {
     let Some(url) = url() else { return };
     let db = admin(&url).await;
