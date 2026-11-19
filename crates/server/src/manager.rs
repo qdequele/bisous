@@ -243,12 +243,25 @@ impl SyncManager {
                 ));
             }
         }
-        let _op = self.serialize(&spec.id).await;
+        let op = self.serialize(&spec.id).await;
         let stored = self
             .backend
             .create_sync(spec.tenant.as_deref(), &spec)
             .await?;
-        self.run_locked(spec).await?;
+        // All or nothing: a sync that cannot start is not kept (it would
+        // start unannounced at the next boot).
+        let (id, tenant) = (spec.id.clone(), spec.tenant.clone());
+        if let Err(e) = self.run_locked(spec).await {
+            warn!(sync_id = %id, error = %e, "the new sync could not start; it is not kept");
+            self.retire(&id).await;
+            self.meter.forget(&id);
+            if let Err(e) = self.backend.delete_sync(tenant.as_deref(), &id).await {
+                warn!(sync_id = %id, error = %e, "could not roll the new sync back");
+            }
+            drop(op);
+            self.forget_lock(&id);
+            return Err(e.into());
+        }
         Ok(stored)
     }
 

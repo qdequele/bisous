@@ -1272,6 +1272,27 @@ async fn dead_letters_overflow_is_reported() {
     assert_eq!(page["items"].as_array().unwrap().len(), 2);
 }
 
+// ------------------------------------------------------------- create
+
+/// A sync that cannot start is not kept: the client gets the error and
+/// nothing starts unannounced at the next boot.
+#[tokio::test]
+async fn a_sync_that_cannot_start_is_rolled_back() {
+    let store = Arc::new(MemStore::new());
+    let a = app_with(AuthConfig::open(), Arc::clone(&store));
+    // The supervisors refuse to start once the server shuts down.
+    a.state.manager.shutdown(Duration::from_secs(1)).await;
+    let (status, body) = call(&a.router, "POST", "/syncs", &[], Some(sync_body("s"))).await;
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (StatusCode::SERVICE_UNAVAILABLE, Some("shutting_down")),
+        "{body}"
+    );
+    assert!(store.list_syncs(None).await.unwrap().is_empty());
+    let next = app_with(AuthConfig::open(), store);
+    assert_eq!(boot_syncs(&next.state).await.unwrap(), 0);
+}
+
 // ------------------------------------------------------------- concurrency
 
 /// A `PUT` that read the sync before a `DELETE` removed it must not start a

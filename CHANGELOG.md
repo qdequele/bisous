@@ -63,6 +63,9 @@ All notable changes to meili-connect are listed here. The format follows
   `?force=true`) and synced fresh; new streams or another Meilisearch URL
   clear the checkpoint so the data is backfilled; anything else restarts.
   A paused sync stays paused.
+- `POST /syncs` is all or nothing: a sync that cannot be started is removed
+  again and the error returned, instead of being kept and started
+  unannounced at the next boot.
 - Bounded growth: Lab events that fail are deferred with exponential backoff
   (additive migration: `attempts`, `next_attempt_at`), the sender backs off
   and rate-limits its logs, and past `LAB_OUTBOX_MAX_PENDING` unsent events
