@@ -681,6 +681,52 @@ async fn snapshot_honours_cancellation() {
     assert!(res.is_ok(), "{res:?}");
 }
 
+/// `stream` returns `Ok(())` promptly on cancel: while blocked on a full
+/// channel, with its ack sender gone, and when cancelled before it starts.
+#[tokio::test]
+async fn stream_honours_cancellation_under_back_pressure() {
+    let Some(url) = url() else { return };
+    let _g = SERIAL.lock().await;
+    let mut conn = admin(&url).await;
+    fresh_db(&mut conn, "mc_scancel").await;
+    conn.query_drop("CREATE TABLE mc_scancel.items (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    let mut src = source(&url, "mc_scancel", &["items"], "scancel-sync");
+    src.open(None).await.unwrap();
+    for i in 0..20 {
+        conn.exec_drop("INSERT INTO mc_scancel.items VALUES (?)", (i,))
+            .await
+            .unwrap();
+    }
+    // A channel nobody reads, and no ack sender at all.
+    let (tx, _rx) = mpsc::channel(1);
+    let (ack_tx, ack_rx) = ack_channel();
+    drop(ack_tx);
+    let cancel = CancellationToken::new();
+    let c = cancel.clone();
+    let task = tokio::spawn(async move {
+        let res = src.stream(tx, ack_rx, c).await;
+        (src, res)
+    });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!task.is_finished(), "the stream stopped by itself");
+    cancel.cancel();
+    let (mut src, res) = tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .expect("stream did not honour cancellation")
+        .unwrap();
+    assert!(res.is_ok(), "{res:?}");
+
+    // Already cancelled: returns at once.
+    let (tx, _rx) = mpsc::channel(1);
+    let (_ack_tx, ack_rx) = ack_channel();
+    let res = tokio::time::timeout(Duration::from_secs(5), src.stream(tx, ack_rx, cancel))
+        .await
+        .expect("stream did not honour cancellation");
+    assert!(res.is_ok(), "{res:?}");
+}
+
 /// Binlog images carry text in the column's charset; the snapshot reads it
 /// as utf8mb4. Both must give the same document.
 #[tokio::test]
