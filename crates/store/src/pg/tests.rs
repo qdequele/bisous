@@ -449,24 +449,33 @@ async fn outbox_concurrent_leasers_never_share() {
             .unwrap();
         all.insert(id);
     }
-    async fn leaser(store: Arc<PgStore>) -> Vec<Uuid> {
+    async fn leaser(store: Arc<PgStore>) -> Vec<(Uuid, Vec<Uuid>)> {
         let mut got = Vec::new();
         loop {
-            let batch = store
+            let lease = store
                 .lease_events(7, Duration::from_secs(300))
                 .await
                 .unwrap();
-            if batch.is_empty() {
+            if lease.events.is_empty() {
                 return got;
             }
-            got.extend(batch.into_iter().map(|e| e.id));
+            got.push((
+                lease.token,
+                lease.events.into_iter().map(|e| e.id).collect(),
+            ));
         }
     }
-    let (a, b) = tokio::join!(
+    let (la, lb) = tokio::join!(
         tokio::spawn(leaser(store.clone())),
         tokio::spawn(leaser(store.clone()))
     );
-    let (a, b) = (a.unwrap(), b.unwrap());
+    let (la, lb) = (la.unwrap(), lb.unwrap());
+    let flat = |l: &[(Uuid, Vec<Uuid>)]| {
+        l.iter()
+            .flat_map(|(_, ids)| ids.clone())
+            .collect::<Vec<_>>()
+    };
+    let (a, b) = (flat(&la), flat(&lb));
     let sa: HashSet<_> = a.iter().copied().collect();
     let sb: HashSet<_> = b.iter().copied().collect();
     assert_eq!(sa.len(), a.len());
@@ -480,11 +489,20 @@ async fn outbox_concurrent_leasers_never_share() {
             .lease_events(10, Duration::from_secs(60))
             .await
             .unwrap()
+            .events
             .is_empty()
     );
-    let ids: Vec<Uuid> = all.iter().copied().collect();
-    assert_eq!(store.mark_events_sent(&ids).await.unwrap(), 200);
-    assert_eq!(store.mark_events_sent(&ids).await.unwrap(), 0);
+    let mut marked = 0;
+    for (token, ids) in la.iter().chain(&lb) {
+        // Another lease's token marks nothing.
+        assert_eq!(
+            store.mark_events_sent(Uuid::new_v4(), ids).await.unwrap(),
+            0
+        );
+        marked += store.mark_events_sent(*token, ids).await.unwrap();
+        assert_eq!(store.mark_events_sent(*token, ids).await.unwrap(), 0);
+    }
+    assert_eq!(marked, 200);
 }
 
 #[tokio::test]
@@ -498,7 +516,8 @@ async fn outbox_expired_lease_is_released_in_order() {
         .enqueue_event(Some("t"), &serde_json::json!({ "n": 2 }))
         .await
         .unwrap();
-    let leased = store.lease_events(10, Duration::ZERO).await.unwrap();
+    let stale = store.lease_events(10, Duration::ZERO).await.unwrap();
+    let leased = &stale.events;
     assert_eq!(
         leased.iter().map(|e| e.id).collect::<Vec<_>>(),
         [first, second]
@@ -509,18 +528,30 @@ async fn outbox_expired_lease_is_released_in_order() {
         .lease_events(1, Duration::from_secs(60))
         .await
         .unwrap();
-    assert_eq!(again[0].id, first);
-    store.mark_events_sent(&[first]).await.unwrap();
+    assert_eq!(again.events[0].id, first);
+    // The expired lease was taken over: its holder can no longer mark it.
+    assert_eq!(
+        store.mark_events_sent(stale.token, &[first]).await.unwrap(),
+        0
+    );
+    assert_eq!(
+        store.mark_events_sent(again.token, &[first]).await.unwrap(),
+        1
+    );
     let rest = store
         .lease_events(10, Duration::from_secs(60))
         .await
         .unwrap();
-    assert_eq!(rest.iter().map(|e| e.id).collect::<Vec<_>>(), [second]);
+    assert_eq!(
+        rest.events.iter().map(|e| e.id).collect::<Vec<_>>(),
+        [second]
+    );
     assert!(
         store
             .lease_events(0, Duration::ZERO)
             .await
             .unwrap()
+            .events
             .is_empty()
     );
 }
@@ -595,7 +626,8 @@ async fn outbox_lease_never_exceeds_its_limit() {
             let batch = store
                 .lease_events(5, Duration::from_secs(300))
                 .await
-                .unwrap();
+                .unwrap()
+                .events;
             assert!(
                 batch.len() <= 5,
                 "leased {} rows for a limit of 5",
@@ -629,6 +661,7 @@ async fn outbox_lease_picks_once() {
     )))
     .bind(5_i64)
     .bind(60.0_f64)
+    .bind(Uuid::new_v4())
     .fetch_one(store.pool())
     .await
     .unwrap();

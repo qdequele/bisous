@@ -17,8 +17,8 @@ use uuid::Uuid;
 
 use crate::error::from_sqlx;
 use crate::{
-    BootSync, DailyProgress, DeadLetterPage, LabOutbox, OutboxEvent, RepoError, SecretKey,
-    StoredDeadLetter, StoredSync, SyncRepository, to_i64, to_u64, validate_spec,
+    BootSync, DailyProgress, DeadLetterPage, LabOutbox, OutboxEvent, OutboxLease, RepoError,
+    SecretKey, StoredDeadLetter, StoredSync, SyncRepository, to_i64, to_u64, validate_spec,
 };
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
@@ -33,7 +33,8 @@ const LEASE_SQL: &str = "WITH picked AS MATERIALIZED (
         LIMIT $1
         FOR UPDATE SKIP LOCKED
      )
-     UPDATE lab_events_outbox o SET leased_until = now() + make_interval(secs => $2)
+     UPDATE lab_events_outbox o
+     SET leased_until = now() + make_interval(secs => $2), lease_token = $3
      FROM picked WHERE o.id = picked.id
      RETURNING o.id, o.tenant_id, o.payload, o.created_at";
 
@@ -497,21 +498,22 @@ impl LabOutbox for PgStore {
         Ok(id)
     }
 
-    async fn lease_events(
-        &self,
-        limit: u32,
-        lease: Duration,
-    ) -> Result<Vec<OutboxEvent>, RepoError> {
+    async fn lease_events(&self, limit: u32, lease: Duration) -> Result<OutboxLease, RepoError> {
+        let token = Uuid::new_v4();
         if limit == 0 {
-            return Ok(Vec::new());
+            return Ok(OutboxLease {
+                token,
+                events: Vec::new(),
+            });
         }
         let rows = sqlx::query(LEASE_SQL)
             .bind(i64::from(limit))
             .bind(lease.as_secs_f64())
+            .bind(token)
             .fetch_all(&self.pool)
             .await
             .map_err(from_sqlx)?;
-        let mut out = rows
+        let mut events = rows
             .iter()
             .map(|r| {
                 let Json(payload): Json<serde_json::Value> =
@@ -525,18 +527,19 @@ impl LabOutbox for PgStore {
                 })
             })
             .collect::<Result<Vec<_>, RepoError>>()?;
-        out.sort_by_key(|e| (e.created_at, e.id));
-        Ok(out)
+        events.sort_by_key(|e| (e.created_at, e.id));
+        Ok(OutboxLease { token, events })
     }
 
-    async fn mark_events_sent(&self, ids: &[Uuid]) -> Result<u64, RepoError> {
+    async fn mark_events_sent(&self, lease: Uuid, ids: &[Uuid]) -> Result<u64, RepoError> {
         if ids.is_empty() {
             return Ok(0);
         }
         let done = sqlx::query(
             "UPDATE lab_events_outbox SET sent_at = now(), leased_until = NULL
-             WHERE id = ANY($1) AND sent_at IS NULL",
+             WHERE id = ANY($2) AND lease_token = $1 AND sent_at IS NULL",
         )
+        .bind(lease)
         .bind(ids)
         .execute(&self.pool)
         .await

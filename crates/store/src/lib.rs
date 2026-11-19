@@ -99,6 +99,15 @@ pub struct OutboxEvent {
     pub created_at: DateTime<Utc>,
 }
 
+/// Events leased together by [`LabOutbox::lease_events`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct OutboxLease {
+    /// Proves the lease: pass it to [`LabOutbox::mark_events_sent`].
+    pub token: Uuid,
+    /// Oldest first. Empty when nothing was free.
+    pub events: Vec<OutboxEvent>,
+}
+
 /// Sync specs and their per-sync data, scoped by tenant.
 #[async_trait]
 pub trait SyncRepository: Send + Sync {
@@ -181,16 +190,15 @@ pub trait LabOutbox: Send + Sync {
     ) -> Result<Uuid, RepoError>;
 
     /// Lease up to `limit` unsent events whose lease is free or expired,
-    /// oldest first, for `lease`. Concurrent leasers never get the same
-    /// event while its lease runs.
-    async fn lease_events(
-        &self,
-        limit: u32,
-        lease: Duration,
-    ) -> Result<Vec<OutboxEvent>, RepoError>;
+    /// oldest first, for `lease`, under a fresh token. Concurrent leasers
+    /// never get the same event while its lease runs.
+    async fn lease_events(&self, limit: u32, lease: Duration) -> Result<OutboxLease, RepoError>;
 
-    /// Mark events as delivered. Returns how many were newly marked.
-    async fn mark_events_sent(&self, ids: &[Uuid]) -> Result<u64, RepoError>;
+    /// Mark events as delivered, but only those still held under `lease`
+    /// (the token of an [`OutboxLease`]): an event whose lease expired and
+    /// was taken by another leaser is left to that leaser. Returns how many
+    /// were newly marked.
+    async fn mark_events_sent(&self, lease: Uuid, ids: &[Uuid]) -> Result<u64, RepoError>;
 }
 
 /// Checks shared by both stores before writing a spec.

@@ -14,8 +14,8 @@ use meili_connect_core::{DeadLetter, StateStore, StoreError, SyncSpec, SyncState
 use uuid::Uuid;
 
 use crate::{
-    BootSync, DailyProgress, DeadLetterPage, LabOutbox, OutboxEvent, RepoError, StoredDeadLetter,
-    StoredSync, SyncRepository, validate_spec,
+    BootSync, DailyProgress, DeadLetterPage, LabOutbox, OutboxEvent, OutboxLease, RepoError,
+    StoredDeadLetter, StoredSync, SyncRepository, validate_spec,
 };
 
 #[derive(Default)]
@@ -31,6 +31,7 @@ struct Inner {
 struct OutboxRow {
     event: OutboxEvent,
     leased_until: Option<DateTime<Utc>>,
+    lease_token: Option<Uuid>,
     sent_at: Option<DateTime<Utc>>,
 }
 
@@ -309,42 +310,44 @@ impl LabOutbox for MemStore {
                 created_at: Utc::now(),
             },
             leased_until: None,
+            lease_token: None,
             sent_at: None,
         });
         Ok(id)
     }
 
-    async fn lease_events(
-        &self,
-        limit: u32,
-        lease: Duration,
-    ) -> Result<Vec<OutboxEvent>, RepoError> {
+    async fn lease_events(&self, limit: u32, lease: Duration) -> Result<OutboxLease, RepoError> {
+        let token = Uuid::new_v4();
         let now = Utc::now();
         let until = chrono::Duration::from_std(lease)
             .ok()
             .and_then(|d| now.checked_add_signed(d))
             .unwrap_or(DateTime::<Utc>::MAX_UTC);
         let mut inner = self.lock()?;
-        let mut out = Vec::new();
+        let mut events = Vec::new();
         // Rows are kept in insertion (= creation) order.
         for row in inner.outbox.iter_mut() {
-            if out.len() >= limit as usize {
+            if events.len() >= limit as usize {
                 break;
             }
             if row.sent_at.is_none() && row.leased_until.is_none_or(|t| t <= now) {
                 row.leased_until = Some(until);
-                out.push(row.event.clone());
+                row.lease_token = Some(token);
+                events.push(row.event.clone());
             }
         }
-        Ok(out)
+        Ok(OutboxLease { token, events })
     }
 
-    async fn mark_events_sent(&self, ids: &[Uuid]) -> Result<u64, RepoError> {
+    async fn mark_events_sent(&self, lease: Uuid, ids: &[Uuid]) -> Result<u64, RepoError> {
         let now = Utc::now();
         let mut inner = self.lock()?;
         let mut n = 0;
         for row in inner.outbox.iter_mut() {
-            if row.sent_at.is_none() && ids.contains(&row.event.id) {
+            if row.sent_at.is_none()
+                && row.lease_token == Some(lease)
+                && ids.contains(&row.event.id)
+            {
                 row.sent_at = Some(now);
                 row.leased_until = None;
                 n += 1;
@@ -539,23 +542,27 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            first.iter().map(|e| e.id).collect::<Vec<_>>(),
+            first.events.iter().map(|e| e.id).collect::<Vec<_>>(),
             ids[..2].to_vec()
         );
         let second = store
             .lease_events(10, Duration::from_secs(60))
             .await
             .unwrap();
-        assert_eq!(second.len(), 1);
+        assert_eq!(second.events.len(), 1);
+        assert_ne!(first.token, second.token);
         assert!(
             store
                 .lease_events(10, Duration::from_secs(60))
                 .await
                 .unwrap()
+                .events
                 .is_empty()
         );
-        assert_eq!(store.mark_events_sent(&ids).await.unwrap(), 3);
-        assert_eq!(store.mark_events_sent(&ids).await.unwrap(), 0);
+        // Each lease marks only its own events.
+        assert_eq!(store.mark_events_sent(first.token, &ids).await.unwrap(), 2);
+        assert_eq!(store.mark_events_sent(second.token, &ids).await.unwrap(), 1);
+        assert_eq!(store.mark_events_sent(second.token, &ids).await.unwrap(), 0);
 
         // An expired lease frees the event.
         let id = store
@@ -567,7 +574,24 @@ mod tests {
             .lease_events(1, Duration::from_secs(60))
             .await
             .unwrap();
-        assert_eq!(again[0].id, id);
+        assert_eq!(again.events[0].id, id);
+    }
+
+    #[tokio::test]
+    async fn outbox_stale_lease_cannot_mark_sent() {
+        let store = MemStore::new();
+        let id = store
+            .enqueue_event(None, &serde_json::json!({}))
+            .await
+            .unwrap();
+        let stale = store.lease_events(1, Duration::ZERO).await.unwrap();
+        let fresh = store
+            .lease_events(1, Duration::from_secs(60))
+            .await
+            .unwrap();
+        assert_eq!(fresh.events[0].id, id);
+        assert_eq!(store.mark_events_sent(stale.token, &[id]).await.unwrap(), 0);
+        assert_eq!(store.mark_events_sent(fresh.token, &[id]).await.unwrap(), 1);
     }
 
     async fn enqueue_three(store: &MemStore) -> Vec<Uuid> {
