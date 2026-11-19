@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
-use crate::{Checkpoint, SourceError, SourceEvent, SourceSpec, StreamMapping};
+use crate::{Checkpoint, Endpoint, SourceError, SourceEvent, SourceSpec, StreamMapping};
 
 /// Bounded channel from the source to the engine. Back-pressure is the
 /// channel being full: a source must `send().await` and never buffer
@@ -165,6 +165,7 @@ pub trait Source: Send {
 
 /// Builds a [`Source`] from the stored spec. One implementation per
 /// connector crate; the server registers them by [`crate::SourceKind`].
+#[async_trait]
 pub trait SourceFactory: Send + Sync {
     /// `sync_id` is stable for the life of the sync and safe to embed in
     /// origin-side names (slot, publication, consumer group).
@@ -174,4 +175,22 @@ pub trait SourceFactory: Send + Sync {
         spec: &SourceSpec,
         streams: &[StreamMapping],
     ) -> Result<Box<dyn Source>, SourceError>;
+
+    /// Every host and port a source built from `spec` connects to: the
+    /// server vets them against its [`crate::HostPolicy`] before each
+    /// connection (check, discover, every engine attempt, teardown).
+    /// Includes the hosts a seed list expands to when the connector expands
+    /// it itself (MongoDB `mongodb+srv` SRV records). Must not connect to
+    /// the origin. A config without a host is a `Config` error; an empty
+    /// list means the connector only talks to a provider's own endpoints
+    /// (AWS without `endpoint_url`).
+    ///
+    /// The default refuses, so a connector that does not declare its
+    /// endpoints cannot be used by the server.
+    async fn endpoints(&self, spec: &SourceSpec) -> Result<Vec<Endpoint>, SourceError> {
+        Err(SourceError::Config(format!(
+            "the {} connector does not declare the hosts it connects to",
+            spec.kind.as_str()
+        )))
+    }
 }

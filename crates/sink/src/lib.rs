@@ -5,11 +5,13 @@
 
 mod client;
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use meili_connect_core::{
-    ApplyReport, DocOp, Document, IndexTarget, MeiliDestination, RejectedDoc, Sink, SinkError,
+    ApplyReport, DocOp, Document, HostPolicy, IndexTarget, MeiliDestination, RejectedDoc, Sink,
+    SinkError,
 };
 use reqwest::{Method, StatusCode};
 use serde::Deserialize;
@@ -54,6 +56,13 @@ pub struct SinkOptions {
     pub request_backoff: Duration,
     /// Cap of one delay, `Retry-After` included.
     pub max_request_backoff: Duration,
+    /// Which addresses the sink may connect to. Unless it is `any`, the
+    /// HTTP client resolves names through the policy and connects only to
+    /// the vetted addresses (no second lookup a DNS rebinding could
+    /// change), never through a proxy; a literal IP in the URL is vetted
+    /// when the sink is built. Redirects are never followed, whatever the
+    /// policy. Default: `any` (tests, trusted standalone use).
+    pub host_policy: Arc<HostPolicy>,
 }
 
 impl Default for SinkOptions {
@@ -71,6 +80,7 @@ impl Default for SinkOptions {
             request_retries: 5,
             request_backoff: Duration::from_millis(200),
             max_request_backoff: Duration::from_secs(30),
+            host_policy: Arc::new(HostPolicy::any()),
         }
     }
 }

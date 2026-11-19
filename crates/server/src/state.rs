@@ -3,10 +3,12 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use meili_connect_core::{SourceFactory, StateStore};
+use meili_connect_core::{HostPolicy, SourceFactory, StateStore};
 use meili_connect_store::{LabOutbox, SyncRepository};
 
 use crate::auth::AuthConfig;
+use crate::guard::GuardedSources;
+use crate::limits::{Limits, ProbeSlots};
 use crate::manager::{SinkFactory, SyncManager};
 
 /// Everything a store must be for the server: the engine's state, the
@@ -20,16 +22,26 @@ impl<T: StateStore + SyncRepository + LabOutbox> Backend for T {}
 pub struct AppState {
     pub backend: Arc<dyn Backend>,
     pub manager: Arc<SyncManager>,
-    pub sources: Arc<dyn SourceFactory>,
+    /// The connector registry, unguarded: go through [`AppState::sources`].
+    pub registry: Arc<dyn SourceFactory>,
     pub sinks: SinkFactory,
+    pub policy: Arc<HostPolicy>,
     pub auth: AuthConfig,
     /// Time limit of `check` and `discover`.
     pub probe_timeout: Duration,
     /// Usage events go to the Lab (all three `LAB_*` event variables set).
     pub lab_events: bool,
+    pub limits: Limits,
+    /// Slots for `check` and `discover`.
+    pub probes: Arc<ProbeSlots>,
 }
 
 impl AppState {
+    /// The connectors behind the host policy; `coarse` for Lab callers.
+    pub fn sources(&self, coarse: bool) -> GuardedSources {
+        GuardedSources::new(Arc::clone(&self.registry), Arc::clone(&self.policy), coarse)
+    }
+
     pub fn repo(&self) -> &dyn SyncRepository {
         &*self.backend
     }

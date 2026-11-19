@@ -25,7 +25,7 @@ Crawler (scrapix).
 
 | Crate | Role |
 |---|---|
-| `core` | Contracts only: `Change`, `Checkpoint`, `Source`, `Sink`, `StateStore`, `SyncSpec`, errors, `Secret`, `document_id`. No I/O. |
+| `core` | Contracts only: `Change`, `Checkpoint`, `Source`, `SourceFactory` (with `endpoints`), `Sink`, `StateStore`, `SyncSpec`, errors, `Secret`, `document_id`, and `HostPolicy`. No I/O but the DNS lookup of `HostPolicy`. |
 | `sink` | `MeiliSink`: NDJSON batches, task polling, poison-document bisection, swap, settings copy. |
 | `engine` | `run_sync`: drives one sync through its lifecycle; `Supervisor`: runs many, restarts with backoff. Depends on the three traits only. |
 | `store` | Postgres (`sqlx`): sync specs with sealed secrets, `SyncState`, dead letters, progress counters, Lab usage outbox. Also an in-memory store for tests and single-node trials. |
@@ -113,6 +113,55 @@ Standalone works with none of the `LAB_*` variables set. With them:
 - **Secrets at rest** are sealed with ChaCha20-Poly1305
   (`version(1)‖nonce(12)‖ciphertext`, key from `CONNECT_SECRET_KEY`), same
   layout as glutony's connections.
+
+## Host policy
+
+Sources and destinations are tenant-supplied addresses that the server
+connects to from inside its network. `core::HostPolicy`
+(`CONNECT_HOST_POLICY`: `public` by default with `LAB_SERVICE_TOKEN`, `any`
+standalone, `allowlist`) decides which addresses may be used; every resolved
+address of a name must pass. The state database is refused as a source origin
+in every mode.
+
+- Each connector declares where it connects: `SourceFactory::endpoints`
+  (Postgres/MySQL host, every MongoDB seed host and the hosts of a
+  `mongodb+srv` SRV record, every Kafka bootstrap server, DynamoDB's
+  `endpoint_url`).
+- The server vets them at `check`, `discover`, `POST` and `PUT`, and wraps
+  the registry (`server::guard::GuardedSources`) so that every source the
+  engine builds, one per attempt, vets them again before its first call
+  that may connect. A refusal is a `Config` error: the sync is held.
+- The sink resolves through the policy (a custom reqwest resolver), so its
+  connections go to the vetted addresses only; literal IPs are vetted when
+  the sink is built; no proxy, no redirects.
+- Errors of a tenant's source and sink, and of Lab calls, are reduced to
+  their class and a fixed description (`server::guard`).
+
+Residual risk: database drivers resolve DNS themselves, so between vetting
+and the driver's connect a rebinding window remains for sources (not for the
+sink); Kafka brokers advertised in metadata and MongoDB members discovered
+from the seeds are not vetted. A hosted deployment must also restrict egress
+at the network level.
+
+## Changes to a sync (`server::manager`)
+
+Every mutation (create, update, delete, pause, resume, resync, release) is
+one `SyncManager` entry point: it takes the sync's lock, reads the stored row
+again inside it, writes, then starts or stops the supervisor. The HTTP
+handler runs it detached from the request, so a client that hangs up (or the
+request timeout) never leaves a change half done. Stopping a sync inside the
+lock is bounded by `SHUTDOWN_GRACE_SECS`.
+
+`PUT` diffs the old and the new spec inside the lock: a new origin is torn
+down with the old spec first (nothing changes when that fails, unless
+`force`), then the checkpoint is cleared; new streams or another Meilisearch
+URL clear the checkpoint (full snapshot, into shadow indexes where the live
+ones hold data); anything else restarts. A paused sync stays paused.
+
+Bounds: `MAX_SYNCS_PER_TENANT`, probe slots (global and per tenant), a
+request timeout, dead letters per sync (enforced by the store, overflow
+counted in `sync_progress.dead_letters_dropped`), and the Lab outbox
+(per-event backoff, sender backoff, backlog cap on the enqueue side).
 
 ## Not in the first version
 

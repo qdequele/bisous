@@ -13,12 +13,15 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{SecondsFormat, Utc};
 use meili_connect_core::{DeadLetter, StateStore, StoreError, SyncState};
 use meili_connect_store::{LabOutbox, RepoError};
 use serde_json::{Value, json};
+
+use crate::limits::LogLimiter;
 
 /// Lab product name of meili-connect.
 pub const PRODUCT: &str = "connect";
@@ -31,14 +34,35 @@ struct Entry {
 
 /// Pending document counts of the registered syncs. Bounded by the number
 /// of syncs: counts of an unregistered sync are ignored.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct UsageMeter {
     entries: Mutex<HashMap<String, Entry>>,
+    /// Unsent outbox events beyond which `flush` keeps the counts in
+    /// memory instead of enqueueing (0: no cap).
+    backlog_cap: u64,
+    backlog_log: Mutex<LogLimiter>,
+}
+
+impl Default for UsageMeter {
+    fn default() -> Self {
+        Self {
+            entries: Mutex::new(HashMap::new()),
+            backlog_cap: 0,
+            backlog_log: Mutex::new(LogLimiter::new(Duration::from_secs(300))),
+        }
+    }
 }
 
 impl UsageMeter {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Stop enqueueing while the outbox holds `cap` unsent events or more;
+    /// counts keep accumulating in memory (one number per sync) meanwhile.
+    pub fn with_backlog_cap(mut self, cap: u64) -> Self {
+        self.backlog_cap = cap;
+        self
     }
 
     fn lock(&self) -> MutexGuard<'_, HashMap<String, Entry>> {
@@ -103,6 +127,26 @@ impl UsageMeter {
     /// non-zero count. On a store error the counts not yet enqueued are put
     /// back for the next flush. Returns how many events were enqueued.
     pub async fn flush(&self, outbox: &dyn LabOutbox) -> Result<usize, RepoError> {
+        if self.backlog_cap > 0 {
+            let backlog = outbox.count_unsent().await?;
+            if backlog >= self.backlog_cap {
+                let allowed = self
+                    .backlog_log
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .allow();
+                if let Some(suppressed) = allowed {
+                    tracing::warn!(
+                        backlog,
+                        cap = self.backlog_cap,
+                        suppressed,
+                        "the Lab events outbox is full (LAB_OUTBOX_MAX_PENDING): usage keeps \
+                         being counted in memory and is enqueued once the Lab takes events again"
+                    );
+                }
+                return Ok(0);
+            }
+        }
         let pending = self.take();
         let mut enqueued = 0;
         let mut iter = pending.into_iter();
@@ -291,6 +335,17 @@ mod tests {
         async fn prune_sent_events(&self, _: Duration) -> Result<u64, RepoError> {
             unreachable!()
         }
+        async fn defer_events(
+            &self,
+            _: uuid::Uuid,
+            _: &[uuid::Uuid],
+            _: meili_connect_store::RetryBackoff,
+        ) -> Result<u64, RepoError> {
+            unreachable!()
+        }
+        async fn count_unsent(&self) -> Result<u64, RepoError> {
+            Ok(0)
+        }
     }
 
     #[tokio::test]
@@ -303,6 +358,27 @@ mod tests {
         assert!(meter.flush(&FailingOutbox).await.is_err());
         assert_eq!(meter.pending("s1"), 2);
         assert_eq!(meter.pending("s2"), 3);
+    }
+
+    #[tokio::test]
+    async fn a_full_outbox_keeps_the_counts_in_memory() {
+        let outbox = MemStore::new();
+        for _ in 0..3 {
+            outbox.enqueue_event(Some("t"), &json!({})).await.unwrap();
+        }
+        let meter = UsageMeter::new().with_backlog_cap(3);
+        meter.register("s1", Some("t"));
+        meter.add("s1", 5);
+        assert_eq!(meter.flush(&outbox).await.unwrap(), 0);
+        assert_eq!(meter.pending("s1"), 5, "still counted");
+        meter.add("s1", 1);
+        assert_eq!(outbox.count_unsent().await.unwrap(), 3, "nothing enqueued");
+        // Room again: the whole count goes out at once.
+        let roomy = UsageMeter::new().with_backlog_cap(10);
+        roomy.register("s1", Some("t"));
+        roomy.add("s1", 6);
+        assert_eq!(roomy.flush(&outbox).await.unwrap(), 1);
+        assert_eq!(outbox.count_unsent().await.unwrap(), 4);
     }
 
     #[test]

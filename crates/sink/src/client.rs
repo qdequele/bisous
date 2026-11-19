@@ -4,10 +4,12 @@
 
 use std::hash::{BuildHasher as _, Hasher as _};
 use std::io::Write as _;
+use std::net::IpAddr;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use meili_connect_core::{MeiliDestination, SinkError};
+use meili_connect_core::{HostPolicy, MeiliDestination, SinkError};
 use reqwest::header::{
     AUTHORIZATION, CONTENT_ENCODING, CONTENT_TYPE, HeaderMap, HeaderValue, RETRY_AFTER,
 };
@@ -18,8 +20,30 @@ use crate::SinkOptions;
 
 /// Bodies above this size are gzipped on the blocking pool.
 const INLINE_GZIP_LIMIT: usize = 64 * 1024;
-/// Longest excerpt of an unparseable error body kept in a message.
-const RAW_ERROR_EXCERPT: usize = 200;
+
+/// Resolves the destination's name through the [`HostPolicy`] and hands
+/// hyper only the vetted addresses, so the connection goes where the policy
+/// looked (no second lookup for a DNS rebinding to change).
+struct PolicyResolver {
+    policy: Arc<HostPolicy>,
+    /// The destination URL's port: the client only ever talks to it.
+    port: u16,
+}
+
+impl reqwest::dns::Resolve for PolicyResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let policy = Arc::clone(&self.policy);
+        let host = name.as_str().to_owned();
+        let port = self.port;
+        Box::pin(async move {
+            let addrs = policy.resolve(&host, port).await.map_err(|e| {
+                tracing::warn!(error = %e, "Meilisearch destination refused by the host policy");
+                Box::new(e) as Box<dyn std::error::Error + Send + Sync>
+            })?;
+            Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
 
 /// Meilisearch's error object (`{message, code, type, link}`).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
@@ -133,11 +157,37 @@ impl Client {
             value.set_sensitive(true);
             headers.insert(AUTHORIZATION, value);
         }
-        let http = reqwest::Client::builder()
+        let policy = Arc::clone(&opts.host_policy);
+        let port = base.port_or_known_default().unwrap_or(80);
+        let host = base
+            .host_str()
+            .ok_or_else(|| SinkError::Config("invalid Meilisearch URL: no host".into()))?;
+        // hyper connects to a literal address without asking the resolver:
+        // vet it here, once (the URL never changes).
+        if let Ok(ip) = host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<IpAddr>()
+        {
+            policy
+                .check_ip(ip, Some(port))
+                .map_err(|e| SinkError::Config(format!("Meilisearch URL: {e}")))?;
+        }
+        let mut builder = reqwest::Client::builder()
             .default_headers(headers)
             .timeout(opts.request_timeout)
             .connect_timeout(opts.connect_timeout.min(opts.request_timeout))
             .user_agent(concat!("meili-connect/", env!("CARGO_PKG_VERSION")))
+            // A redirect would send the API key and the documents to a host
+            // nobody vetted.
+            .redirect(reqwest::redirect::Policy::none());
+        if !policy.is_any() {
+            // A proxy would resolve the name itself.
+            builder = builder
+                .no_proxy()
+                .dns_resolver(Arc::new(PolicyResolver { policy, port }));
+        }
+        let http = builder
             .build()
             .map_err(|e| SinkError::Config(format!("cannot build HTTP client: {e}")))?;
         Ok(Self { http, base, opts })
@@ -266,13 +316,12 @@ impl Client {
         if status.is_success() {
             return Ok(Ok(body));
         }
-        let error = serde_json::from_slice::<MeiliError>(&body).unwrap_or_else(|_| {
-            let text = String::from_utf8_lossy(&body);
-            let excerpt: String = text.chars().take(RAW_ERROR_EXCERPT).collect();
-            MeiliError {
-                message: format!("HTTP {status}: {excerpt}"),
-                ..MeiliError::default()
-            }
+        // A body that is not Meilisearch's error object is never echoed: the
+        // URL may point at something else, whose replies must not reach the
+        // tenant through error messages.
+        let error = serde_json::from_slice::<MeiliError>(&body).unwrap_or_else(|_| MeiliError {
+            message: format!("HTTP {status}: the reply is not a Meilisearch error"),
+            ..MeiliError::default()
         });
         Ok(Err(ApiError {
             status,

@@ -23,18 +23,20 @@ cp .env.example .env
 echo "CONNECT_SECRET_KEY=$(openssl rand -base64 32)" >> .env
 docker compose up -d --build
 curl localhost:8080/health          # {"status":"ok"}
+export AUTH="Authorization: Bearer dev-admin-key-change-me"
 ```
 
 `compose.yaml` starts the server, its state Postgres, a Meilisearch
 (`localhost:7700`, key `dev-master-key-change-me`) and a demo origin Postgres
 (`localhost:5433`, `wal_level=logical`, a `products` table with 1,000 rows).
-With no `ADMIN_API_KEY` the API is in open mode, so the examples below send no
-token; with one, add `-H "Authorization: Bearer $ADMIN_API_KEY"`.
+Compose publishes every port on `127.0.0.1` only and sets a development
+`ADMIN_API_KEY` (`dev-admin-key-change-me`, change it in `.env`); the
+examples send it.
 
 Sync the demo table (inside compose the services reach each other by name):
 
 ```bash
-curl -s localhost:8080/syncs -H 'Content-Type: application/json' -d '{
+curl -s localhost:8080/syncs -H "$AUTH" -H 'Content-Type: application/json' -d '{
   "name": "products",
   "source": {"kind": "postgres", "config": {"url": "postgres://app:app@origin:5432/app?sslmode=disable"}},
   "destination": {"url": "http://meilisearch:7700", "api_key": "dev-master-key-change-me"},
@@ -49,8 +51,10 @@ docker compose exec origin psql -U app -c "UPDATE products SET name = 'Blue lamp
 curl -s 'localhost:7700/indexes/products/search?q=lamp' -H 'Authorization: Bearer dev-master-key-change-me' | jq '.hits[0]'
 ```
 
-Without Docker: `cargo run -p meili-connect-server` (in-memory store when
-`DATABASE_URL` is unset; nothing survives a restart).
+Without Docker: `LISTEN_ADDR=127.0.0.1:8080 cargo run -p meili-connect-server`
+(in-memory store when `DATABASE_URL` is unset; nothing survives a restart).
+With no `ADMIN_API_KEY` nor `LAB_SERVICE_TOKEN` the API is in open mode, which
+the server only accepts on a loopback address or with `ALLOW_OPEN_MODE=true`.
 
 ## The API by example
 
@@ -63,7 +67,7 @@ the body `{"code": "...", "message": "..."}`.
 |---|---|---|
 | `LAB_SERVICE_TOKEN` | `Authorization: Bearer <token>` **and** `X-Connect-Tenant-Id: <tenant>` | that tenant only |
 | `ADMIN_API_KEY` | `Authorization: Bearer <key>`, optionally `X-Connect-Tenant-Id` | global, or the named tenant |
-| neither | nothing | global (open mode, logged loudly at startup) |
+| neither | nothing | global (open mode: only on a loopback `LISTEN_ADDR` or with `ALLOW_OPEN_MODE=true`, logged loudly) |
 
 Tokens are compared in constant time. A sync of another scope does not exist
 for the caller: every route answers `404`. `/health` is always open.
@@ -119,9 +123,26 @@ spec the API returns has the Meilisearch key and the source's secrets
 
 ### Update
 
-`PUT` replaces the spec, then stops and restarts the sync. Send
+`PUT` replaces the spec. What happens next depends on what changed:
+
+- **Another origin** (kind, host, port, URL, user, database, TLS, slot or
+  publication name): the old origin is cleaned up first with the old spec
+  (slot, publication…); if that fails nothing changes (`502
+  teardown_failed`, or `?force=true` to go on and clean up by hand). Then the
+  sync starts fresh: full snapshot.
+- **Other streams** (index, primary key, fields, renames, vector, a new
+  collection) **or another Meilisearch URL**: the checkpoint is cleared and
+  the sync snapshots everything again, into shadow indexes where the live
+  ones hold data, so new mappings are backfilled.
+- **Anything else** (name, guard, secrets, tuning): a plain restart.
+
+A paused sync stays paused. Send
 `"<redacted>"` for any secret to keep the stored value, so a `GET` body can be
-edited and sent back:
+edited and sent back. A placeholder is only accepted while the connection it
+belongs to is unchanged: the source's kind, hosts, ports, URLs, user,
+database and TLS settings for a source secret, the URL for the Meilisearch
+key. Point the sync somewhere else and the secret must be sent again
+(`422 secret_required`), so a stored secret never follows a new host.
 
 ```bash
 curl -s $API/syncs/$ID -H "$AUTH" | jq '.name = "products v2"' \
@@ -163,7 +184,8 @@ Stops the sync, deletes leftover shadow indexes, tears the source down on the
 origin (replication slot and publication, consumer group), then deletes the
 sync with its state, dead letters and progress. The Meilisearch indexes are
 kept. If the origin cannot be reached the answer is `502 teardown_failed` and
-the sync is kept, stopped, so the call can be retried; `?force=true` deletes
+the sync is kept, paused (its status says why; it stays stopped across
+restarts), so the call can be retried; `?force=true` deletes
 it anyway (drop the slot by hand then, or it retains WAL).
 
 ## Configuration
@@ -175,17 +197,60 @@ Every variable, with defaults, is in [`.env.example`](.env.example).
 | `LISTEN_ADDR` | `0.0.0.0:8080` | HTTP API address. |
 | `DATABASE_URL` | unset | State Postgres. **Unset: in-memory store, nothing survives a restart** (warned at startup). |
 | `CONNECT_SECRET_KEY` | | Base64 32-byte key sealing specs at rest. Required with `DATABASE_URL`. `openssl rand -base64 32`. |
-| `ADMIN_API_KEY` | unset | Standalone admin token. |
-| `LAB_SERVICE_TOKEN` | unset | Lab token; requires `X-Connect-Tenant-Id`. |
+| `ADMIN_API_KEY` | unset | Standalone admin token. Set but blank: startup error. |
+| `ALLOW_OPEN_MODE` | `false` | Without any token the server only starts on a loopback `LISTEN_ADDR`, unless this is `true`. |
+| `LAB_SERVICE_TOKEN` | unset | Lab token; requires `X-Connect-Tenant-Id`. Set but blank: startup error. |
+| `CONNECT_HOST_POLICY` | `public` with `LAB_SERVICE_TOKEN`, else `any` | Which hosts sources and destinations may point at: `public`, `any` or `allowlist`. See [Host policy](#host-policy). |
+| `CONNECT_HOST_ALLOWLIST` | unset | With `allowlist`: comma-separated `host`, `host:port`, IP addresses and CIDRs. |
 | `LAB_URL`, `LAB_INSTANCE_ID`, `LAB_INSTANCE_SECRET` | unset | Lab usage events. All three or none. |
 | `USAGE_FLUSH_INTERVAL_SECS` | `60` | How often counts become usage events. |
 | `LAB_SEND_INTERVAL_SECS` | `2` | How often the outbox is delivered. |
 | `SOURCE_PROBE_TIMEOUT_SECS` | `30` | Limit of `check` and `discover`. |
-| `SHUTDOWN_GRACE_SECS` | `30` | Time the syncs get to stop on SIGTERM/SIGINT. |
+| `SHUTDOWN_GRACE_SECS` | `30` | Time the syncs get to stop on SIGTERM/SIGINT; also the bound on stopping one sync. |
+| `MAX_SYNCS_PER_TENANT` | `20` | Syncs a tenant may own (`409 sync_quota_exceeded`). The global scope is not limited. |
+| `PROBE_CONCURRENCY` / `PROBE_CONCURRENCY_PER_TENANT` | `16` / `4` | `check` and `discover` running at once, in all and per tenant (`429 too_many_probes`). |
+| `REQUEST_TIMEOUT_SECS` | `180` | Longest API request (`503 request_timeout`); a change to a sync still completes. |
+| `DEAD_LETTERS_MAX_PER_SYNC` | `10000` | Dead letters kept per sync; past it they are counted (`dead_letters_overflow` in the status) but not stored. Payloads over 64 KiB are stored as `{"truncated": true, "bytes": n}`. |
+| `LAB_OUTBOX_MAX_PENDING` | `100000` | Unsent Lab events beyond which usage stays counted in memory instead of enqueued. |
 | `LOG_FORMAT` | `pretty` | `pretty` or `json`. |
 | `LOG_LEVEL` / `RUST_LOG` | `info` | `RUST_LOG` wins and takes the full filter syntax. |
 
 Specs, checkpoints, document bodies and secrets are never logged.
+
+### Host policy
+
+A sync's source and its Meilisearch destination are addresses the caller
+chooses, and the server connects to them from inside its own network. The
+host policy decides, before any connection, which addresses are allowed:
+
+| `CONNECT_HOST_POLICY` | Allows |
+|---|---|
+| `public` (default with `LAB_SERVICE_TOKEN`) | Names whose **every** resolved address is public, and public literal addresses. Loopback, RFC 1918, CGNAT `100.64/10`, link-local (`169.254.169.254` included), IPv6 ULA `fc00::/7`, the IPv4-mapped and NAT64 forms of these, multicast, broadcast, unspecified and documentation ranges are refused. |
+| `any` (default standalone) | Every host. |
+| `allowlist` | Only the entries of `CONNECT_HOST_ALLOWLIST`: a host name (any address it resolves to, optionally one port) or a network (every resolved address must be in one). |
+
+In every mode the server's own state database (`DATABASE_URL`) is refused as
+a source origin. The policy applies to `check`, `discover`, `POST` and `PUT`
+(`422 host_not_allowed`, naming the host but not what it resolved to), and
+again every time a sync starts or restarts (a refused sync is `held`). The
+Meilisearch client resolves names through the policy and connects only to the
+vetted addresses, uses no proxy and never follows redirects.
+
+Errors reported to the Lab (calls with `LAB_SERVICE_TOKEN`, and the
+`message` / `last_error` of a tenant's sync) are reduced to their class and a
+fixed description; the server log keeps the detail. The standalone admin sees
+detailed errors.
+
+**Residual risk.** Database drivers (Postgres, MySQL, MongoDB, Kafka, the AWS
+SDK) resolve names themselves: between the policy's lookup and the driver's
+connect a DNS rebinding window remains for sources (not for the Meilisearch
+destination, whose connection is pinned to the vetted addresses). Kafka
+brokers advertised in the cluster metadata, and MongoDB replica-set members
+discovered from the seed hosts, are not vetted. DynamoDB with
+`credentials: {"type": "default"}` uses the server's own AWS identity. A
+hosted deployment must therefore also restrict egress at the network level
+(no route to the metadata endpoint, the state database or internal services
+from the connector's network).
 
 ### Usage events (the Lab)
 
@@ -203,8 +268,12 @@ with a non-zero count goes into the outbox (Postgres):
 A sender leases up to 500 events, posts `{"events": [...]}` to
 `<LAB_URL>/internal/events` with `X-Lab-Instance-Id`, `X-Lab-Timestamp` and
 `X-Lab-Signature: sha256=<hex HMAC-SHA256(LAB_INSTANCE_SECRET, "<ts>.<body>")>`,
-marks the ids the Lab lists in `accepted` as sent and retries the rest. Sent
-events are pruned after 7 days. Delivery is **at-least-once from the outbox
+marks the ids the Lab lists in `accepted` as sent and retries the rest. An
+event that failed waits longer after each attempt (10 s doubling up to an
+hour), the sender slows down while the Lab fails and logs it at most every
+5 minutes, and past `LAB_OUTBOX_MAX_PENDING` unsent events usage is kept
+counted in memory (one number per sync) instead of enqueued. Sent events are
+pruned after 7 days. Delivery is **at-least-once from the outbox
 onward** (the event id is stable, the Lab deduplicates). Counts accumulated in
 memory but not yet enqueued **are lost if the process crashes** (at most one
 flush interval); a graceful shutdown enqueues them. Global (non-tenant) syncs
@@ -316,7 +385,6 @@ Known limits:
 - One collection per index; no joins across tables; transforms are field
   selection, renames and a vector field only.
 - Usage counts not yet enqueued are lost on a crash (see above).
-- `PUT` restarts the sync even when it was paused.
 - No web UI: the Lab console is the UI.
 
 ## Development

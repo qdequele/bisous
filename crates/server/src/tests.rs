@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -12,8 +12,9 @@ use axum::http::{Method, Request, StatusCode};
 use http_body_util::BodyExt;
 use meili_connect_core::{
     AckReceiver, ApplyReport, Capabilities, Change, CheckReport, CheckStatus, Checkpoint,
-    CollectionInfo, DocOp, EventSender, IndexTarget, MeiliDestination, Op, Opened, Sink, SinkError,
-    Source, SourceError, SourceEvent, SourceFactory, SourceSpec, StreamMapping, SyncPhase,
+    CollectionInfo, DocOp, Endpoint, EventSender, HostPolicy, IndexTarget, MeiliDestination, Op,
+    Opened, Sink, SinkError, Source, SourceError, SourceEvent, SourceFactory, SourceSpec,
+    StreamMapping, SyncPhase,
 };
 use meili_connect_engine::SupervisorConfig;
 use meili_connect_store::{LabOutbox, MemStore, SyncRepository};
@@ -22,6 +23,7 @@ use tokio_util::sync::CancellationToken;
 use tower::ServiceExt;
 
 use crate::auth::{AuthConfig, H_TENANT_ID};
+use crate::limits::Limits;
 use crate::manager::SinkFactory;
 use crate::routes::ROUTES;
 use crate::state::{AppState, Backend};
@@ -37,19 +39,42 @@ const SECRET_MARK: &str = "hunter2";
 struct Probe {
     teardown_fails: AtomicBool,
     teardowns: AtomicUsize,
+    /// Each teardown takes this long.
+    teardown_delay_ms: AtomicU64,
+    /// The config of the last source the engine opened.
+    last_opened: std::sync::Mutex<Option<Value>>,
+    /// The configs torn down, in order.
+    torn_down: std::sync::Mutex<Vec<Value>>,
 }
 
 struct FakeSources(Arc<Probe>);
 
 /// Config knobs: `invalid` (build fails), `slow` (check/discover hang),
-/// `rows` (snapshot emits that many upserts).
+/// `rows` (snapshot emits that many upserts), `host`/`port` (its endpoint),
+/// `check_error` (check fails with that transient text), `open_error`
+/// (open fails with that configuration text).
 struct FakeSource {
     probe: Arc<Probe>,
     config: Value,
     collection: String,
 }
 
+#[async_trait]
 impl SourceFactory for FakeSources {
+    async fn endpoints(&self, spec: &SourceSpec) -> Result<Vec<Endpoint>, SourceError> {
+        Ok(match spec.config.get("host").and_then(Value::as_str) {
+            Some(host) => vec![Endpoint::new(
+                host,
+                spec.config
+                    .get("port")
+                    .and_then(Value::as_u64)
+                    .and_then(|p| u16::try_from(p).ok())
+                    .unwrap_or(5432),
+            )],
+            None => vec![],
+        })
+    }
+
     fn build(
         &self,
         _sync_id: &str,
@@ -83,6 +108,9 @@ impl Source for FakeSource {
         if self.config.get("slow").is_some() {
             tokio::time::sleep(Duration::from_secs(30)).await;
         }
+        if let Some(e) = self.config.get("check_error").and_then(Value::as_str) {
+            return Err(SourceError::Transient(e.to_owned()));
+        }
         let mut r = CheckReport::default();
         r.push("connect", CheckStatus::Ok, "connected");
         r.push("wal_level", CheckStatus::Failed, "set wal_level to logical");
@@ -102,6 +130,10 @@ impl Source for FakeSource {
     }
 
     async fn open(&mut self, resume: Option<Checkpoint>) -> Result<Opened, SourceError> {
+        if let Some(e) = self.config.get("open_error").and_then(Value::as_str) {
+            return Err(SourceError::Config(e.to_owned()));
+        }
+        *self.probe.last_opened.lock().unwrap() = Some(self.config.clone());
         Ok(match resume {
             Some(_) => Opened::Resumed,
             None => Opened::Fresh {
@@ -137,12 +169,25 @@ impl Source for FakeSource {
         _acks: AckReceiver,
         cancel: CancellationToken,
     ) -> Result<(), SourceError> {
+        if self.config.get("stubborn").is_some() {
+            // Ignores cancellation: only an abort stops it.
+            std::future::pending::<()>().await;
+        }
         cancel.cancelled().await;
         Ok(())
     }
 
     async fn teardown(&mut self) -> Result<(), SourceError> {
         self.probe.teardowns.fetch_add(1, Ordering::SeqCst);
+        self.probe
+            .torn_down
+            .lock()
+            .unwrap()
+            .push(self.config.clone());
+        let delay = self.probe.teardown_delay_ms.load(Ordering::SeqCst);
+        if delay > 0 {
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+        }
         if self.probe.teardown_fails.load(Ordering::SeqCst) {
             Err(SourceError::Transient("origin unreachable".into()))
         } else {
@@ -200,16 +245,48 @@ struct App {
 }
 
 fn app_with(auth: AuthConfig, store: Arc<MemStore>) -> App {
+    app_full(auth, store, HostPolicy::any())
+}
+
+fn app_full(auth: AuthConfig, store: Arc<MemStore>, policy: HostPolicy) -> App {
+    app_build(
+        auth,
+        store,
+        policy,
+        Limits::default(),
+        Duration::from_millis(200),
+    )
+}
+
+fn app_limits(auth: AuthConfig, limits: Limits, probe_timeout: Duration) -> App {
+    app_build(
+        auth,
+        Arc::new(MemStore::new()),
+        HostPolicy::any(),
+        limits,
+        probe_timeout,
+    )
+}
+
+fn app_build(
+    auth: AuthConfig,
+    store: Arc<MemStore>,
+    policy: HostPolicy,
+    limits: Limits,
+    probe_timeout: Duration,
+) -> App {
     let probe = Arc::new(Probe::default());
     let state = build_state(
         Arc::clone(&store) as Arc<dyn Backend>,
         Wiring {
             sources: Arc::new(FakeSources(Arc::clone(&probe))),
             sinks: fake_sinks(),
+            policy: Arc::new(policy),
             supervisor: SupervisorConfig::default(),
             auth,
-            probe_timeout: Duration::from_millis(200),
+            probe_timeout,
             lab_events: true,
+            limits,
         },
         CancellationToken::new(),
     );
@@ -229,6 +306,7 @@ fn locked() -> AuthConfig {
     AuthConfig {
         lab_service_token: Some(LAB.into()),
         admin_api_key: Some(ADMIN.into()),
+        open_mode: false,
     }
 }
 
@@ -324,7 +402,7 @@ async fn wait_for(mut cond: impl AsyncFnMut() -> bool) {
 #[tokio::test]
 async fn auth_matrix() {
     // Open mode: everything is global, no token needed.
-    let open = app(AuthConfig::default());
+    let open = app(AuthConfig::open());
     assert_eq!(
         call(&open.router, "GET", "/syncs", &[], None).await.0,
         StatusCode::OK
@@ -471,7 +549,7 @@ async fn a_tenant_never_reaches_another_tenants_sync() {
 
 #[tokio::test]
 async fn secrets_are_redacted_on_every_response() {
-    let a = app(AuthConfig::default());
+    let a = app(AuthConfig::open());
     let (status, created) = call(&a.router, "POST", "/syncs", &[], Some(sync_body("s"))).await;
     assert_eq!(status, StatusCode::CREATED);
     assert_no_secret(&created);
@@ -502,7 +580,7 @@ async fn secrets_are_redacted_on_every_response() {
 
 #[tokio::test]
 async fn put_keeps_redacted_secrets() {
-    let a = app(AuthConfig::default());
+    let a = app(AuthConfig::open());
     let id = create(&a, &[], "s").await;
     let (_, mut current) = call(&a.router, "GET", &format!("/syncs/{id}"), &[], None).await;
     // Edit a plain field, send the redacted placeholders back.
@@ -520,7 +598,15 @@ async fn put_keeps_redacted_secrets() {
     assert_no_secret(&updated);
     assert_eq!(updated["name"], "renamed");
 
-    let stored = a.store.get_sync(None, &id).await.unwrap().unwrap().spec;
+    let stored = a
+        .store
+        .get_sync(None, &id)
+        .await
+        .unwrap()
+        .unwrap()
+        .readable()
+        .unwrap()
+        .spec;
     assert_eq!(
         stored.destination.api_key.expose(),
         format!("meili-{SECRET_MARK}")
@@ -540,7 +626,15 @@ async fn put_keeps_redacted_secrets() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    let stored = a.store.get_sync(None, &id).await.unwrap().unwrap().spec;
+    let stored = a
+        .store
+        .get_sync(None, &id)
+        .await
+        .unwrap()
+        .unwrap()
+        .readable()
+        .unwrap()
+        .spec;
     assert_eq!(stored.source.config["password"], "new-pass");
 
     // A placeholder with nothing stored behind it is refused.
@@ -550,7 +644,7 @@ async fn put_keeps_redacted_secrets() {
         "PUT",
         &format!("/syncs/{id}"),
         &[],
-        Some(current),
+        Some(current.clone()),
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -560,6 +654,70 @@ async fn put_keeps_redacted_secrets() {
             .unwrap()
             .contains("source.config.new_token")
     );
+
+    // A placeholder never follows a new destination or a new source host.
+    current["source"]["config"]["new_token"] = json!("t");
+    let mut moved = current.clone();
+    moved["destination"]["url"] = json!("http://attacker.example:7700");
+    let (status, body) = call(
+        &a.router,
+        "PUT",
+        &format!("/syncs/{id}"),
+        &[],
+        Some(moved.clone()),
+    )
+    .await;
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (StatusCode::UNPROCESSABLE_ENTITY, Some("secret_required")),
+        "{body}"
+    );
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap()
+            .contains("destination.api_key")
+    );
+    let mut moved_source = current.clone();
+    moved_source["source"]["config"]["host"] = json!("attacker.example");
+    let (status, body) = call(
+        &a.router,
+        "PUT",
+        &format!("/syncs/{id}"),
+        &[],
+        Some(moved_source),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["code"], "secret_required");
+    let stored = a
+        .store
+        .get_sync(None, &id)
+        .await
+        .unwrap()
+        .unwrap()
+        .readable()
+        .unwrap()
+        .spec;
+    assert_eq!(
+        stored.destination.url, "http://meili:7700",
+        "nothing changed"
+    );
+    // Sending the key again moves it.
+    moved["destination"]["api_key"] = json!("other-key");
+    let (status, _) = call(&a.router, "PUT", &format!("/syncs/{id}"), &[], Some(moved)).await;
+    assert_eq!(status, StatusCode::OK);
+    let stored = a
+        .store
+        .get_sync(None, &id)
+        .await
+        .unwrap()
+        .unwrap()
+        .readable()
+        .unwrap()
+        .spec;
+    assert_eq!(stored.destination.url, "http://attacker.example:7700");
+    assert_eq!(stored.destination.api_key.expose(), "other-key");
 
     // A create never accepts placeholders.
     let mut body = sync_body("other");
@@ -572,7 +730,7 @@ async fn put_keeps_redacted_secrets() {
 
 #[tokio::test]
 async fn invalid_specs_are_refused() {
-    let a = app(AuthConfig::default());
+    let a = app(AuthConfig::open());
     let cases: Vec<(Value, StatusCode, &str)> = vec![
         (
             {
@@ -713,7 +871,7 @@ async fn invalid_specs_are_refused() {
 
 #[tokio::test]
 async fn check_and_discover_store_nothing_and_time_out() {
-    let a = app(AuthConfig::default());
+    let a = app(AuthConfig::open());
     let probe = json!({"source": {"kind": "postgres", "config": {"password": "x"}}});
     let (status, body) = call(
         &a.router,
@@ -747,11 +905,791 @@ async fn check_and_discover_store_nothing_and_time_out() {
     );
 }
 
+// ------------------------------------------------------------- host policy
+
+fn origin(host: &str, port: u16) -> Value {
+    json!({"kind": "postgres", "config": {"host": host, "port": port, "rows": 1}})
+}
+
+fn body_with(source: Value, destination: &str, name: &str) -> Value {
+    let mut b = sync_body(name);
+    b["source"] = source;
+    b["destination"]["url"] = json!(destination);
+    b
+}
+
+#[tokio::test]
+async fn the_public_policy_refuses_internal_origins_everywhere() {
+    let a = app_full(locked(), Arc::new(MemStore::new()), HostPolicy::public());
+    for host in [
+        "127.0.0.1",
+        "10.1.2.3",
+        "169.254.169.254",
+        "::1",
+        "localhost",
+    ] {
+        for uri in ["/sources/check", "/sources/discover"] {
+            let (status, body) = call(
+                &a.router,
+                "POST",
+                uri,
+                &lab("t1"),
+                Some(json!({"source": origin(host, 5432)})),
+            )
+            .await;
+            assert_eq!(
+                (status, body["code"].as_str()),
+                (StatusCode::UNPROCESSABLE_ENTITY, Some("host_not_allowed")),
+                "{uri} {host}: {body}"
+            );
+            let msg = body["message"].as_str().unwrap();
+            assert!(msg.contains(host), "{msg}");
+            if host == "localhost" {
+                assert!(!msg.contains("127.0.0.1") && !msg.contains("::1"), "{msg}");
+            }
+        }
+        let (status, body) = call(
+            &a.router,
+            "POST",
+            "/syncs",
+            &lab("t1"),
+            Some(body_with(origin(host, 5432), "https://8.8.8.8", host)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{host}: {body}");
+        assert_eq!(body["code"], "host_not_allowed");
+    }
+    // A Meilisearch destination on loopback is refused too.
+    for dest in [
+        "http://127.0.0.1:7700",
+        "http://localhost:7700",
+        "http://[::1]:7700",
+    ] {
+        let (status, body) = call(
+            &a.router,
+            "POST",
+            "/syncs",
+            &lab("t1"),
+            Some(body_with(origin("8.8.8.8", 5432), dest, "d")),
+        )
+        .await;
+        assert_eq!(
+            (status, body["code"].as_str()),
+            (StatusCode::UNPROCESSABLE_ENTITY, Some("host_not_allowed")),
+            "{dest}: {body}"
+        );
+    }
+    let (_, list) = call(&a.router, "GET", "/syncs", &lab("t1"), None).await;
+    assert_eq!(list["syncs"], json!([]));
+    // A public origin and destination pass.
+    let (status, body) = call(
+        &a.router,
+        "POST",
+        "/sources/check",
+        &lab("t1"),
+        Some(json!({"source": origin("8.8.8.8", 5432)})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// With the production sinks (which refuse a literal internal address
+/// themselves) the answer is still `422 host_not_allowed`.
+#[tokio::test]
+async fn a_loopback_destination_is_host_not_allowed_with_the_real_sinks() {
+    let policy = Arc::new(HostPolicy::public());
+    let state = build_state(
+        Arc::new(MemStore::new()) as Arc<dyn Backend>,
+        Wiring {
+            sources: Arc::new(FakeSources(Arc::new(Probe::default()))),
+            sinks: crate::manager::meili_sinks(Arc::clone(&policy)),
+            policy,
+            supervisor: SupervisorConfig::default(),
+            auth: AuthConfig::open(),
+            probe_timeout: Duration::from_millis(200),
+            lab_events: false,
+            limits: Limits::default(),
+        },
+        CancellationToken::new(),
+    );
+    let router = router(state);
+    for dest in [
+        "http://127.0.0.1:7700",
+        "http://[::1]:7700",
+        "http://localhost:7700",
+    ] {
+        let (status, body) = call(
+            &router,
+            "POST",
+            "/syncs",
+            &[],
+            Some(body_with(origin("8.8.8.8", 5432), dest, "d")),
+        )
+        .await;
+        assert_eq!(
+            (status, body["code"].as_str()),
+            (StatusCode::UNPROCESSABLE_ENTITY, Some("host_not_allowed")),
+            "{dest}: {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_state_database_is_refused_even_under_any() {
+    let policy = HostPolicy::any().forbid_origin(Endpoint::new("127.0.0.1", 6543));
+    let a = app_full(AuthConfig::open(), Arc::new(MemStore::new()), policy);
+    for host in ["127.0.0.1", "localhost"] {
+        let (status, body) = call(
+            &a.router,
+            "POST",
+            "/sources/check",
+            &[],
+            Some(json!({"source": origin(host, 6543)})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{host}: {body}");
+        assert_eq!(body["code"], "host_not_allowed");
+    }
+    // Another port of the same host is a different server.
+    let (status, _) = call(
+        &a.router,
+        "POST",
+        "/sources/check",
+        &[],
+        Some(json!({"source": origin("127.0.0.1", 5432)})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn every_start_vets_the_origin_again() {
+    let store = Arc::new(MemStore::new());
+    let first = app_with(AuthConfig::open(), Arc::clone(&store));
+    let mut body = sync_body("s");
+    body["source"] = origin("127.0.0.1", 5432);
+    let (status, created) = call(&first.router, "POST", "/syncs", &[], Some(body)).await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let id = created["id"].as_str().unwrap().to_owned();
+    first.state.manager.shutdown(Duration::from_secs(5)).await;
+
+    // The operator tightens the policy: the stored sync is held at boot.
+    let second = app_full(AuthConfig::open(), store, HostPolicy::public());
+    boot_syncs(&second.state).await.unwrap();
+    let uri = format!("/syncs/{id}/status");
+    wait_for(async || call(&second.router, "GET", &uri, &[], None).await.1["phase"] == "held")
+        .await;
+    let (_, st) = call(&second.router, "GET", &uri, &[], None).await;
+    assert!(
+        st["message"].as_str().unwrap().contains("not allowed"),
+        "{st}"
+    );
+}
+
+#[tokio::test]
+async fn lab_callers_and_tenant_syncs_get_coarse_errors() {
+    let a = app(locked());
+    let probe = json!({"source": {"kind": "postgres", "config": {
+        "check_error": "connect 10.9.9.9:5432: DRIVER-DETAIL"}}});
+    let (status, body) = call(
+        &a.router,
+        "POST",
+        "/sources/check",
+        &lab("t1"),
+        Some(probe.clone()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert!(!body.to_string().contains("DRIVER-DETAIL"), "{body}");
+    // The operator sees the detail.
+    let (_, body) = call(&a.router, "POST", "/sources/check", &admin(), Some(probe)).await;
+    assert!(body.to_string().contains("DRIVER-DETAIL"), "{body}");
+
+    // Persisted messages of a tenant's sync are coarse too.
+    let mut body = sync_body("held");
+    body["source"]["config"]["open_error"] = json!("relation 10.9.9.9 DRIVER-DETAIL");
+    let (status, created) = call(&a.router, "POST", "/syncs", &lab("t1"), Some(body.clone())).await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let id = created["id"].as_str().unwrap().to_owned();
+    let uri = format!("/syncs/{id}/status");
+    wait_for(async || call(&a.router, "GET", &uri, &lab("t1"), None).await.1["phase"] == "held")
+        .await;
+    let (_, st) = call(&a.router, "GET", &uri, &lab("t1"), None).await;
+    assert!(!st.to_string().contains("DRIVER-DETAIL"), "{st}");
+    assert!(
+        st["message"].as_str().unwrap().contains("configuration"),
+        "{st}"
+    );
+    // A global sync keeps the detail for the operator.
+    let (status, created) = call(&a.router, "POST", "/syncs", &admin(), Some(body)).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let id = created["id"].as_str().unwrap().to_owned();
+    let uri = format!("/syncs/{id}/status");
+    wait_for(async || call(&a.router, "GET", &uri, &admin(), None).await.1["phase"] == "held")
+        .await;
+    let (_, st) = call(&a.router, "GET", &uri, &admin(), None).await;
+    assert!(
+        st["message"].as_str().unwrap().contains("DRIVER-DETAIL"),
+        "{st}"
+    );
+}
+
+// ------------------------------------------------------------- quotas
+
+#[tokio::test]
+async fn a_tenant_owns_a_bounded_number_of_syncs() {
+    let a = app_limits(
+        locked(),
+        Limits {
+            max_syncs_per_tenant: 2,
+            ..Limits::default()
+        },
+        Duration::from_millis(200),
+    );
+    create(&a, &lab("t1"), "one").await;
+    let two = create(&a, &lab("t1"), "two").await;
+    let (status, body) = call(
+        &a.router,
+        "POST",
+        "/syncs",
+        &lab("t1"),
+        Some(sync_body("three")),
+    )
+    .await;
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (StatusCode::CONFLICT, Some("sync_quota_exceeded")),
+        "{body}"
+    );
+    // Other tenants and the global scope are not affected.
+    create(&a, &lab("t2"), "one").await;
+    for i in 0..3 {
+        create(&a, &admin(), &format!("g{i}")).await;
+    }
+    // Deleting one frees a slot.
+    let (status, _) = call(
+        &a.router,
+        "DELETE",
+        &format!("/syncs/{two}"),
+        &lab("t1"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    create(&a, &lab("t1"), "three").await;
+}
+
+#[tokio::test]
+async fn concurrent_creates_respect_the_quota() {
+    let a = app_limits(
+        locked(),
+        Limits {
+            max_syncs_per_tenant: 3,
+            ..Limits::default()
+        },
+        Duration::from_millis(200),
+    );
+    let calls = (0..8).map(|i| {
+        let router = a.router.clone();
+        async move {
+            call(
+                &router,
+                "POST",
+                "/syncs",
+                &lab("t1"),
+                Some(sync_body(&format!("s{i}"))),
+            )
+            .await
+            .0
+        }
+    });
+    let statuses = futures_join_all(calls).await;
+    assert_eq!(
+        statuses
+            .iter()
+            .filter(|s| **s == StatusCode::CREATED)
+            .count(),
+        3
+    );
+    let (_, list) = call(&a.router, "GET", "/syncs", &lab("t1"), None).await;
+    assert_eq!(list["syncs"].as_array().unwrap().len(), 3);
+}
+
+async fn futures_join_all<F: std::future::Future + Send + 'static>(
+    futs: impl Iterator<Item = F>,
+) -> Vec<F::Output>
+where
+    F::Output: Send + 'static,
+{
+    let handles: Vec<_> = futs.map(tokio::spawn).collect();
+    let mut out = Vec::new();
+    for h in handles {
+        out.push(h.await.unwrap());
+    }
+    out
+}
+
+#[tokio::test]
+async fn probes_are_bounded_per_tenant_and_in_all() {
+    let a = app_limits(
+        locked(),
+        Limits {
+            probe_concurrency: 2,
+            probe_concurrency_per_tenant: 1,
+            ..Limits::default()
+        },
+        Duration::from_millis(400),
+    );
+    let slow = json!({"source": {"kind": "postgres", "config": {"slow": true}}});
+    let fast = json!({"source": {"kind": "postgres", "config": {}}});
+    let router = a.router.clone();
+    let s = slow.clone();
+    let first = tokio::spawn(async move {
+        call(&router, "POST", "/sources/check", &lab("t1"), Some(s))
+            .await
+            .0
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    // The same tenant has no slot left.
+    let (status, body) = call(
+        &a.router,
+        "POST",
+        "/sources/discover",
+        &lab("t1"),
+        Some(fast.clone()),
+    )
+    .await;
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (StatusCode::TOO_MANY_REQUESTS, Some("too_many_probes"))
+    );
+    // Another tenant has one, until the global pool is used up.
+    let router = a.router.clone();
+    let second = tokio::spawn(async move {
+        call(&router, "POST", "/sources/check", &lab("t2"), Some(slow))
+            .await
+            .0
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let (status, _) = call(
+        &a.router,
+        "POST",
+        "/sources/check",
+        &lab("t3"),
+        Some(fast.clone()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(first.await.unwrap(), StatusCode::GATEWAY_TIMEOUT);
+    assert_eq!(second.await.unwrap(), StatusCode::GATEWAY_TIMEOUT);
+    // Slots come back.
+    let (status, _) = call(&a.router, "POST", "/sources/check", &lab("t1"), Some(fast)).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn requests_are_bounded_in_time() {
+    let a = app_limits(
+        AuthConfig::open(),
+        Limits {
+            request_timeout: Duration::from_millis(150),
+            ..Limits::default()
+        },
+        Duration::from_secs(20),
+    );
+    let started = std::time::Instant::now();
+    let (status, body) = call(
+        &a.router,
+        "POST",
+        "/sources/check",
+        &[],
+        Some(json!({"source": {"kind": "postgres", "config": {"slow": true}}})),
+    )
+    .await;
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (StatusCode::SERVICE_UNAVAILABLE, Some("request_timeout"))
+    );
+    assert!(started.elapsed() < Duration::from_secs(5));
+}
+
+#[tokio::test]
+async fn dead_letters_overflow_is_reported() {
+    let store = Arc::new(MemStore::new().with_dead_letter_limits(
+        meili_connect_store::DeadLetterLimits {
+            max_per_sync: 2,
+            ..Default::default()
+        },
+    ));
+    let a = app_with(AuthConfig::open(), store);
+    let id = create(&a, &[], "s").await;
+    let letters: Vec<_> = (0..5)
+        .map(|i| meili_connect_core::DeadLetter {
+            sync_id: id.clone(),
+            index: "items".into(),
+            document_id: format!("d{i}"),
+            payload: json!({"kind": "replace"}),
+            reason: "invalid".into(),
+            created_at: chrono::Utc::now(),
+        })
+        .collect();
+    meili_connect_core::StateStore::push_dead_letters(&*a.store, &letters)
+        .await
+        .unwrap();
+    let (_, st) = call(&a.router, "GET", &format!("/syncs/{id}/status"), &[], None).await;
+    assert_eq!(st["dead_letters_overflow"], 3, "{st}");
+    let (_, page) = call(
+        &a.router,
+        "GET",
+        &format!("/syncs/{id}/dead-letters"),
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(page["items"].as_array().unwrap().len(), 2);
+}
+
+// ------------------------------------------------------------- stopping
+
+/// A sync that does not stop holds its lock at most the grace period:
+/// update, pause and delete answer instead of waiting for it.
+#[tokio::test]
+async fn a_sync_that_does_not_stop_is_abandoned_after_the_grace() {
+    let a = app_limits(
+        AuthConfig::open(),
+        Limits {
+            stop_grace: Duration::from_millis(200),
+            ..Limits::default()
+        },
+        Duration::from_millis(200),
+    );
+    let mut body = sync_body("s");
+    body["source"]["config"]["stubborn"] = json!(true);
+    let (_, created) = call(&a.router, "POST", "/syncs", &[], Some(body)).await;
+    let id = created["id"].as_str().unwrap().to_owned();
+    streaming(&a, &id).await;
+    let (_, mut current) = call(&a.router, "GET", &format!("/syncs/{id}"), &[], None).await;
+    current["name"] = json!("renamed");
+    for (method, uri, body) in [
+        ("PUT", format!("/syncs/{id}"), Some(current)),
+        ("POST", format!("/syncs/{id}/pause"), None),
+    ] {
+        streaming(&a, &id).await;
+        let started = std::time::Instant::now();
+        let (status, resp) = call(&a.router, method, &uri, &[], body).await;
+        assert_eq!(status, StatusCode::OK, "{method} {uri}: {resp}");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{method} {uri} took {:?}",
+            started.elapsed()
+        );
+        if method == "POST" {
+            assert_eq!(resp["phase"], "paused");
+        }
+        call(&a.router, "POST", &format!("/syncs/{id}/resume"), &[], None).await;
+    }
+}
+
+// ------------------------------------------------------------- unreadable rows
+
+#[tokio::test]
+async fn an_unreadable_row_never_hides_the_others() {
+    let a = app(AuthConfig::open());
+    let good = create(&a, &[], "a-good").await;
+    let bad = create(&a, &[], "b-bad").await;
+    a.store.make_unreadable(&bad);
+
+    let (status, list) = call(&a.router, "GET", "/syncs", &[], None).await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    let syncs = list["syncs"].as_array().unwrap();
+    assert_eq!(syncs.len(), 2);
+    assert_eq!(syncs[0]["id"], good.as_str());
+    assert_eq!(syncs[0]["destination"]["api_key"], "<redacted>");
+    assert_eq!(
+        (syncs[1]["id"].as_str(), syncs[1]["unreadable"].as_bool()),
+        (Some(bad.as_str()), Some(true))
+    );
+    assert_eq!(syncs[1]["name"], "b-bad");
+    assert_eq!(syncs[1]["source"]["kind"], "postgres");
+
+    let (status, one) = call(&a.router, "GET", &format!("/syncs/{bad}"), &[], None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(one["unreadable"], true);
+    // Its status still answers; changes are refused; force deletes it.
+    let (status, _) = call(&a.router, "GET", &format!("/syncs/{bad}/status"), &[], None).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) = call(
+        &a.router,
+        "POST",
+        &format!("/syncs/{bad}/resume"),
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (StatusCode::CONFLICT, Some("sync_unreadable"))
+    );
+    let (status, _) = call(&a.router, "DELETE", &format!("/syncs/{bad}"), &[], None).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let (status, _) = call(
+        &a.router,
+        "DELETE",
+        &format!("/syncs/{bad}?force=true"),
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, list) = call(&a.router, "GET", "/syncs", &[], None).await;
+    assert_eq!(list["syncs"].as_array().unwrap().len(), 1);
+}
+
+// ------------------------------------------------------------- create
+
+/// A sync that cannot start is not kept: the client gets the error and
+/// nothing starts unannounced at the next boot.
+#[tokio::test]
+async fn a_sync_that_cannot_start_is_rolled_back() {
+    let store = Arc::new(MemStore::new());
+    let a = app_with(AuthConfig::open(), Arc::clone(&store));
+    // The supervisors refuse to start once the server shuts down.
+    a.state.manager.shutdown(Duration::from_secs(1)).await;
+    let (status, body) = call(&a.router, "POST", "/syncs", &[], Some(sync_body("s"))).await;
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (StatusCode::SERVICE_UNAVAILABLE, Some("shutting_down")),
+        "{body}"
+    );
+    assert!(store.list_syncs(None).await.unwrap().is_empty());
+    let next = app_with(AuthConfig::open(), store);
+    assert_eq!(boot_syncs(&next.state).await.unwrap(), 0);
+}
+
+// ------------------------------------------------------------- concurrency
+
+/// A `PUT` that read the sync before a `DELETE` removed it must not start a
+/// supervisor for the deleted sync.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn put_racing_delete_never_resurrects_the_sync() {
+    let a = app(AuthConfig::open());
+    let id = create(&a, &[], "s").await;
+    let (_, mut current) = call(&a.router, "GET", &format!("/syncs/{id}"), &[], None).await;
+    current["source"]["config"]["rows"] = json!(7);
+    // The DELETE holds the sync in its teardown while the PUT comes in.
+    a.probe.teardown_delay_ms.store(300, Ordering::SeqCst);
+    let router = a.router.clone();
+    let uri = format!("/syncs/{id}");
+    let delete = tokio::spawn(async move { call(&router, "DELETE", &uri, &[], None).await.0 });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let (put, body) = call(
+        &a.router,
+        "PUT",
+        &format!("/syncs/{id}"),
+        &[],
+        Some(current),
+    )
+    .await;
+    assert_eq!(delete.await.unwrap(), StatusCode::NO_CONTENT);
+    assert_eq!(put, StatusCode::NOT_FOUND, "{body}");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(a.state.manager.running_ids().is_empty());
+    assert!(a.store.get_sync(None, &id).await.unwrap().is_none());
+    assert!(
+        meili_connect_core::StateStore::load(&*a.store, &id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+/// Whatever the interleaving of a `resume` and a `PUT`, the sync ends up
+/// running the stored (new) spec.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn resume_racing_put_runs_the_stored_spec() {
+    let a = app(AuthConfig::open());
+    let id = create(&a, &[], "s").await;
+    for round in 0..15u64 {
+        let (status, _) = call(&a.router, "POST", &format!("/syncs/{id}/pause"), &[], None).await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, mut current) = call(&a.router, "GET", &format!("/syncs/{id}"), &[], None).await;
+        current["source"]["config"]["rows"] = json!(100 + round);
+        let (r1, r2) = (a.router.clone(), a.router.clone());
+        let resume_uri = format!("/syncs/{id}/resume");
+        let put_uri = format!("/syncs/{id}");
+        let resume = tokio::spawn(async move { call(&r1, "POST", &resume_uri, &[], None).await.0 });
+        let put =
+            tokio::spawn(async move { call(&r2, "PUT", &put_uri, &[], Some(current)).await.0 });
+        assert_eq!(resume.await.unwrap(), StatusCode::OK);
+        assert_eq!(put.await.unwrap(), StatusCode::OK);
+        // The running sync must be on the new spec: resume it if the PUT
+        // left it paused, then wait for its open.
+        call(&a.router, "POST", &format!("/syncs/{id}/resume"), &[], None).await;
+        let want = json!(100 + round);
+        wait_for(async || {
+            a.probe
+                .last_opened
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|c| c["rows"] == want)
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let opened = a.probe.last_opened.lock().unwrap().clone().unwrap();
+        assert_eq!(opened["rows"], want, "round {round}");
+    }
+}
+
+// ------------------------------------------------------------- put
+
+async fn written(a: &App, id: &str) -> u64 {
+    let (_, st) = call(&a.router, "GET", &format!("/syncs/{id}/status"), &[], None).await;
+    st["progress"]["written"].as_u64().unwrap()
+}
+
+async fn streaming(a: &App, id: &str) {
+    let uri = format!("/syncs/{id}/status");
+    wait_for(async || {
+        let st = call(&a.router, "GET", &uri, &[], None).await.1;
+        st["phase"] == "streaming" && st["has_checkpoint"] == true
+    })
+    .await;
+}
+
+async fn put(a: &App, id: &str, query: &str, body: Value) -> (StatusCode, Value) {
+    call(
+        &a.router,
+        "PUT",
+        &format!("/syncs/{id}{query}"),
+        &[],
+        Some(body),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn a_new_origin_is_torn_down_with_the_old_spec_and_synced_fresh() {
+    let a = app(AuthConfig::open());
+    let mut body = sync_body("s");
+    body["source"]["config"]["host"] = json!("old-db");
+    let (_, created) = call(&a.router, "POST", "/syncs", &[], Some(body.clone())).await;
+    let id = created["id"].as_str().unwrap().to_owned();
+    streaming(&a, &id).await;
+    assert_eq!(written(&a, &id).await, 3);
+
+    body["source"]["config"]["host"] = json!("new-db");
+    body["source"]["config"]["rows"] = json!(5);
+    let (status, resp) = put(&a, &id, "", body.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{resp}");
+    let torn: Vec<Value> = a.probe.torn_down.lock().unwrap().clone();
+    assert_eq!(torn.len(), 1);
+    assert_eq!(torn[0]["host"], "old-db", "torn down with the old spec");
+    // The checkpoint was cleared: the new origin is snapshotted.
+    wait_for(async || written(&a, &id).await == 8).await;
+    streaming(&a, &id).await;
+
+    // A teardown that fails changes nothing, unless forced.
+    a.probe.teardown_fails.store(true, Ordering::SeqCst);
+    body["source"]["config"]["host"] = json!("third-db");
+    let (status, resp) = put(&a, &id, "", body.clone()).await;
+    assert_eq!(
+        (status, resp["code"].as_str()),
+        (StatusCode::BAD_GATEWAY, Some("teardown_failed")),
+        "{resp}"
+    );
+    let stored = a
+        .store
+        .get_sync(None, &id)
+        .await
+        .unwrap()
+        .unwrap()
+        .readable()
+        .unwrap()
+        .spec;
+    assert_eq!(stored.source.config["host"], "new-db");
+    assert_eq!(a.state.manager.running_ids(), vec![id.clone()]);
+    streaming(&a, &id).await;
+    let (status, _) = put(&a, &id, "?force=true", body).await;
+    assert_eq!(status, StatusCode::OK);
+    let stored = a
+        .store
+        .get_sync(None, &id)
+        .await
+        .unwrap()
+        .unwrap()
+        .readable()
+        .unwrap()
+        .spec;
+    assert_eq!(stored.source.config["host"], "third-db");
+}
+
+#[tokio::test]
+async fn changed_streams_are_backfilled_and_a_rename_only_restarts() {
+    let a = app(AuthConfig::open());
+    let id = create(&a, &[], "s").await;
+    streaming(&a, &id).await;
+    assert_eq!(written(&a, &id).await, 3);
+    let (_, mut current) = call(&a.router, "GET", &format!("/syncs/{id}"), &[], None).await;
+
+    // Name and guard only: no new snapshot, no teardown.
+    current["name"] = json!("renamed");
+    current["mass_delete_guard"] = json!(0.9);
+    let (status, _) = put(&a, &id, "", current.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    streaming(&a, &id).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(written(&a, &id).await, 3);
+
+    // Another index, primary key or field selection: everything again.
+    current["streams"][0]["index"] = json!("items_v2");
+    current["streams"][0]["fields"] = json!({"include": ["n"]});
+    let (status, _) = put(&a, &id, "", current.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    wait_for(async || written(&a, &id).await == 6).await;
+    // A new collection too.
+    current["streams"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"collection": "public.other", "index": "other"}));
+    let (status, _) = put(&a, &id, "", current).await;
+    assert_eq!(status, StatusCode::OK);
+    wait_for(async || written(&a, &id).await == 9).await;
+    assert_eq!(a.probe.teardowns.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn put_on_a_paused_sync_leaves_it_paused() {
+    let a = app(AuthConfig::open());
+    let id = create(&a, &[], "s").await;
+    streaming(&a, &id).await;
+    call(&a.router, "POST", &format!("/syncs/{id}/pause"), &[], None).await;
+    let (_, mut current) = call(&a.router, "GET", &format!("/syncs/{id}"), &[], None).await;
+    for edit in ["name", "streams"] {
+        if edit == "name" {
+            current["name"] = json!("still paused");
+        } else {
+            current["streams"][0]["index"] = json!("elsewhere");
+        }
+        let (status, resp) = put(&a, &id, "", current.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{resp}");
+        let (_, st) = call(&a.router, "GET", &format!("/syncs/{id}/status"), &[], None).await;
+        assert_eq!(
+            (st["phase"].as_str(), st["running"].as_bool()),
+            (Some("paused"), Some(false)),
+            "{edit}: {st}"
+        );
+    }
+    // Resuming runs the new spec from scratch (its streams changed).
+    call(&a.router, "POST", &format!("/syncs/{id}/resume"), &[], None).await;
+    wait_for(async || written(&a, &id).await == 6).await;
+}
+
 // ------------------------------------------------------------- lifecycle
 
 #[tokio::test]
 async fn delete_tears_down_and_keeps_the_sync_when_teardown_fails() {
-    let a = app(AuthConfig::default());
+    let a = app(AuthConfig::open());
     let id = create(&a, &[], "s").await;
     a.probe.teardown_fails.store(true, Ordering::SeqCst);
     let (status, body) = call(&a.router, "DELETE", &format!("/syncs/{id}"), &[], None).await;
@@ -761,6 +1699,19 @@ async fn delete_tears_down_and_keeps_the_sync_when_teardown_fails() {
     );
     let (status, _) = call(&a.router, "GET", &format!("/syncs/{id}"), &[], None).await;
     assert_eq!(status, StatusCode::OK, "kept for a retry");
+    // Kept stopped, durably: paused with the reason, not started at boot.
+    let (_, st) = call(&a.router, "GET", &format!("/syncs/{id}/status"), &[], None).await;
+    assert_eq!(
+        (st["phase"].as_str(), st["running"].as_bool()),
+        (Some("paused"), Some(false)),
+        "{st}"
+    );
+    assert!(
+        st["message"].as_str().unwrap().contains("deletion failed"),
+        "{st}"
+    );
+    let rebooted = app_with(AuthConfig::open(), Arc::clone(&a.store));
+    assert_eq!(boot_syncs(&rebooted.state).await.unwrap(), 0);
     // A retry once the origin is back succeeds.
     a.probe.teardown_fails.store(false, Ordering::SeqCst);
     let (status, _) = call(&a.router, "DELETE", &format!("/syncs/{id}"), &[], None).await;
@@ -787,7 +1738,7 @@ async fn delete_tears_down_and_keeps_the_sync_when_teardown_fails() {
 
 #[tokio::test]
 async fn pause_resume_status_and_release() {
-    let a = app(AuthConfig::default());
+    let a = app(AuthConfig::open());
     let id = create(&a, &[], "s").await;
     let status_uri = format!("/syncs/{id}/status");
     wait_for(async || {
@@ -869,7 +1820,7 @@ async fn pause_resume_status_and_release() {
 
 #[tokio::test]
 async fn dead_letters_are_paged() {
-    let a = app(AuthConfig::default());
+    let a = app(AuthConfig::open());
     let id = create(&a, &[], "s").await;
     let letters: Vec<_> = (0..5)
         .map(|i| meili_connect_core::DeadLetter {
@@ -919,7 +1870,7 @@ async fn dead_letters_are_paged() {
 #[tokio::test]
 async fn boot_starts_every_sync_but_the_paused_ones() {
     let store = Arc::new(MemStore::new());
-    let first = app_with(AuthConfig::default(), Arc::clone(&store));
+    let first = app_with(AuthConfig::open(), Arc::clone(&store));
     let running = create(&first, &[], "running").await;
     let paused = create(&first, &[], "paused").await;
     call(
@@ -932,7 +1883,7 @@ async fn boot_starts_every_sync_but_the_paused_ones() {
     .await;
     first.state.manager.shutdown(Duration::from_secs(5)).await;
 
-    let second = app_with(AuthConfig::default(), store);
+    let second = app_with(AuthConfig::open(), store);
     assert_eq!(boot_syncs(&second.state).await.unwrap(), 1);
     let mut ids = second.state.manager.running_ids();
     ids.sort();
@@ -1034,7 +1985,7 @@ fn the_table_lists_every_path_in_lib_rs() {
 
 #[tokio::test]
 async fn every_listed_route_is_mounted_with_its_method() {
-    let a = app(AuthConfig::default());
+    let a = app(AuthConfig::open());
     for r in ROUTES {
         let uri = r
             .path

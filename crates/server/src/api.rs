@@ -2,6 +2,8 @@
 //! sees the syncs of that scope: a sync of another tenant is a 404, on
 //! every route.
 
+use std::sync::Arc;
+
 use axum::Json;
 use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::extract::{Path, Query, State};
@@ -11,14 +13,16 @@ use chrono::{DateTime, Days, NaiveDate, Utc};
 use meili_connect_core::{
     MeiliDestination, Source, SourceSpec, StreamMapping, SyncPhase, SyncSpec,
 };
-use meili_connect_store::{DeadLetterPage, StoredSync};
+use meili_connect_store::{DeadLetterPage, StoredSync, SyncRow};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::auth::Scope;
+use crate::auth::{Principal, Scope};
 use crate::error::{ApiError, source_error};
-use crate::manager::RemoveError;
-use crate::redact::{REDACTED, contains_redacted, redact_spec, restore_redacted};
+use crate::guard::{VetError, coarse_source_error, vet_destination, vet_source};
+use crate::redact::{
+    REDACTED, check_placeholders, contains_redacted, redact_spec, restore_redacted,
+};
 use crate::state::AppState;
 
 type ApiResult<T> = Result<T, ApiError>;
@@ -60,11 +64,48 @@ fn probe_request(input: Result<Json<Value>, JsonRejection>) -> ApiResult<ProbeRe
     serde_json::from_value(value).map_err(|e| ApiError::invalid(e.to_string()))
 }
 
-fn probe_source(state: &AppState, req: &ProbeRequest) -> ApiResult<Box<dyn Source>> {
+/// Builds the source (its config errors are the connector's own words),
+/// then vets its endpoints against the host policy.
+async fn probe_source(
+    state: &AppState,
+    req: &ProbeRequest,
+    coarse: bool,
+) -> ApiResult<Box<dyn Source>> {
+    let sources = state.sources(coarse);
     state
-        .sources
+        .registry
         .build(PROBE_ID, &req.source, &req.streams)
+        .map_err(|e| source_error(&e))?;
+    vet(state, &req.source, coarse).await?;
+    sources
+        .build_vetted(PROBE_ID, &req.source, &req.streams)
         .map_err(|e| source_error(&e))
+}
+
+/// Every endpoint of the source passes the host policy.
+async fn vet(state: &AppState, source: &SourceSpec, coarse: bool) -> ApiResult<()> {
+    match vet_source(&*state.registry, &state.policy, source).await {
+        Ok(_) => Ok(()),
+        Err(VetError::Policy(e)) => Err(ApiError::host_not_allowed(e.to_string())),
+        Err(VetError::Source(e)) if coarse => Err(source_error(&coarse_source_error(e))),
+        Err(VetError::Source(e)) => Err(source_error(&e)),
+    }
+}
+
+/// Lab callers get coarse source and sink errors.
+fn coarse(scope: &Scope) -> bool {
+    scope.principal == Principal::Lab
+}
+
+/// Run a change to a sync to completion even if the request goes away (a
+/// client hanging up, the request timeout): a mutation half done would
+/// leave the sync between two states.
+async fn detached<T: Send + 'static>(
+    op: impl Future<Output = ApiResult<T>> + Send + 'static,
+) -> ApiResult<T> {
+    tokio::spawn(op)
+        .await
+        .map_err(|_| ApiError::internal("the operation ended abnormally"))?
 }
 
 fn probe_timeout(state: &AppState) -> ApiError {
@@ -80,15 +121,17 @@ fn probe_timeout(state: &AppState) -> ApiError {
 
 pub async fn check_source(
     State(state): State<AppState>,
-    _scope: Scope,
+    scope: Scope,
     input: Result<Json<Value>, JsonRejection>,
 ) -> ApiResult<Json<Value>> {
     let req = probe_request(input)?;
-    let mut source = probe_source(&state, &req)?;
-    let report = tokio::time::timeout(state.probe_timeout, source.check())
-        .await
-        .map_err(|_| probe_timeout(&state))?
-        .map_err(|e| source_error(&e))?;
+    let _slot = state.probes.try_acquire(scope.tenant())?;
+    let report = tokio::time::timeout(state.probe_timeout, async {
+        let mut source = probe_source(&state, &req, coarse(&scope)).await?;
+        source.check().await.map_err(|e| source_error(&e))
+    })
+    .await
+    .map_err(|_| probe_timeout(&state))??;
     Ok(Json(json!({
         "passed": report.passed(),
         "items": report.items,
@@ -97,15 +140,17 @@ pub async fn check_source(
 
 pub async fn discover_source(
     State(state): State<AppState>,
-    _scope: Scope,
+    scope: Scope,
     input: Result<Json<Value>, JsonRejection>,
 ) -> ApiResult<Json<Value>> {
     let req = probe_request(input)?;
-    let mut source = probe_source(&state, &req)?;
-    let collections = tokio::time::timeout(state.probe_timeout, source.discover())
-        .await
-        .map_err(|_| probe_timeout(&state))?
-        .map_err(|e| source_error(&e))?;
+    let _slot = state.probes.try_acquire(scope.tenant())?;
+    let collections = tokio::time::timeout(state.probe_timeout, async {
+        let mut source = probe_source(&state, &req, coarse(&scope)).await?;
+        source.discover().await.map_err(|e| source_error(&e))
+    })
+    .await
+    .map_err(|_| probe_timeout(&state))??;
     Ok(Json(json!({ "collections": collections })))
 }
 
@@ -152,8 +197,10 @@ impl SyncInput {
 }
 
 /// `SyncSpec::validate` plus what the server needs: a name, a
-/// Meilisearch URL, a source config its connector accepts.
-fn validate(state: &AppState, spec: &SyncSpec) -> ApiResult<()> {
+/// Meilisearch URL, a source config its connector accepts, and a source and
+/// a destination the host policy allows (resolved now, so a refusal is
+/// immediate; vetted again on every start).
+async fn validate(state: &AppState, spec: &SyncSpec, coarse: bool) -> ApiResult<()> {
     if spec.name.is_empty() || spec.name.len() > MAX_NAME_LEN {
         return Err(ApiError::invalid(format!(
             "name must be 1 to {MAX_NAME_LEN} characters"
@@ -164,11 +211,22 @@ fn validate(state: &AppState, spec: &SyncSpec) -> ApiResult<()> {
     if !(url.starts_with("http://") || url.starts_with("https://")) {
         return Err(ApiError::invalid("destination.url must be an http(s) URL"));
     }
+    // Before the sink is built: it refuses a literal address of its own,
+    // with a less precise error.
+    vet_destination(&state.policy, url)
+        .await
+        .map_err(ApiError::host_not_allowed)?;
+    validate_shape(state, spec)?;
+    vet(state, &spec.source, coarse).await
+}
+
+/// The sink and the source accept their config.
+fn validate_shape(state: &AppState, spec: &SyncSpec) -> ApiResult<()> {
     (state.sinks)(&spec.destination).map_err(|e| ApiError::invalid(e.to_string()))?;
     // Builds the source without connecting: the connector checks its
     // config shape and the mappings.
     state
-        .sources
+        .registry
         .build(&spec.id, &spec.source, &spec.streams)
         .map_err(|e| source_error(&e))?;
     Ok(())
@@ -194,7 +252,31 @@ pub fn view(stored: &StoredSync) -> ApiResult<SyncView> {
     })
 }
 
-async fn owned(state: &AppState, scope: &Scope, id: &str) -> ApiResult<StoredSync> {
+/// What the API shows of a row: the redacted spec, or, for a row whose spec
+/// cannot be read, its id, name and kind flagged `unreadable`.
+fn row_view(row: &SyncRow) -> ApiResult<Value> {
+    match row {
+        SyncRow::Readable(stored) => serde_json::to_value(view(stored)?)
+            .map_err(|_| ApiError::internal("cannot serialize the sync")),
+        SyncRow::Unreadable(u) => Ok(json!({
+            "id": u.id,
+            "tenant": u.tenant,
+            "name": u.name,
+            "source": { "kind": u.kind },
+            "unreadable": true,
+            "error": UNREADABLE,
+            "created_at": u.created_at,
+            "updated_at": u.updated_at,
+        })),
+    }
+}
+
+/// Fixed text for an unreadable row: the cause is in the server log.
+pub const UNREADABLE: &str = "the stored spec of this sync cannot be read (another \
+     CONNECT_SECRET_KEY, or a damaged row); it can only be deleted, with ?force=true";
+
+/// The sync exists in the caller's scope (readable or not).
+async fn owned(state: &AppState, scope: &Scope, id: &str) -> ApiResult<SyncRow> {
     state
         .repo()
         .get_sync(scope.tenant(), id)
@@ -217,16 +299,16 @@ pub async fn create_sync(
         serde_json::from_value(value).map_err(|e| ApiError::invalid(e.to_string()))?;
     let id = uuid::Uuid::now_v7().to_string();
     let spec = input.into_spec(id, scope.tenant.clone());
-    validate(&state, &spec)?;
-    let stored = state.repo().create_sync(scope.tenant(), &spec).await?;
-    state.manager.run(spec).await?;
+    validate(&state, &spec, coarse(&scope)).await?;
+    let manager = Arc::clone(&state.manager);
+    let stored = detached(async move { manager.create(spec).await }).await?;
     tracing::info!(sync_id = %stored.spec.id, tenant = ?scope.tenant(), "sync created");
     Ok((StatusCode::CREATED, Json(view(&stored)?)).into_response())
 }
 
 pub async fn list_syncs(State(state): State<AppState>, scope: Scope) -> ApiResult<Json<Value>> {
     let syncs = state.repo().list_syncs(scope.tenant()).await?;
-    let views = syncs.iter().map(view).collect::<ApiResult<Vec<_>>>()?;
+    let views = syncs.iter().map(row_view).collect::<ApiResult<Vec<_>>>()?;
     Ok(Json(json!({ "syncs": views })))
 }
 
@@ -234,33 +316,47 @@ pub async fn get_sync(
     State(state): State<AppState>,
     scope: Scope,
     Path(id): Path<String>,
-) -> ApiResult<Json<SyncView>> {
-    Ok(Json(view(&owned(&state, &scope, &id).await?)?))
+) -> ApiResult<Json<Value>> {
+    Ok(Json(row_view(&owned(&state, &scope, &id).await?)?))
 }
 
 pub async fn update_sync(
     State(state): State<AppState>,
     scope: Scope,
     Path(id): Path<String>,
+    query: Result<Query<ForceQuery>, QueryRejection>,
     input: Result<Json<Value>, JsonRejection>,
 ) -> ApiResult<Json<SyncView>> {
+    let Query(query) = query?;
     let mut value = body(input)?;
-    let current = owned(&state, &scope, &id).await?;
-    let stored_json = serde_json::to_value(&current.spec)
-        .map_err(|_| ApiError::internal("cannot serialize the sync"))?;
-    restore_redacted(&mut value, &stored_json).map_err(ApiError::invalid)?;
-    let input: SyncInput =
-        serde_json::from_value(value).map_err(|e| ApiError::invalid(e.to_string()))?;
-    let spec = input.into_spec(current.spec.id.clone(), current.spec.tenant.clone());
-    validate(&state, &spec)?;
-    let stored = state.repo().update_sync(scope.tenant(), &spec).await?;
-    state.manager.run(spec).await?;
-    tracing::info!(sync_id = %id, "sync updated and restarted");
+    let coarse = coarse(&scope);
+    let tenant = scope.tenant.clone();
+    let stored = detached(async move {
+        // Everything that depends on the stored spec runs inside the sync's
+        // lock, on the row read there.
+        let prepare = async |current: &StoredSync| -> ApiResult<SyncSpec> {
+            let stored_json = serde_json::to_value(&current.spec)
+                .map_err(|_| ApiError::internal("cannot serialize the sync"))?;
+            check_placeholders(&value, &stored_json).map_err(ApiError::secret_required)?;
+            restore_redacted(&mut value, &stored_json).map_err(ApiError::invalid)?;
+            let input: SyncInput = serde_json::from_value(std::mem::take(&mut value))
+                .map_err(|e| ApiError::invalid(e.to_string()))?;
+            let spec = input.into_spec(current.spec.id.clone(), current.spec.tenant.clone());
+            validate(&state, &spec, coarse).await?;
+            Ok(spec)
+        };
+        state
+            .manager
+            .update(tenant.as_deref(), &id, query.force, prepare)
+            .await
+    })
+    .await?;
     Ok(Json(view(&stored)?))
 }
 
+/// `?force=true`: go on when the origin cannot be cleaned up.
 #[derive(Debug, Deserialize)]
-pub struct DeleteQuery {
+pub struct ForceQuery {
     #[serde(default)]
     force: bool,
 }
@@ -269,33 +365,12 @@ pub async fn delete_sync(
     State(state): State<AppState>,
     scope: Scope,
     Path(id): Path<String>,
-    query: Result<Query<DeleteQuery>, QueryRejection>,
+    query: Result<Query<ForceQuery>, QueryRejection>,
 ) -> ApiResult<StatusCode> {
     let Query(query) = query?;
-    let current = owned(&state, &scope, &id).await?;
-    match state.manager.remove(&current.spec, query.force).await {
-        Ok(()) => {}
-        Err(RemoveError::Teardown(message)) => {
-            return Err(ApiError::new(
-                StatusCode::BAD_GATEWAY,
-                "teardown_failed",
-                format!(
-                    "{message}; the sync is kept (stopped). Retry, or delete with ?force=true \
-                     and clean up the origin by hand"
-                ),
-            ));
-        }
-        Err(RemoveError::Supervisor(e)) => return Err(e.into()),
-    }
-    if state.lab_events
-        && let Err(e) = state.manager.meter().flush_one(state.outbox(), &id).await
-    {
-        tracing::warn!(sync_id = %id, error = %e, "usage of a deleted sync could not be enqueued");
-    } else if !state.lab_events {
-        state.manager.meter().forget(&id);
-    }
-    state.repo().delete_sync(scope.tenant(), &id).await?;
-    tracing::info!(sync_id = %id, "sync deleted");
+    let manager = Arc::clone(&state.manager);
+    let tenant = scope.tenant.clone();
+    detached(async move { manager.delete(tenant.as_deref(), &id, query.force).await }).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -306,8 +381,8 @@ pub async fn pause_sync(
     scope: Scope,
     Path(id): Path<String>,
 ) -> ApiResult<Json<Value>> {
-    owned(&state, &scope, &id).await?;
-    state.manager.pause(&id).await?;
+    let (manager, tenant, sync) = (Arc::clone(&state.manager), scope.tenant.clone(), id.clone());
+    detached(async move { manager.pause(tenant.as_deref(), &sync).await }).await?;
     status_json(&state, &scope, &id).await.map(Json)
 }
 
@@ -316,11 +391,8 @@ pub async fn resume_sync(
     scope: Scope,
     Path(id): Path<String>,
 ) -> ApiResult<Json<Value>> {
-    let current = owned(&state, &scope, &id).await?;
-    let running = state.manager.status(&id).await?.is_some_and(|s| s.running);
-    if !running {
-        state.manager.run(current.spec).await?;
-    }
+    let (manager, tenant, sync) = (Arc::clone(&state.manager), scope.tenant.clone(), id.clone());
+    detached(async move { manager.resume(tenant.as_deref(), &sync).await }).await?;
     status_json(&state, &scope, &id).await.map(Json)
 }
 
@@ -329,8 +401,8 @@ pub async fn resync_sync(
     scope: Scope,
     Path(id): Path<String>,
 ) -> ApiResult<Json<Value>> {
-    let current = owned(&state, &scope, &id).await?;
-    state.manager.resync(current.spec).await?;
+    let (manager, tenant, sync) = (Arc::clone(&state.manager), scope.tenant.clone(), id.clone());
+    detached(async move { manager.resync(tenant.as_deref(), &sync).await }).await?;
     status_json(&state, &scope, &id).await.map(Json)
 }
 
@@ -339,14 +411,8 @@ pub async fn release_sync(
     scope: Scope,
     Path(id): Path<String>,
 ) -> ApiResult<Json<Value>> {
-    let current = owned(&state, &scope, &id).await?;
-    let phase = state.state_store().load(&id).await?.map(|s| s.phase);
-    if phase != Some(SyncPhase::Held) {
-        return Err(ApiError::conflict(format!(
-            "sync {id} is not held; only a held sync can be released"
-        )));
-    }
-    state.manager.release(current.spec).await?;
+    let (manager, tenant, sync) = (Arc::clone(&state.manager), scope.tenant.clone(), id.clone());
+    detached(async move { manager.release(tenant.as_deref(), &sync).await }).await?;
     status_json(&state, &scope, &id).await.map(Json)
 }
 
@@ -361,11 +427,12 @@ async fn status_json(state: &AppState, scope: &Scope, id: &str) -> ApiResult<Val
         .repo()
         .progress(scope.tenant(), id, first_day, today)
         .await?;
-    let (mut written, mut deleted, mut rejected) = (0u64, 0u64, 0u64);
+    let (mut written, mut deleted, mut rejected, mut dropped) = (0u64, 0u64, 0u64, 0u64);
     for d in &days {
         written = written.saturating_add(d.written);
         deleted = deleted.saturating_add(d.deleted);
         rejected = rejected.saturating_add(d.rejected);
+        dropped = dropped.saturating_add(d.dead_letters_dropped);
     }
     let phase = saved.as_ref().map_or(SyncPhase::Pending, |s| s.phase);
     Ok(json!({
@@ -379,6 +446,9 @@ async fn status_json(state: &AppState, scope: &Scope, id: &str) -> ApiResult<Val
         "consecutive_failures": live.as_ref().map_or(0, |s| s.consecutive_failures),
         "last_error": live.as_ref().and_then(|s| s.last_error.clone()),
         "progress": { "written": written, "deleted": deleted, "rejected": rejected },
+        // Rejected documents not kept as dead letters: the sync reached
+        // DEAD_LETTERS_MAX_PER_SYNC. Clear the dead letters to keep more.
+        "dead_letters_overflow": dropped,
     }))
 }
 

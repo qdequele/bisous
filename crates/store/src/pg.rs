@@ -17,8 +17,9 @@ use uuid::Uuid;
 
 use crate::error::from_sqlx;
 use crate::{
-    BootSync, DailyProgress, DeadLetterPage, LabOutbox, OutboxEvent, OutboxLease, RepoError,
-    SecretKey, StoredDeadLetter, StoredSync, SyncRepository, to_i64, to_u64, validate_spec,
+    BootSync, DailyProgress, DeadLetterLimits, DeadLetterPage, LabOutbox, OutboxEvent, OutboxLease,
+    RepoError, RetryBackoff, SecretKey, StoredDeadLetter, StoredSync, SyncRepository, SyncRow,
+    UnreadableSync, bound_letter, to_i64, to_u64, validate_spec,
 };
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
@@ -32,6 +33,7 @@ const PRUNE_BATCH: i64 = 1_000;
 const LEASE_SQL: &str = "WITH picked AS MATERIALIZED (
         SELECT id FROM lab_events_outbox
         WHERE sent_at IS NULL AND (leased_until IS NULL OR leased_until <= now())
+          AND (next_attempt_at IS NULL OR next_attempt_at <= now())
         ORDER BY created_at, id
         LIMIT $1
         FOR UPDATE SKIP LOCKED
@@ -44,6 +46,7 @@ const LEASE_SQL: &str = "WITH picked AS MATERIALIZED (
 pub struct PgStore {
     pool: PgPool,
     key: SecretKey,
+    limits: DeadLetterLimits,
 }
 
 impl std::fmt::Debug for PgStore {
@@ -80,22 +83,47 @@ impl PgStore {
             },
             other => StoreError::Fatal(format!("migrations failed: {other}")),
         })?;
-        Ok(Self { pool, key })
+        Ok(Self {
+            pool,
+            key,
+            limits: DeadLetterLimits::default(),
+        })
+    }
+
+    /// Bound what one sync may keep in the dead-letter table.
+    pub fn with_dead_letter_limits(mut self, limits: DeadLetterLimits) -> Self {
+        self.limits = limits;
+        self
     }
 
     pub fn pool(&self) -> &PgPool {
         &self.pool
     }
 
-    fn row_to_sync(&self, row: &PgRow) -> Result<StoredSync, RepoError> {
+    fn row_to_sync(&self, row: &PgRow) -> Result<SyncRow, RepoError> {
         let id: String = row.try_get("id").map_err(from_sqlx)?;
         let tenant: Option<String> = row.try_get("tenant_id").map_err(from_sqlx)?;
         let sealed: Vec<u8> = row.try_get("spec_sealed").map_err(from_sqlx)?;
-        let spec = self.unseal(&id, tenant.as_deref(), &sealed)?;
-        Ok(StoredSync {
-            spec,
-            created_at: row.try_get("created_at").map_err(from_sqlx)?,
-            updated_at: row.try_get("updated_at").map_err(from_sqlx)?,
+        let created_at = row.try_get("created_at").map_err(from_sqlx)?;
+        let updated_at = row.try_get("updated_at").map_err(from_sqlx)?;
+        Ok(match self.unseal(&id, tenant.as_deref(), &sealed) {
+            Ok(spec) => SyncRow::Readable(StoredSync {
+                spec,
+                created_at,
+                updated_at,
+            }),
+            Err(e) => {
+                tracing::warn!(sync_id = %id, error = %e, "a stored sync cannot be read");
+                SyncRow::Unreadable(UnreadableSync {
+                    name: row.try_get("name").map_err(from_sqlx)?,
+                    kind: row.try_get("kind").map_err(from_sqlx)?,
+                    id,
+                    tenant,
+                    error: e.to_string(),
+                    created_at,
+                    updated_at,
+                })
+            }
         })
     }
 
@@ -208,34 +236,65 @@ impl StateStore for PgStore {
         if letters.is_empty() {
             return Ok(());
         }
-        let mut sync_ids = Vec::with_capacity(letters.len());
-        let mut indexes = Vec::with_capacity(letters.len());
-        let mut doc_ids = Vec::with_capacity(letters.len());
-        let mut payloads = Vec::with_capacity(letters.len());
-        let mut reasons = Vec::with_capacity(letters.len());
-        let mut created = Vec::with_capacity(letters.len());
+        let mut by_sync: std::collections::BTreeMap<&str, Vec<DeadLetter>> =
+            std::collections::BTreeMap::new();
         for l in letters {
-            sync_ids.push(l.sync_id.clone());
-            indexes.push(l.index.clone());
-            doc_ids.push(l.document_id.clone());
-            payloads.push(l.payload.clone());
-            reasons.push(l.reason.clone());
-            created.push(l.created_at);
+            by_sync
+                .entry(l.sync_id.as_str())
+                .or_default()
+                .push(bound_letter(l, &self.limits));
         }
-        sqlx::query(
-            "INSERT INTO dead_letters (sync_id, index_uid, document_id, payload, reason, created_at)
-             SELECT * FROM UNNEST($1::text[], $2::text[], $3::text[], $4::jsonb[], $5::text[],
-                                  $6::timestamptz[])",
-        )
-        .bind(sync_ids)
-        .bind(indexes)
-        .bind(doc_ids)
-        .bind(payloads)
-        .bind(reasons)
-        .bind(created)
-        .execute(&self.pool)
-        .await
-        .map_err(store_err)?;
+        // All or nothing.
+        let mut tx = self.pool.begin().await.map_err(store_err)?;
+        for (sync_id, group) in by_sync {
+            let stored: i64 =
+                sqlx::query_scalar("SELECT count(*) FROM dead_letters WHERE sync_id = $1")
+                    .bind(sync_id)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .map_err(store_err)?;
+            let room = self.limits.max_per_sync.saturating_sub(to_u64(stored));
+            let keep = group.len().min(usize::try_from(room).unwrap_or(usize::MAX));
+            let dropped = group.len() - keep;
+            if keep > 0 {
+                let kept = &group[..keep];
+                sqlx::query(
+                    "INSERT INTO dead_letters
+                        (sync_id, index_uid, document_id, payload, reason, created_at)
+                     SELECT * FROM UNNEST($1::text[], $2::text[], $3::text[], $4::jsonb[],
+                                          $5::text[], $6::timestamptz[])",
+                )
+                .bind(kept.iter().map(|l| l.sync_id.clone()).collect::<Vec<_>>())
+                .bind(kept.iter().map(|l| l.index.clone()).collect::<Vec<_>>())
+                .bind(
+                    kept.iter()
+                        .map(|l| l.document_id.clone())
+                        .collect::<Vec<_>>(),
+                )
+                .bind(kept.iter().map(|l| l.payload.clone()).collect::<Vec<_>>())
+                .bind(kept.iter().map(|l| l.reason.clone()).collect::<Vec<_>>())
+                .bind(kept.iter().map(|l| l.created_at).collect::<Vec<_>>())
+                .execute(&mut *tx)
+                .await
+                .map_err(store_err)?;
+            }
+            if dropped > 0 {
+                sqlx::query(
+                    "INSERT INTO sync_progress (sync_id, day, dead_letters_dropped)
+                     VALUES ($1, $2, $3)
+                     ON CONFLICT (sync_id, day) DO UPDATE SET
+                        dead_letters_dropped =
+                            sync_progress.dead_letters_dropped + EXCLUDED.dead_letters_dropped",
+                )
+                .bind(sync_id)
+                .bind(Utc::now().date_naive())
+                .bind(to_i64(dropped as u64))
+                .execute(&mut *tx)
+                .await
+                .map_err(store_err)?;
+            }
+        }
+        tx.commit().await.map_err(store_err)?;
         Ok(())
     }
 
@@ -295,13 +354,9 @@ impl SyncRepository for PgStore {
         })
     }
 
-    async fn get_sync(
-        &self,
-        tenant: Option<&str>,
-        id: &str,
-    ) -> Result<Option<StoredSync>, RepoError> {
+    async fn get_sync(&self, tenant: Option<&str>, id: &str) -> Result<Option<SyncRow>, RepoError> {
         let row = sqlx::query(
-            "SELECT id, tenant_id, spec_sealed, created_at, updated_at FROM syncs
+            "SELECT id, tenant_id, name, kind, spec_sealed, created_at, updated_at FROM syncs
              WHERE id = $1 AND tenant_id IS NOT DISTINCT FROM $2",
         )
         .bind(id)
@@ -312,9 +367,9 @@ impl SyncRepository for PgStore {
         row.map(|r| self.row_to_sync(&r)).transpose()
     }
 
-    async fn list_syncs(&self, tenant: Option<&str>) -> Result<Vec<StoredSync>, RepoError> {
+    async fn list_syncs(&self, tenant: Option<&str>) -> Result<Vec<SyncRow>, RepoError> {
         let rows = sqlx::query(
-            "SELECT id, tenant_id, spec_sealed, created_at, updated_at FROM syncs
+            "SELECT id, tenant_id, name, kind, spec_sealed, created_at, updated_at FROM syncs
              WHERE tenant_id IS NOT DISTINCT FROM $1 ORDER BY name",
         )
         .bind(tenant)
@@ -461,7 +516,7 @@ impl SyncRepository for PgStore {
     ) -> Result<Vec<DailyProgress>, RepoError> {
         self.ensure_owned(tenant, sync_id).await?;
         let rows = sqlx::query(
-            "SELECT day, written, deleted, rejected FROM sync_progress
+            "SELECT day, written, deleted, rejected, dead_letters_dropped FROM sync_progress
              WHERE sync_id = $1 AND day BETWEEN $2 AND $3 ORDER BY day",
         )
         .bind(sync_id)
@@ -477,6 +532,9 @@ impl SyncRepository for PgStore {
                     written: to_u64(r.try_get("written").map_err(from_sqlx)?),
                     deleted: to_u64(r.try_get("deleted").map_err(from_sqlx)?),
                     rejected: to_u64(r.try_get("rejected").map_err(from_sqlx)?),
+                    dead_letters_dropped: to_u64(
+                        r.try_get("dead_letters_dropped").map_err(from_sqlx)?,
+                    ),
                 })
             })
             .collect()
@@ -578,6 +636,42 @@ impl LabOutbox for PgStore {
                 return Ok(total);
             }
         }
+    }
+
+    async fn defer_events(
+        &self,
+        lease: Uuid,
+        ids: &[Uuid],
+        backoff: RetryBackoff,
+    ) -> Result<u64, RepoError> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let done = sqlx::query(
+            "UPDATE lab_events_outbox
+             SET attempts = attempts + 1,
+                 leased_until = NULL,
+                 next_attempt_at = now() + make_interval(secs =>
+                    LEAST($4::float8, $3::float8 * power(2, LEAST(attempts, 20))))
+             WHERE id = ANY($2) AND lease_token = $1 AND sent_at IS NULL",
+        )
+        .bind(lease)
+        .bind(ids)
+        .bind(backoff.base.as_secs_f64())
+        .bind(backoff.max.as_secs_f64())
+        .execute(&self.pool)
+        .await
+        .map_err(from_sqlx)?;
+        Ok(done.rows_affected())
+    }
+
+    async fn count_unsent(&self) -> Result<u64, RepoError> {
+        let n: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM lab_events_outbox WHERE sent_at IS NULL")
+                .fetch_one(&self.pool)
+                .await
+                .map_err(from_sqlx)?;
+        Ok(to_u64(n))
     }
 }
 

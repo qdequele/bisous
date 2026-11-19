@@ -7,7 +7,9 @@ pub mod api;
 pub mod auth;
 pub mod config;
 pub mod error;
+pub mod guard;
 pub mod lab;
+pub mod limits;
 pub mod manager;
 pub mod redact;
 pub mod registry;
@@ -22,15 +24,16 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::routing::{get, post};
-use meili_connect_core::{SourceFactory, StateStore, SyncPhase};
+use meili_connect_core::{HostPolicy, SourceFactory, StateStore, SyncPhase};
 use meili_connect_engine::SupervisorConfig;
-use meili_connect_store::{MemStore, PgStore, SecretKey};
+use meili_connect_store::{DeadLetterLimits, MemStore, PgStore, SecretKey};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use crate::auth::AuthConfig;
 use crate::config::{Config, LogFormat};
-use crate::manager::{SinkFactory, SyncManager, meili_sinks};
+use crate::limits::{Limits, ProbeSlots};
+use crate::manager::{ManagerDeps, SinkFactory, SyncManager, meili_sinks};
 use crate::registry::SourceRegistry;
 use crate::state::{AppState, Backend};
 use crate::usage::{MeteredStore, UsageMeter};
@@ -59,6 +62,10 @@ pub fn router(state: AppState) -> Router {
             get(api::list_dead_letters).delete(api::clear_dead_letters),
         )
         .fallback(api::fallback)
+        .layer(axum::middleware::from_fn_with_state(
+            state.limits.request_timeout,
+            limits::request_timeout,
+        ))
         .with_state(state)
 }
 
@@ -66,10 +73,12 @@ pub fn router(state: AppState) -> Router {
 pub struct Wiring {
     pub sources: Arc<dyn SourceFactory>,
     pub sinks: SinkFactory,
+    pub policy: Arc<HostPolicy>,
     pub supervisor: SupervisorConfig,
     pub auth: AuthConfig,
     pub probe_timeout: std::time::Duration,
     pub lab_events: bool,
+    pub limits: Limits,
 }
 
 /// Assemble the shared state around a backend. The engine gets the
@@ -79,27 +88,38 @@ pub fn build_state(
     wiring: Wiring,
     cancel: CancellationToken,
 ) -> AppState {
-    let meter = Arc::new(UsageMeter::new());
+    let meter = Arc::new(UsageMeter::new().with_backlog_cap(wiring.limits.outbox_max_pending));
     let engine_store: Arc<dyn StateStore> = Arc::new(MeteredStore::new(
         Arc::clone(&backend) as Arc<dyn StateStore>,
         Arc::clone(&meter),
     ));
-    let manager = Arc::new(SyncManager::new(
-        engine_store,
-        Arc::clone(&wiring.sources),
-        Arc::clone(&wiring.sinks),
-        wiring.supervisor,
+    let manager = Arc::new(SyncManager::new(ManagerDeps {
+        store: engine_store,
+        backend: Arc::clone(&backend),
+        sources: Arc::clone(&wiring.sources),
+        sinks: Arc::clone(&wiring.sinks),
+        policy: Arc::clone(&wiring.policy),
+        config: wiring.supervisor,
         meter,
+        lab_events: wiring.lab_events,
+        max_syncs_per_tenant: wiring.limits.max_syncs_per_tenant,
+        stop_grace: wiring.limits.stop_grace,
         cancel,
-    ));
+    }));
     AppState {
         backend,
         manager,
-        sources: wiring.sources,
+        registry: wiring.sources,
         sinks: wiring.sinks,
+        policy: wiring.policy,
         auth: wiring.auth,
         probe_timeout: wiring.probe_timeout,
         lab_events: wiring.lab_events,
+        probes: Arc::new(ProbeSlots::new(
+            wiring.limits.probe_concurrency,
+            wiring.limits.probe_concurrency_per_tenant,
+        )),
+        limits: wiring.limits,
     }
 }
 
@@ -179,12 +199,17 @@ pub async fn run() -> Result<(), String> {
     let config = Config::from_env().map_err(|e| e.0)?;
     init_tracing(&config);
 
+    let dead_letter_limits = DeadLetterLimits {
+        max_per_sync: config.limits.dead_letters_max_per_sync,
+        ..DeadLetterLimits::default()
+    };
     let backend: Arc<dyn Backend> = match (&config.database_url, &config.secret_key) {
         (Some(url), Some(key)) => {
             let key = SecretKey::from_base64(key).map_err(|e| e.to_string())?;
             let store = PgStore::connect(url, key)
                 .await
-                .map_err(|e| format!("cannot open the state database: {e}"))?;
+                .map_err(|e| format!("cannot open the state database: {e}"))?
+                .with_dead_letter_limits(dead_letter_limits);
             info!("state store: Postgres");
             Arc::new(store)
         }
@@ -194,13 +219,14 @@ pub async fn run() -> Result<(), String> {
                  usage are LOST on restart, and every sync snapshots again. Do not run this in \
                  production."
             );
-            Arc::new(MemStore::new())
+            Arc::new(MemStore::new().with_dead_letter_limits(dead_letter_limits))
         }
     };
 
     let auth = AuthConfig {
         lab_service_token: config.lab_service_token.clone(),
         admin_api_key: config.admin_api_key.clone(),
+        open_mode: config.open_mode,
     };
     if auth.is_open() {
         warn!(
@@ -209,16 +235,28 @@ pub async fn run() -> Result<(), String> {
         );
     }
 
+    let policy = Arc::new(config.host_policy.clone());
+    if policy.is_any() && config.lab_service_token.is_some() {
+        warn!(
+            "CONNECT_HOST_POLICY=any with LAB_SERVICE_TOKEN set: tenants can point syncs at \
+             internal addresses (metadata endpoint, private networks). Use `public` or \
+             `allowlist` for a hosted deployment"
+        );
+    }
+    info!(host_policy = policy.mode_name(), "host policy");
+
     let cancel = CancellationToken::new();
     let state = build_state(
         Arc::clone(&backend),
         Wiring {
             sources: Arc::new(SourceRegistry::new()),
-            sinks: meili_sinks(),
+            sinks: meili_sinks(Arc::clone(&policy)),
+            policy,
             supervisor: SupervisorConfig::default(),
             auth,
             probe_timeout: config.source_probe_timeout,
             lab_events: config.lab_events.is_some(),
+            limits: config.limits.clone(),
         },
         cancel.child_token(),
     );

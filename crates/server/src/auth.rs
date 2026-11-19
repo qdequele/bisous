@@ -4,7 +4,7 @@
 //! |---|---|---|---|
 //! | set | any | `Bearer <token>` + **required** `X-Connect-Tenant-Id` | that tenant |
 //! | any | set | `Bearer <key>`, `X-Connect-Tenant-Id` optional | global, or the named tenant |
-//! | unset | unset | nothing | open mode: global scope |
+//! | unset | unset | nothing | open mode: global scope, only when the config allowed it (loopback or `ALLOW_OPEN_MODE=true`); otherwise every call is refused |
 //!
 //! Tokens are compared in constant time. `/health` never goes through here.
 
@@ -23,16 +23,32 @@ pub const H_TENANT_ID: &str = "x-connect-tenant-id";
 /// Longest accepted tenant id.
 pub const MAX_TENANT_LEN: usize = 128;
 
+/// The default has no secret and no open mode: it refuses every call.
 #[derive(Debug, Clone, Default)]
 pub struct AuthConfig {
     pub lab_service_token: Option<Secret>,
     pub admin_api_key: Option<Secret>,
+    /// No secret is configured and that was allowed (loopback listener or
+    /// `ALLOW_OPEN_MODE=true`). Ignored when a secret is set.
+    pub open_mode: bool,
 }
 
 impl AuthConfig {
-    /// Open mode: no management secret configured.
-    pub fn is_open(&self) -> bool {
+    /// Open mode, explicitly.
+    pub fn open() -> Self {
+        Self {
+            open_mode: true,
+            ..Self::default()
+        }
+    }
+
+    fn no_secret(&self) -> bool {
         self.lab_service_token.is_none() && self.admin_api_key.is_none()
+    }
+
+    /// Open mode: no management secret configured, deliberately.
+    pub fn is_open(&self) -> bool {
+        self.no_secret() && self.open_mode
     }
 }
 
@@ -108,6 +124,12 @@ pub fn authorize(headers: &HeaderMap, config: &AuthConfig) -> Result<Scope, ApiE
             tenant: None,
         });
     }
+    if config.no_secret() {
+        // Fail closed: no secret and open mode not allowed.
+        return Err(ApiError::unauthorized(
+            "no management auth is configured on this server",
+        ));
+    }
     // Check the token before looking at the tenant: an unauthenticated
     // caller learns nothing about tenants.
     let token =
@@ -170,7 +192,20 @@ mod tests {
         AuthConfig {
             lab_service_token: lab.map(Secret::new),
             admin_api_key: admin.map(Secret::new),
+            open_mode: lab.is_none() && admin.is_none(),
         }
+    }
+
+    #[test]
+    fn no_secret_without_open_mode_refuses_everything() {
+        let err = authorize(&HeaderMap::new(), &AuthConfig::default()).unwrap_err();
+        assert_eq!(err.code, "unauthorized");
+        let err = authorize(
+            &headers(&[("authorization", "Bearer anything")]),
+            &AuthConfig::default(),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "unauthorized");
     }
 
     #[test]

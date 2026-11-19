@@ -27,6 +27,7 @@ use crate::schema::{
 #[derive(Debug, Default, Clone, Copy)]
 pub struct MysqlSourceFactory;
 
+#[async_trait::async_trait]
 impl SourceFactory for MysqlSourceFactory {
     fn build(
         &self,
@@ -35,6 +36,13 @@ impl SourceFactory for MysqlSourceFactory {
         streams: &[StreamMapping],
     ) -> Result<Box<dyn Source>, SourceError> {
         Ok(Box::new(MysqlSource::new(sync_id, spec, streams)?))
+    }
+
+    async fn endpoints(
+        &self,
+        spec: &SourceSpec,
+    ) -> Result<Vec<meili_connect_core::Endpoint>, SourceError> {
+        crate::endpoints::endpoints(spec)
     }
 }
 

@@ -17,8 +17,9 @@ use meili_connect_core::{DeadLetter, StateStore, StoreError, SyncSpec, SyncState
 use uuid::Uuid;
 
 use crate::{
-    BootSync, DailyProgress, DeadLetterPage, LabOutbox, OutboxEvent, OutboxLease, RepoError,
-    StoredDeadLetter, StoredSync, SyncRepository, validate_spec,
+    BootSync, DailyProgress, DeadLetterLimits, DeadLetterPage, LabOutbox, OutboxEvent, OutboxLease,
+    RepoError, RetryBackoff, StoredDeadLetter, StoredSync, SyncRepository, SyncRow, UnreadableSync,
+    bound_letter, validate_spec,
 };
 
 #[derive(Default)]
@@ -27,8 +28,12 @@ struct Inner {
     states: HashMap<String, SyncState>,
     dead_letters: BTreeMap<i64, DeadLetter>,
     next_dead_letter: i64,
-    progress: BTreeMap<(String, NaiveDate), [u64; 3]>,
+    /// written, deleted, rejected, dead letters dropped.
+    progress: BTreeMap<(String, NaiveDate), [u64; 4]>,
     outbox: Vec<OutboxRow>,
+    /// Test hook: rows reported as unreadable, like a Postgres row sealed
+    /// with another key.
+    unreadable: std::collections::HashSet<String>,
 }
 
 struct OutboxRow {
@@ -36,6 +41,8 @@ struct OutboxRow {
     leased_until: Option<DateTime<Utc>>,
     lease_token: Option<Uuid>,
     sent_at: Option<DateTime<Utc>>,
+    attempts: u32,
+    next_attempt_at: Option<DateTime<Utc>>,
 }
 
 impl Inner {
@@ -43,6 +50,22 @@ impl Inner {
         match self.syncs.get(id) {
             Some(s) if s.spec.tenant.as_deref() == tenant => Ok(()),
             _ => Err(RepoError::NotFound(format!("sync {id}"))),
+        }
+    }
+
+    fn row(&self, s: &StoredSync) -> SyncRow {
+        if self.unreadable.contains(&s.spec.id) {
+            SyncRow::Unreadable(UnreadableSync {
+                id: s.spec.id.clone(),
+                tenant: s.spec.tenant.clone(),
+                name: s.spec.name.clone(),
+                kind: s.spec.source.kind.as_str().to_owned(),
+                error: "the spec cannot be unsealed".into(),
+                created_at: s.created_at,
+                updated_at: s.updated_at,
+            })
+        } else {
+            SyncRow::Readable(s.clone())
         }
     }
 
@@ -57,6 +80,7 @@ impl Inner {
 pub struct MemStore {
     inner: Mutex<Inner>,
     permissive: bool,
+    limits: DeadLetterLimits,
 }
 
 impl MemStore {
@@ -72,6 +96,20 @@ impl MemStore {
             permissive: true,
             ..Self::default()
         }
+    }
+
+    /// Test helper: from now on report this sync as unreadable, as
+    /// Postgres does for a row sealed with another key.
+    pub fn make_unreadable(&self, id: &str) {
+        if let Ok(mut inner) = self.lock() {
+            inner.unreadable.insert(id.to_owned());
+        }
+    }
+
+    /// Bound what one sync may keep in the dead-letter table.
+    pub fn with_dead_letter_limits(mut self, limits: DeadLetterLimits) -> Self {
+        self.limits = limits;
+        self
     }
 
     fn check_sync(&self, inner: &Inner, sync_id: &str) -> Result<(), StoreError> {
@@ -110,14 +148,30 @@ impl StateStore for MemStore {
 
     async fn push_dead_letters(&self, letters: &[DeadLetter]) -> Result<(), StoreError> {
         let mut inner = self.lock()?;
-        // All or nothing, like the single INSERT in Postgres.
+        // All or nothing, like the transaction in Postgres.
         for letter in letters {
             self.check_sync(&inner, &letter.sync_id)?;
         }
+        let day = Utc::now().date_naive();
         for letter in letters {
+            let stored = inner
+                .dead_letters
+                .values()
+                .filter(|d| d.sync_id == letter.sync_id)
+                .count() as u64;
+            if stored >= self.limits.max_per_sync {
+                let c = inner
+                    .progress
+                    .entry((letter.sync_id.clone(), day))
+                    .or_default();
+                c[3] = c[3].saturating_add(1);
+                continue;
+            }
             inner.next_dead_letter += 1;
             let id = inner.next_dead_letter;
-            inner.dead_letters.insert(id, letter.clone());
+            inner
+                .dead_letters
+                .insert(id, bound_letter(letter, &self.limits));
         }
         Ok(())
     }
@@ -168,29 +222,24 @@ impl SyncRepository for MemStore {
         Ok(stored)
     }
 
-    async fn get_sync(
-        &self,
-        tenant: Option<&str>,
-        id: &str,
-    ) -> Result<Option<StoredSync>, RepoError> {
+    async fn get_sync(&self, tenant: Option<&str>, id: &str) -> Result<Option<SyncRow>, RepoError> {
         let inner = self.lock()?;
         Ok(inner
             .syncs
             .get(id)
             .filter(|s| s.spec.tenant.as_deref() == tenant)
-            .cloned())
+            .map(|s| inner.row(s)))
     }
 
-    async fn list_syncs(&self, tenant: Option<&str>) -> Result<Vec<StoredSync>, RepoError> {
+    async fn list_syncs(&self, tenant: Option<&str>) -> Result<Vec<SyncRow>, RepoError> {
         let inner = self.lock()?;
-        let mut out: Vec<StoredSync> = inner
+        let mut out: Vec<&StoredSync> = inner
             .syncs
             .values()
             .filter(|s| s.spec.tenant.as_deref() == tenant)
-            .cloned()
             .collect();
         out.sort_by(|a, b| a.spec.name.cmp(&b.spec.name));
-        Ok(out)
+        Ok(out.into_iter().map(|s| inner.row(s)).collect())
     }
 
     async fn update_sync(
@@ -234,7 +283,10 @@ impl SyncRepository for MemStore {
             .map(|s| BootSync {
                 id: s.spec.id.clone(),
                 tenant: s.spec.tenant.clone(),
-                spec: Ok(s.spec.clone()),
+                spec: match inner.row(s) {
+                    SyncRow::Readable(r) => Ok(r.spec),
+                    SyncRow::Unreadable(u) => Err(RepoError::Fatal(u.error)),
+                },
             })
             .collect();
         out.sort_by(|a, b| a.id.cmp(&b.id));
@@ -316,6 +368,7 @@ impl SyncRepository for MemStore {
                 written: c[0],
                 deleted: c[1],
                 rejected: c[2],
+                dead_letters_dropped: c[3],
             })
             .collect())
     }
@@ -339,6 +392,8 @@ impl LabOutbox for MemStore {
             leased_until: None,
             lease_token: None,
             sent_at: None,
+            attempts: 0,
+            next_attempt_at: None,
         });
         Ok(id)
     }
@@ -357,7 +412,10 @@ impl LabOutbox for MemStore {
             if events.len() >= limit as usize {
                 break;
             }
-            if row.sent_at.is_none() && row.leased_until.is_none_or(|t| t <= now) {
+            if row.sent_at.is_none()
+                && row.leased_until.is_none_or(|t| t <= now)
+                && row.next_attempt_at.is_none_or(|t| t <= now)
+            {
                 row.leased_until = Some(until);
                 row.lease_token = Some(token);
                 events.push(row.event.clone());
@@ -394,6 +452,43 @@ impl LabOutbox for MemStore {
             .outbox
             .retain(|row| row.sent_at.is_none_or(|t| t >= cutoff));
         Ok((before - inner.outbox.len()) as u64)
+    }
+
+    async fn defer_events(
+        &self,
+        lease: Uuid,
+        ids: &[Uuid],
+        backoff: RetryBackoff,
+    ) -> Result<u64, RepoError> {
+        let now = Utc::now();
+        let mut inner = self.lock()?;
+        let mut n = 0;
+        for row in inner.outbox.iter_mut() {
+            if row.sent_at.is_none()
+                && row.lease_token == Some(lease)
+                && ids.contains(&row.event.id)
+            {
+                let wait = chrono::Duration::from_std(backoff.delay(row.attempts))
+                    .unwrap_or(chrono::Duration::MAX);
+                row.attempts = row.attempts.saturating_add(1);
+                row.next_attempt_at = Some(
+                    now.checked_add_signed(wait)
+                        .unwrap_or(DateTime::<Utc>::MAX_UTC),
+                );
+                row.leased_until = None;
+                n += 1;
+            }
+        }
+        Ok(n)
+    }
+
+    async fn count_unsent(&self) -> Result<u64, RepoError> {
+        Ok(self
+            .lock()?
+            .outbox
+            .iter()
+            .filter(|r| r.sent_at.is_none())
+            .count() as u64)
     }
 }
 
@@ -544,10 +639,12 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap()
+                .readable()
+                .unwrap()
                 .spec,
             a
         );
-        let ids = |v: Vec<StoredSync>| v.into_iter().map(|s| s.spec.id).collect::<Vec<_>>();
+        let ids = |v: Vec<SyncRow>| v.iter().map(|s| s.id().to_owned()).collect::<Vec<_>>();
         assert_eq!(ids(store.list_syncs(Some("ta")).await.unwrap()), ["a1"]);
         assert_eq!(ids(store.list_syncs(None).await.unwrap()), ["g1"]);
 
@@ -657,13 +754,107 @@ mod tests {
                 day: today,
                 written: 5,
                 deleted: 1,
-                rejected: 4
+                rejected: 4,
+                dead_letters_dropped: 0,
             }]
         );
         assert!(matches!(
             store.progress(Some("x"), "s", today, today).await,
             Err(RepoError::NotFound(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn dead_letters_are_capped_per_sync_and_bounded_in_size() {
+        let store = MemStore::new().with_dead_letter_limits(DeadLetterLimits {
+            max_per_sync: 3,
+            max_payload_bytes: 64,
+        });
+        for id in ["a", "b"] {
+            store.create_sync(None, &spec(id, None, id)).await.unwrap();
+        }
+        let mut big = letter("a", "big");
+        big.payload = serde_json::json!({"doc": "x".repeat(1000)});
+        big.reason = "r".repeat(10_000);
+        store.push_dead_letters(&[big]).await.unwrap();
+        for i in 0..5 {
+            store
+                .push_dead_letters(&[letter("a", &i.to_string())])
+                .await
+                .unwrap();
+        }
+        store.push_dead_letters(&[letter("b", "1")]).await.unwrap();
+        let a = store
+            .list_dead_letters(None, "a", DeadLetterPage::default())
+            .await
+            .unwrap();
+        assert_eq!(a.len(), 3, "capped");
+        assert_eq!(
+            a[0].letter.payload,
+            serde_json::json!({"truncated": true, "bytes": 1010})
+        );
+        assert!(a[0].letter.reason.chars().count() <= 2_049);
+        let today = Utc::now().date_naive();
+        let p = store.progress(None, "a", today, today).await.unwrap();
+        assert_eq!(p[0].dead_letters_dropped, 3);
+        // Another sync has its own budget; clearing frees room.
+        assert_eq!(
+            store
+                .list_dead_letters(None, "b", DeadLetterPage::default())
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        store.clear_dead_letters(None, "a").await.unwrap();
+        store
+            .push_dead_letters(&[letter("a", "again")])
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .list_dead_letters(None, "a", DeadLetterPage::default())
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn deferred_events_wait_for_their_backoff() {
+        let store = MemStore::new();
+        let id = store
+            .enqueue_event(Some("t"), &serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(store.count_unsent().await.unwrap(), 1);
+        let lease = store
+            .lease_events(10, Duration::from_millis(10))
+            .await
+            .unwrap();
+        let backoff = RetryBackoff {
+            base: Duration::from_secs(60),
+            max: Duration::from_secs(3600),
+        };
+        assert_eq!(
+            store
+                .defer_events(lease.token, &[id], backoff)
+                .await
+                .unwrap(),
+            1
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        // The lease is over, but the event waits for its backoff.
+        let again = store
+            .lease_events(10, Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert!(again.events.is_empty());
+        assert_eq!(store.count_unsent().await.unwrap(), 1);
+        assert_eq!(backoff.delay(0), Duration::from_secs(60));
+        assert_eq!(backoff.delay(3), Duration::from_secs(480));
+        assert_eq!(backoff.delay(30), Duration::from_secs(3600));
     }
 
     #[tokio::test]
