@@ -518,3 +518,39 @@ async fn outbox_expired_lease_is_released_in_order() {
             .is_empty()
     );
 }
+
+#[tokio::test]
+async fn timeouts_and_read_only_transactions_are_transient() {
+    let Some(store) = store().await else { return };
+    // 57014: statement timeout.
+    let mut tx = store.pool().begin().await.unwrap();
+    sqlx::query("SET LOCAL statement_timeout = 10")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    let err = sqlx::query("SELECT pg_sleep(1)")
+        .execute(&mut *tx)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(from_sqlx(err), RepoError::Transient(m) if m.contains("57014")),
+        "statement timeout"
+    );
+    drop(tx);
+    // 25006: what a demoted primary answers to a write.
+    let mut tx = store.pool().begin().await.unwrap();
+    sqlx::query("SET TRANSACTION READ ONLY")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    let err = sqlx::query("INSERT INTO lab_events_outbox (id, payload) VALUES ($1, '{}')")
+        .bind(Uuid::new_v4())
+        .execute(&mut *tx)
+        .await
+        .unwrap_err();
+    let mapped = StoreError::from(from_sqlx(err));
+    assert!(
+        matches!(&mapped, StoreError::Transient(m) if m.contains("25006")),
+        "{mapped:?}"
+    );
+}

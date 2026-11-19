@@ -54,10 +54,14 @@ impl PgStore {
 
     /// Wrap an existing pool, applying pending migrations first.
     pub async fn from_pool(pool: PgPool, key: SecretKey) -> Result<Self, StoreError> {
-        MIGRATOR
-            .run(&pool)
-            .await
-            .map_err(|e| StoreError::Fatal(format!("migrations failed: {e}")))?;
+        MIGRATOR.run(&pool).await.map_err(|e| match e {
+            // A connection lost while migrating is worth a retry.
+            sqlx::migrate::MigrateError::Execute(e) => match from_sqlx(e) {
+                RepoError::Transient(m) => StoreError::Transient(format!("migrations: {m}")),
+                other => StoreError::Fatal(format!("migrations failed: {other}")),
+            },
+            other => StoreError::Fatal(format!("migrations failed: {other}")),
+        })?;
         Ok(Self { pool, key })
     }
 
