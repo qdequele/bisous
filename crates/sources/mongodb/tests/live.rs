@@ -588,6 +588,33 @@ async fn idle_stream_emits_keepalive_checkpoints_and_cancels() {
     c.database(&other).drop().await.unwrap();
 }
 
+#[tokio::test]
+async fn snapshot_blocked_on_a_full_channel_returns_ok_on_cancel() {
+    let Some(url) = url() else { return };
+    let c = client(&url).await;
+    let db = unique_db();
+    c.database(&db)
+        .collection::<Document>("a")
+        .insert_many((0..500).map(|i| doc! {"_id": i}))
+        .await
+        .unwrap();
+    let mut source = build(&url, json!({}), &[&format!("{db}.a")]);
+    source.open(None).await.unwrap();
+    // Nobody reads: the snapshot blocks on back-pressure.
+    let (tx, _rx) = mpsc::channel(1);
+    let cancel = CancellationToken::new();
+    let c2 = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        c2.cancel();
+    });
+    let r = tokio::time::timeout(Duration::from_secs(3), source.snapshot(tx, cancel))
+        .await
+        .expect("snapshot ignored the cancellation");
+    assert!(r.is_ok(), "{r:?}");
+    c.database(&db).drop().await.unwrap();
+}
+
 /// `MONGO_STANDALONE_TEST_URL`: a mongod started without `--replSet`.
 #[tokio::test]
 async fn standalone_is_reported_with_the_fix() {

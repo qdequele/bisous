@@ -140,6 +140,22 @@ impl MongoSource {
         Ok(client)
     }
 
+    /// [`Self::client`], or `None` once `cancel` fires (an `mongodb+srv`
+    /// URI resolves DNS here).
+    async fn client_or_cancel(
+        &mut self,
+        cancel: &CancellationToken,
+    ) -> Result<Option<Client>, SourceError> {
+        if cancel.is_cancelled() {
+            return Ok(None);
+        }
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => Ok(None),
+            c = self.client() => c.map(Some),
+        }
+    }
+
     /// One database when every mapping lives in it, else the deployment.
     fn single_db(&self) -> Option<&str> {
         let first = self.targets.first()?.db.as_str();
@@ -597,7 +613,9 @@ impl Source for MongoSource {
         events: EventSender,
         cancel: CancellationToken,
     ) -> Result<(), SourceError> {
-        let client = self.client().await?;
+        let Some(client) = self.client_or_cancel(&cancel).await? else {
+            return Ok(());
+        };
         let batch = self.config.snapshot_batch_size;
         for t in self.targets.clone() {
             let coll = client.database(&t.db).collection::<Document>(&t.coll);
@@ -642,7 +660,9 @@ impl Source for MongoSource {
     ) -> Result<(), SourceError> {
         // Resume tokens hold nothing on the server: acks need no action.
         drop(acks);
-        let client = self.client().await?;
+        let Some(client) = self.client_or_cancel(&cancel).await? else {
+            return Ok(());
+        };
         let mut position = self
             .position
             .clone()
@@ -828,6 +848,69 @@ mod tests {
         assert_eq!(get("n").source_type, "int|long");
         assert!(!get("n").nullable);
         assert!(get("tags").nullable);
+    }
+
+    /// A source pointed at a port nothing listens on: every server
+    /// selection waits for its 15 s timeout, so only cancellation can end
+    /// `snapshot` or `stream` quickly.
+    fn unreachable() -> MongoSource {
+        let config = MongoConfig::from_json(
+            &serde_json::json!({"uri": "mongodb://127.0.0.1:1/?directConnection=true"}),
+        )
+        .unwrap();
+        let streams: Vec<StreamMapping> =
+            serde_json::from_value(serde_json::json!([{"collection": "a.x", "index": "x"}]))
+                .unwrap();
+        MongoSource::new("s", config, &streams).unwrap()
+    }
+
+    #[tokio::test]
+    async fn snapshot_returns_ok_promptly_on_cancel() {
+        let mut s = unreachable();
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let cancel = CancellationToken::new();
+        let c = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            c.cancel();
+        });
+        let started = Instant::now();
+        let r = tokio::time::timeout(Duration::from_secs(3), s.snapshot(tx, cancel))
+            .await
+            .expect("snapshot ignored the cancellation");
+        assert!(r.is_ok(), "{r:?}");
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn stream_returns_ok_promptly_on_cancel() {
+        let mut s = unreachable();
+        s.position = Some(Position::from_timestamp(mongodb::bson::Timestamp {
+            time: 1,
+            increment: 1,
+        }));
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let (_ack_tx, acks) = meili_connect_core::ack_channel();
+        let cancel = CancellationToken::new();
+        let c = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            c.cancel();
+        });
+        let r = tokio::time::timeout(Duration::from_secs(3), s.stream(tx, acks, cancel))
+            .await
+            .expect("stream ignored the cancellation");
+        assert!(r.is_ok(), "{r:?}");
+
+        // Already cancelled: Ok at once, even before `open`.
+        let mut s = unreachable();
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let (_ack_tx, acks) = meili_connect_core::ack_channel();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        assert!(s.stream(tx, acks, cancel.clone()).await.is_ok());
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        assert!(s.snapshot(tx, cancel).await.is_ok());
     }
 
     #[test]
