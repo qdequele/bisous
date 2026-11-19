@@ -112,6 +112,11 @@ Everything in `docs/openapi.yaml`, plus:
 - `GET /syncs/{id}/status` includes `lag` (`{"seconds", "bytes"}` when the
   source can tell), `documents` totals per unit, `bytes`, and
   `dead_letters`.
+- `GET /sources/dynamodb/trust`: for the calling tenant, `{"external_id",
+  "principal" (string or null), "trust_policy" (IAM JSON), "note" (string or
+  null)}`. The console shows it in the DynamoDB `assume_role` form and never
+  sends `external_id` (the engine sets it; another value is
+  `422 external_id_not_allowed`).
 - `GET /metrics`: Prometheus text, authenticated with `METRICS_TOKEN` (never
   the tenant tokens), no tenant labels beyond counts.
 - `GET /health`.

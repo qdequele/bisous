@@ -37,6 +37,17 @@ All notable changes to meili-connect are listed here. The format follows
   (`sslrootcert`, `passfile`, `service`, …) answer
   `422 ambient_credentials`; a stored one is held at its next start. The
   standalone global scope keeps them.
+- On a hosted server the external ID of a tenant's DynamoDB role
+  (`credentials: assume_role`) is chosen by the server, one per tenant,
+  derived from `CONNECT_SECRET_KEY`: a tenant could otherwise name another
+  team's role with that team's external ID and read its table through the
+  server's own AWS identity. Another `external_id` answers
+  `422 external_id_not_allowed`; a stored one is held at its next start
+  until the role's trust policy uses the new external ID; without
+  `CONNECT_SECRET_KEY`, `assume_role` answers `422 external_id_unavailable`.
+  New `GET /sources/dynamodb/trust` gives a tenant its external ID, the
+  server's AWS principal and the trust policy to paste. The standalone global
+  scope keeps a free-form `external_id`.
 
 ### Added
 
