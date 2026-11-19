@@ -1066,6 +1066,69 @@ async fn copy_settings_cases() {
 }
 
 #[tokio::test]
+async fn copy_settings_refuses_redacted_api_keys() {
+    let server = MockServer::start().await;
+    // What Meilisearch 1.57 returns for embedders configured with keys.
+    let cases = [
+        (
+            "oa",
+            json!({"oa": {"source": "openAi", "model": "m", "apiKey": "sk-XXXXX..."}}),
+        ),
+        (
+            "mix",
+            json!({"mix": {"source": "composite",
+                "searchEmbedder": {"source": "userProvided", "dimensions": 3},
+                "indexingEmbedder": {"source": "rest", "apiKey": "XXX..."}}}),
+        ),
+    ];
+    for (i, (name, embedders)) in cases.into_iter().enumerate() {
+        let from = format!("live{i}");
+        Mock::given(method("GET"))
+            .and(path(format!("/indexes/{from}/settings")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "searchableAttributes": ["*"],
+                "embedders": embedders,
+            })))
+            .mount(&server)
+            .await;
+        let e = sink(&server, opts())
+            .copy_settings(&from, "shadow")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&e, SinkError::Config(m) if m.contains(&format!("`{name}`"))),
+            "{e:?}"
+        );
+        assert!(!e.to_string().contains("XXX"));
+    }
+    // Embedders without a key are copied.
+    let settings = json!({"embedders": {
+        "up": {"source": "userProvided", "dimensions": 3},
+        "local": {"source": "ollama", "url": "http://x", "apiKey": null},
+    }});
+    Mock::given(method("GET"))
+        .and(path("/indexes/keyless/settings"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(settings.clone()))
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path("/indexes/shadow/settings"))
+        .and(wiremock::matchers::body_json(settings))
+        .respond_with(task_ok(9))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(path("/tasks/9"))
+        .respond_with(task_state(9, "succeeded", None))
+        .mount(&server)
+        .await;
+    sink(&server, opts())
+        .copy_settings("keyless", "shadow")
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn document_count_cases() {
     let server = MockServer::start().await;
     Mock::given(path("/indexes/movies/stats"))

@@ -225,6 +225,27 @@ fn shape_problem(op: &DocOp) -> Option<String> {
     })
 }
 
+/// The first embedder of `settings` that holds an `apiKey`, at any depth
+/// (composite embedders nest theirs). `GET /settings` always redacts API
+/// keys (`"sk-XXXXX..."`), so any key found there cannot be copied.
+fn embedder_with_api_key(settings: &serde_json::Value) -> Option<&str> {
+    fn has_key(v: &serde_json::Value) -> bool {
+        match v {
+            serde_json::Value::Object(o) => o
+                .iter()
+                .any(|(k, v)| (k == "apiKey" && !v.is_null()) || has_key(v)),
+            serde_json::Value::Array(a) => a.iter().any(has_key),
+            _ => false,
+        }
+    }
+    settings
+        .get("embedders")?
+        .as_object()?
+        .iter()
+        .find(|(_, e)| has_key(e))
+        .map(|(name, _)| name.as_str())
+}
+
 /// What became of a document isolated with a possibly transient failure.
 enum Settled {
     Written,
@@ -731,6 +752,16 @@ impl Sink for MeiliSink {
             Err(api) if api.status == StatusCode::NOT_FOUND => return Ok(()),
             Err(api) => return Err(map_api_error("reading settings", &api)),
         };
+        if let Some(embedder) = embedder_with_api_key(&settings) {
+            return Err(SinkError::Config(format!(
+                "cannot copy the settings of index `{from}` to `{to}`: embedder `{embedder}` has \
+                 an API key, which Meilisearch only returns redacted; copying it would install a \
+                 broken key"
+            )));
+        }
+        // Every key of `GET /settings` is accepted back by `PATCH` (checked
+        // against Meilisearch 1.57, embedders included), and the PATCH
+        // creates `to` when it does not exist yet.
         self.index_task(
             "copying settings",
             Method::PATCH,
