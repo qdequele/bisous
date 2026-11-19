@@ -21,6 +21,9 @@
 //!   invalidated, and has not confirmed past `lsn`; otherwise
 //!   `PositionLost`.
 //! - **teardown** drops the slot and the publication.
+//!
+//! Postgres 14 or later: `pgwire-replication` always asks pgoutput for
+//! `messages`, which older servers reject at `START_REPLICATION`.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 

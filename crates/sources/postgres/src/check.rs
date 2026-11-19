@@ -4,7 +4,7 @@ use meili_connect_core::{CheckReport, CheckStatus, SourceError};
 
 use crate::catalog;
 use crate::conn::Sql;
-use crate::source::{MIN_VERSION, PostgresSource};
+use crate::source::{MIN_VERSION, PostgresSource, too_old};
 
 pub async fn run(src: &mut PostgresSource) -> Result<CheckReport, SourceError> {
     let mut report = CheckReport::default();
@@ -33,11 +33,7 @@ pub async fn run(src: &mut PostgresSource) -> Result<CheckReport, SourceError> {
     let sql = src.db()?;
 
     if version < MIN_VERSION {
-        report.push(
-            "server_version",
-            CheckStatus::Failed,
-            format!("Postgres {version} is too old: logical replication needs 10 or later"),
-        );
+        report.push("server_version", CheckStatus::Failed, too_old(version));
     } else {
         report.push("server_version", CheckStatus::Ok, version_text(version));
     }

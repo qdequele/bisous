@@ -24,8 +24,20 @@ use crate::pgoutput::{Decoded, Decoder, KeyColumns, Mapped};
 /// Rows per `FETCH` during the snapshot: the most rows held in memory.
 const SNAPSHOT_BATCH: usize = 500;
 const CURSOR: &str = "meili_connect_snapshot";
-/// Oldest supported server: logical replication with pgoutput.
-pub(crate) const MIN_VERSION: i32 = 100_000;
+/// Oldest supported server. `pgwire-replication` always asks pgoutput for
+/// `messages 'true'`, an option pgoutput only knows from Postgres 14: an
+/// older server accepts the slot and the snapshot, then refuses every
+/// START_REPLICATION. Refuse it before creating anything.
+pub(crate) const MIN_VERSION: i32 = 140_000;
+
+pub(crate) fn too_old(version: i32) -> String {
+    format!(
+        "Postgres {}.{} is too old: logical replication through this connector needs \
+         Postgres 14 or later",
+        version / 10_000,
+        version % 10_000
+    )
+}
 
 /// One mapped table: canonical identity plus the name the user mapped.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -476,10 +488,7 @@ impl Source for PostgresSource {
         }
         self.connect().await?;
         if self.version < MIN_VERSION {
-            return Err(SourceError::Config(format!(
-                "Postgres {} is too old: logical replication needs 10 or later",
-                self.version
-            )));
+            return Err(SourceError::Config(too_old(self.version)));
         }
         let tables = self.mapped_tables().await?;
         self.warm_types(&tables).await?;

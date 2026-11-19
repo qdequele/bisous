@@ -26,6 +26,17 @@ fn url() -> Option<String> {
     }
 }
 
+/// A Postgres older than 14 (`PG_OLD_TEST_URL`), for the version gate.
+fn old_url() -> Option<String> {
+    match std::env::var("PG_OLD_TEST_URL") {
+        Ok(u) if !u.is_empty() => Some(u),
+        _ => {
+            eprintln!("PG_OLD_TEST_URL is not set: skipping old-Postgres test");
+            None
+        }
+    }
+}
+
 fn unique(prefix: &str) -> String {
     format!("{prefix}_{:08x}", rand::random::<u32>())
 }
@@ -666,4 +677,50 @@ async fn teardown_while_streaming_and_bad_credentials() {
         assert!(matches!(err, SourceError::Config(_)), "{err:?}");
         assert!(!err.to_string().contains("hunter2"));
     }
+}
+
+#[tokio::test]
+async fn servers_older_than_14_are_refused_before_anything_is_created() {
+    let Some(url) = old_url() else { return };
+    let db = admin(&url).await;
+    let version: i32 = db
+        .query_one("SELECT current_setting('server_version_num')::int4", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert!(version < 140_000, "PG_OLD_TEST_URL is Postgres {version}");
+    let table = unique("old");
+    create_items(&db, &table).await;
+    let sync_id = unique("old");
+    let name = format!("meili_connect_{sync_id}");
+    let mut src = source(&url, &sync_id, &[&format!("public.{table}")]);
+
+    let report = src.check().await.unwrap();
+    let item = report
+        .items
+        .iter()
+        .find(|i| i.name == "server_version")
+        .unwrap();
+    assert_eq!(item.status, CheckStatus::Failed, "{report:#?}");
+    assert!(item.message.contains("14"), "{}", item.message);
+
+    let err = src.open(None).await.unwrap_err();
+    assert!(matches!(err, SourceError::Config(_)), "{err:?}");
+    let slots: i64 = db
+        .query_one(
+            "SELECT count(*) FROM pg_replication_slots WHERE slot_name = $1",
+            &[&name],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    let pubs: i64 = db
+        .query_one(
+            "SELECT count(*) FROM pg_publication WHERE pubname = $1",
+            &[&name],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!((slots, pubs), (0, 0));
 }
