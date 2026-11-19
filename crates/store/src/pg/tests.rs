@@ -9,7 +9,7 @@ use std::sync::Arc;
 use sqlx::Connection;
 
 use super::*;
-use crate::test_support::{invalid_specs, letter, spec, state};
+use crate::test_support::{invalid_specs, letter, skipped_letter, spec, state};
 
 async fn store_with_key(key: SecretKey) -> Option<PgStore> {
     store_with(key, &[]).await
@@ -753,4 +753,29 @@ async fn unknown_syncs_are_not_found() {
         store.record_progress("ghost", 1, 0, 0).await,
         Err(StoreError::NotFound(_))
     ));
+}
+
+/// Skipped source records are dead letters with a JSON null payload and a
+/// source position as the id.
+#[tokio::test]
+async fn skipped_records_round_trip_as_dead_letters() {
+    let Some(store) = store().await else { return };
+    store
+        .create_sync(None, &spec("s", None, "n"))
+        .await
+        .unwrap();
+    let letters = vec![
+        skipped_letter("s", "orders/3@1842"),
+        letter("s", "1"),
+        skipped_letter("s", "public.orders@0/16B3748"),
+    ];
+    store.push_dead_letters(&letters).await.unwrap();
+    let got = store
+        .list_dead_letters(None, "s", DeadLetterPage::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        got.into_iter().map(|d| d.letter).collect::<Vec<_>>(),
+        letters
+    );
 }

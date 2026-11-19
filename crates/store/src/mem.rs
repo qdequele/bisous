@@ -401,7 +401,7 @@ impl LabOutbox for MemStore {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::test_support::{invalid_specs, letter, spec, state};
+    use crate::test_support::{invalid_specs, letter, skipped_letter, spec, state};
 
     #[tokio::test]
     async fn state_round_trip() {
@@ -463,6 +463,29 @@ mod tests {
             .unwrap();
         loose.record_progress("ghost", 1, 0, 0).await.unwrap();
         assert!(loose.load("ghost").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn skipped_records_round_trip_as_dead_letters() {
+        let store = MemStore::new();
+        store
+            .create_sync(None, &spec("s", None, "n"))
+            .await
+            .unwrap();
+        let letters = vec![
+            skipped_letter("s", "orders/3@1842"),
+            letter("s", "1"),
+            skipped_letter("s", "public.orders@0/16B3748"),
+        ];
+        store.push_dead_letters(&letters).await.unwrap();
+        let got = store
+            .list_dead_letters(None, "s", DeadLetterPage::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            got.into_iter().map(|d| d.letter).collect::<Vec<_>>(),
+            letters
+        );
     }
 
     #[tokio::test]

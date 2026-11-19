@@ -295,6 +295,18 @@ pub(crate) mod test_support {
         vec![no_streams, bad_index, bad_guard]
     }
 
+    /// A record the source skipped: no payload, a position as the id.
+    pub fn skipped_letter(sync_id: &str, position: &str) -> DeadLetter {
+        DeadLetter {
+            sync_id: sync_id.into(),
+            index: "orders".into(),
+            document_id: position.into(),
+            payload: serde_json::Value::Null,
+            reason: "undecodable record".into(),
+            created_at: now(),
+        }
+    }
+
     pub fn letter(sync_id: &str, doc: &str) -> DeadLetter {
         DeadLetter {
             sync_id: sync_id.into(),
