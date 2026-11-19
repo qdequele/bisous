@@ -13,9 +13,10 @@ use std::time::Duration;
 
 use chrono::Utc;
 use meili_connect_core::{
-    AckReceiver, AckSender, Checkpoint, DeadLetter, DocOp, DocumentKind, IndexTarget, Opened,
-    Progress, ResyncReason, Sink, SinkError, Source, SourceError, SourceEvent, SourceFactory,
-    StateStore, StoreError, SyncPhase, SyncSpec, SyncState, Usage, ack_channel,
+    AckReceiver, AckSender, Checkpoint, DeadLetter, DocOp, DocumentKind, IndexTarget, Lag,
+    LagReporter, LagWatch, Opened, Progress, ResyncReason, Sink, SinkError, Source, SourceError,
+    SourceEvent, SourceFactory, StateStore, StoreError, SyncPhase, SyncSpec, SyncState, Usage,
+    ack_channel,
 };
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
@@ -93,6 +94,9 @@ pub struct RunMonitor {
     inner: Arc<Mutex<MonitorState>>,
     max_consecutive_resyncs: u32,
     healthy_after: Duration,
+    /// Handed to every source built: its lag while it streams.
+    lag: LagReporter,
+    lag_watch: LagWatch,
 }
 
 #[derive(Debug, Default)]
@@ -132,11 +136,24 @@ impl RunMonitor {
     /// sync has streamed for `healthy_after` without interruption; past
     /// `max_consecutive_resyncs` the sync is held instead.
     pub fn new(max_consecutive_resyncs: u32, healthy_after: Duration) -> Self {
+        let (lag, lag_watch) = LagReporter::new();
         Self {
-            inner: Arc::new(Mutex::new(MonitorState::default())),
+            inner: Arc::new(Mutex::new(MonitorState {
+                // Progress is measured from the start of supervision.
+                last_checkpoint: Some(Instant::now()),
+                ..MonitorState::default()
+            })),
             max_consecutive_resyncs,
             healthy_after,
+            lag,
+            lag_watch,
         }
+    }
+
+    /// How far behind its origin the running source is, when it can tell
+    /// (`None` while not streaming).
+    pub fn lag(&self) -> Option<Lag> {
+        *self.lag_watch.borrow()
     }
 
     fn state(&self) -> MutexGuard<'_, MonitorState> {
@@ -233,7 +250,8 @@ impl RunMonitor {
         self.state().last_checkpoint = Some(Instant::now());
     }
 
-    /// How long ago a run of this monitor last saved a checkpoint.
+    /// How long ago a run of this monitor last saved a checkpoint (or,
+    /// before the first one, since the monitor was created).
     pub fn since_last_checkpoint(&self) -> Option<Duration> {
         self.state().last_checkpoint.map(|t| t.elapsed())
     }
@@ -315,6 +333,8 @@ pub async fn run_sync_monitored(
     loop {
         let attempted = runner.attempt(resync, reason).await;
         monitor.deactivate();
+        // Not streaming any more: whatever the source last said is stale.
+        monitor.lag.clear();
         match attempted {
             Ok(()) | Err(Halt::Cancelled) => return Ok(()),
             Err(Halt::Error(EngineError::Source(SourceError::PositionLost(lost)))) => {
@@ -493,6 +513,8 @@ impl Runner<'_> {
             self.deps
                 .sources
                 .build(&self.spec.id, &self.spec.source, &self.spec.streams)?;
+        self.monitor.lag.clear();
+        source.report_lag(self.monitor.lag.clone());
         let resume = if resync {
             None
         } else {

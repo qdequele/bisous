@@ -429,6 +429,11 @@ async fn status_json(state: &AppState, scope: &Scope, id: &str) -> ApiResult<Val
         .await?;
     let (mut written, mut deleted, mut rejected, mut dropped) = (0u64, 0u64, 0u64, 0u64);
     let mut units = meili_connect_core::Usage::default();
+    let dead_letters = state.repo().count_dead_letters(scope.tenant(), id).await?;
+    let lag = live.as_ref().and_then(|s| s.lag);
+    let lag_warning = state
+        .lag_guard
+        .warning(lag.as_ref(), live.as_ref().and_then(|s| s.since_checkpoint));
     for d in &days {
         written = written.saturating_add(d.written);
         deleted = deleted.saturating_add(d.deleted);
@@ -450,12 +455,17 @@ async fn status_json(state: &AppState, scope: &Scope, id: &str) -> ApiResult<Val
         "progress": { "written": written, "deleted": deleted, "rejected": rejected },
         // The metered units since the sync was created.
         "documents": {
-            "streamed": units.documents_streamed,
-            "snapshot": units.documents_snapshot,
-            "resync": units.documents_resync,
+            "documents_streamed": units.documents_streamed,
+            "documents_snapshot": units.documents_snapshot,
+            "documents_resync": units.documents_resync,
         },
         "bytes": units.bytes,
         "sync_seconds": units.sync_seconds,
+        // How far behind the origin, while streaming and when the source
+        // can tell.
+        "lag": lag,
+        "lag_warning": lag_warning,
+        "dead_letters": dead_letters,
         // Rejected documents not kept as dead letters: the sync reached
         // DEAD_LETTERS_MAX_PER_SYNC. Clear the dead letters to keep more.
         "dead_letters_overflow": dropped,

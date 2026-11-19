@@ -488,3 +488,25 @@ async fn time_in_streaming_is_metered_and_a_held_sync_costs_nothing() {
 fn seed_rows_sup(h: &Harness) {
     h.origin.seed(vec![upsert(1, json!({}))]);
 }
+
+#[tokio::test]
+async fn the_status_carries_the_streaming_lag_only_while_running() {
+    let h = Harness::new();
+    h.origin.seed(vec![upsert(1, json!({}))]);
+    let s = supervisor(&h);
+    s.start(spec()).await.expect("start");
+    wait_status(&s, "streaming", streaming).await;
+    wait_status(&s, "caught up", |st| {
+        st.lag
+            .is_some_and(|l| l.seconds == Some(0.0) && l.bytes == Some(0))
+    })
+    .await;
+    let st = status(&s).await;
+    assert!(
+        st.since_checkpoint
+            .is_some_and(|d| d < Duration::from_secs(5)),
+        "{st:?}"
+    );
+    s.stop(SYNC_ID).await.expect("stop");
+    assert_eq!(status(&s).await.lag, None, "a stopped sync has no lag");
+}

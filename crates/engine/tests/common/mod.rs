@@ -10,10 +10,10 @@ use std::time::Duration;
 use async_trait::async_trait;
 use meili_connect_core::{
     AckReceiver, ApplyReport, Capabilities, Change, CheckReport, Checkpoint, CollectionInfo,
-    DeadLetter, DocOp, Document, EventSender, FieldSelection, IndexTarget, MeiliDestination, Op,
-    Opened, Progress, RejectedDoc, ResyncReason, Secret, Sink, SinkError, Source, SourceError,
-    SourceEvent, SourceFactory, SourceKind, SourceSpec, StateStore, StoreError, StreamMapping,
-    SyncPhase, SyncSpec, SyncState, Usage, document_id,
+    DeadLetter, DocOp, Document, EventSender, FieldSelection, IndexTarget, Lag, LagReporter,
+    MeiliDestination, Op, Opened, Progress, RejectedDoc, ResyncReason, Secret, Sink, SinkError,
+    Source, SourceError, SourceEvent, SourceFactory, SourceKind, SourceSpec, StateStore,
+    StoreError, StreamMapping, SyncPhase, SyncSpec, SyncState, Usage, document_id,
 };
 use meili_connect_engine::{SyncDeps, SyncOptions};
 use serde_json::{Value, json};
@@ -274,6 +274,7 @@ impl SourceFactory for FakeFactory {
         Ok(Box::new(FakeSource {
             origin: Arc::clone(&self.0),
             pos: 0,
+            lag: None,
         }))
     }
 }
@@ -281,6 +282,7 @@ impl SourceFactory for FakeFactory {
 pub struct FakeSource {
     origin: Arc<Origin>,
     pos: usize,
+    lag: Option<LagReporter>,
 }
 
 struct Active(Arc<Origin>);
@@ -399,6 +401,18 @@ impl Source for FakeSource {
             Some(acks)
         };
         let _active = Active(Arc::clone(&origin));
+        // Reports how many log events it has not sent yet, as seconds.
+        let report = |pos: usize| {
+            if let Some(lag) = &self.lag {
+                let behind = origin.state().log.len().saturating_sub(pos);
+                lag.report(Lag {
+                    seconds: Some(behind as f64),
+                    bytes: Some(behind as u64 * 100),
+                    records: None,
+                });
+            }
+        };
+        report(self.pos);
         let mut fault = fault;
         let mut sent_here = 0usize;
         loop {
@@ -433,6 +447,7 @@ impl Source for FakeSource {
                     self.pos += 1;
                     sent_here += 1;
                     origin.state().sent += 1;
+                    report(self.pos);
                 }
                 None => {
                     tokio::select! {
@@ -456,6 +471,10 @@ impl Source for FakeSource {
     async fn teardown(&mut self) -> Result<(), SourceError> {
         self.origin.state().teardowns += 1;
         Ok(())
+    }
+
+    fn report_lag(&mut self, reporter: LagReporter) {
+        self.lag = Some(reporter);
     }
 }
 

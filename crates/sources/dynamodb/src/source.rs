@@ -11,7 +11,7 @@ use aws_sdk_dynamodbstreams::types::ShardIteratorType;
 use futures::StreamExt;
 use meili_connect_core::{
     AckReceiver, Capabilities, CheckReport, CheckStatus, CollectionInfo, EventSender, FieldInfo,
-    Opened, Source, SourceError, SourceFactory, SourceKind, SourceSpec, StreamMapping,
+    LagReporter, Opened, Source, SourceError, SourceFactory, SourceKind, SourceSpec, StreamMapping,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -124,6 +124,7 @@ pub struct DynamoSource {
     tables: Vec<String>,
     clients: Option<Clients>,
     opened: Option<BTreeMap<String, TableState>>,
+    lag: Option<LagReporter>,
 }
 
 impl std::fmt::Debug for DynamoSource {
@@ -144,6 +145,7 @@ impl DynamoSource {
             tables,
             clients: None,
             opened: None,
+            lag: None,
         }
     }
 
@@ -633,7 +635,19 @@ impl Source for DynamoSource {
         let Some(opened) = self.opened.as_mut() else {
             return Err(SourceError::Fatal("stream called before open".into()));
         };
-        stream::run(clients.streams, &opts, opened, events, cancel).await
+        stream::run(
+            clients.streams,
+            &opts,
+            opened,
+            events,
+            self.lag.clone(),
+            cancel,
+        )
+        .await
+    }
+
+    fn report_lag(&mut self, reporter: LagReporter) {
+        self.lag = Some(reporter);
     }
 
     async fn teardown(&mut self) -> Result<(), SourceError> {

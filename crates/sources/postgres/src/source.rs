@@ -6,7 +6,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use meili_connect_core::{
     AckReceiver, Capabilities, Change, CheckReport, Checkpoint, CollectionInfo, EventSender,
-    FieldInfo, Op, Opened, Source, SourceError, SourceEvent, SourceKind,
+    FieldInfo, Lag, LagReporter, Op, Opened, Source, SourceError, SourceEvent, SourceKind,
+    seconds_since_unix_millis,
 };
 use pgwire_replication::{Lsn, ReplicationClient, ReplicationEvent};
 use tokio_postgres::SimpleQueryMessage;
@@ -77,6 +78,7 @@ pub struct PostgresSource {
     /// Where `stream` starts: the slot's consistent point after a fresh
     /// open, the resume checkpoint otherwise.
     start: Option<Lsn>,
+    lag: Option<LagReporter>,
 }
 
 impl std::fmt::Debug for PostgresSource {
@@ -123,6 +125,7 @@ impl PostgresSource {
             types: TypeRegistry::new(),
             pending: None,
             start: None,
+            lag: None,
         }
     }
 
@@ -703,6 +706,12 @@ impl Source for PostgresSource {
             acks_open: true,
             emitted: start,
             in_tx: false,
+            lag: StreamLag {
+                reporter: self.lag.clone(),
+                server_end: start,
+                confirmed: start,
+                seconds: None,
+            },
         };
         state.apply_ack()?;
         let mut decoder = Decoder::new(self.keys.clone());
@@ -725,8 +734,14 @@ impl Source for PostgresSource {
                 return Err(SourceError::Transient("replication stream ended".into()));
             };
             match event {
-                ReplicationEvent::Begin { .. } => state.in_tx = true,
-                ReplicationEvent::XLogData { data, .. } => {
+                ReplicationEvent::Begin {
+                    commit_time_micros, ..
+                } => {
+                    state.in_tx = true;
+                    state.lag.seconds = Some(seconds_since_pg_micros(commit_time_micros));
+                }
+                ReplicationEvent::XLogData { data, wal_end, .. } => {
+                    state.lag.saw(wal_end);
                     let out = loop {
                         match decoder.decode(&data, &self.types)? {
                             Decoded::Events(out) => break out,
@@ -759,13 +774,26 @@ impl Source for PostgresSource {
                         }
                     }
                 }
-                ReplicationEvent::Commit { end_lsn, .. } => {
+                ReplicationEvent::Commit {
+                    end_lsn,
+                    commit_time_micros,
+                    ..
+                } => {
                     state.in_tx = false;
+                    state.lag.saw(end_lsn);
+                    state.lag.seconds = Some(seconds_since_pg_micros(commit_time_micros));
                     if !state.checkpoint(&events, end_lsn, &cancel).await? {
                         return Ok(());
                     }
+                    state.lag.publish();
                 }
                 ReplicationEvent::KeepAlive { wal_end, .. } => {
+                    state.lag.saw(wal_end);
+                    // Outside a transaction with everything up to the
+                    // server's position decoded: caught up.
+                    if !state.in_tx && wal_end <= state.emitted {
+                        state.lag.seconds = Some(0.0);
+                    }
                     // Outside a transaction, everything before the server's
                     // position has been decoded and sent: restarting there
                     // loses nothing, and lets the slot release WAL written
@@ -776,6 +804,10 @@ impl Source for PostgresSource {
                     {
                         return Ok(());
                     }
+                    if !state.in_tx && wal_end <= state.emitted {
+                        state.lag.seconds = Some(0.0);
+                    }
+                    state.lag.publish();
                 }
                 ReplicationEvent::Message { .. } => {}
                 ReplicationEvent::StoppedAt { .. } => {
@@ -859,6 +891,10 @@ impl Source for PostgresSource {
         tracing::info!(slot = %slot_name, %publication, "dropped replication slot and publication");
         Ok(())
     }
+
+    fn report_lag(&mut self, reporter: LagReporter) {
+        self.lag = Some(reporter);
+    }
 }
 
 struct StreamState {
@@ -869,6 +905,50 @@ struct StreamState {
     /// past it.
     emitted: Lsn,
     in_tx: bool,
+    lag: StreamLag,
+}
+
+/// Microseconds between the Unix epoch and the Postgres epoch (2000-01-01).
+const PG_EPOCH_UNIX_MICROS: i64 = 946_684_800_000_000;
+
+/// Seconds since a Postgres timestamp (microseconds since 2000-01-01).
+fn seconds_since_pg_micros(micros: i64) -> f64 {
+    seconds_since_unix_millis(micros.saturating_add(PG_EPOCH_UNIX_MICROS) / 1000)
+}
+
+/// What the stream knows of its lag, published on commits and keep-alives
+/// (no extra query).
+struct StreamLag {
+    reporter: Option<LagReporter>,
+    /// The highest server WAL position seen (keep-alives, data, commits).
+    server_end: Lsn,
+    /// The position confirmed to the slot (the latest durable checkpoint).
+    confirmed: Lsn,
+    /// Age of the last commit seen, `0` once caught up.
+    seconds: Option<f64>,
+}
+
+impl StreamLag {
+    fn saw(&mut self, lsn: Lsn) {
+        if lsn > self.server_end {
+            self.server_end = lsn;
+        }
+    }
+
+    /// Bytes of WAL the slot retains past what the engine confirmed.
+    fn bytes(&self) -> u64 {
+        self.server_end.0.saturating_sub(self.confirmed.0)
+    }
+
+    fn publish(&self) {
+        if let Some(r) = &self.reporter {
+            r.report(Lag {
+                seconds: self.seconds,
+                bytes: Some(self.bytes()),
+                records: None,
+            });
+        }
+    }
 }
 
 impl StreamState {
@@ -879,7 +959,11 @@ impl StreamState {
         let acked = self.acks.borrow_and_update().clone();
         if let Some(cp) = acked {
             let lsn = lsn::decode(&cp)?;
-            self.client.update_applied_lsn(lsn.min(self.emitted));
+            let confirmed = lsn.min(self.emitted);
+            self.client.update_applied_lsn(confirmed);
+            if confirmed > self.lag.confirmed {
+                self.lag.confirmed = confirmed;
+            }
         }
         Ok(())
     }
@@ -929,5 +1013,48 @@ impl StreamState {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod lag_tests {
+    use super::*;
+
+    #[test]
+    fn bytes_are_the_wal_past_the_confirmed_position() {
+        let (reporter, watch) = LagReporter::new();
+        let mut lag = StreamLag {
+            reporter: Some(reporter),
+            server_end: Lsn(1_000),
+            confirmed: Lsn(1_000),
+            seconds: None,
+        };
+        lag.saw(Lsn(5_000));
+        lag.saw(Lsn(0)); // mid-transaction data carries no position
+        lag.seconds = Some(0.0);
+        lag.publish();
+        assert_eq!(
+            *watch.borrow(),
+            Some(Lag {
+                seconds: Some(0.0),
+                bytes: Some(4_000),
+                records: None
+            })
+        );
+        lag.confirmed = Lsn(6_000);
+        assert_eq!(lag.bytes(), 0, "never negative");
+    }
+
+    #[test]
+    fn commit_timestamps_count_from_the_postgres_epoch() {
+        let now_unix_micros = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_micros() as i64)
+            .unwrap_or(0);
+        let ten_seconds_ago = now_unix_micros - PG_EPOCH_UNIX_MICROS - 10_000_000;
+        let s = seconds_since_pg_micros(ten_seconds_ago);
+        assert!((9.5..11.0).contains(&s), "{s}");
+        // A commit "in the future" (clock skew) is no lag.
+        assert_eq!(seconds_since_pg_micros(i64::MAX / 2), 0.0);
     }
 }

@@ -88,6 +88,7 @@ pub struct Wiring {
     pub credits: Option<Arc<CreditCache>>,
     /// `GET /metrics` answers 404 without it.
     pub metrics_token: Option<Secret>,
+    pub lag_guard: crate::config::LagGuard,
 }
 
 /// Assemble the shared state around a backend. The engine gets the
@@ -134,6 +135,7 @@ pub fn build_state(
         lab_events: wiring.lab_events,
         metrics,
         metrics_token: wiring.metrics_token,
+        lag_guard: wiring.lag_guard,
         probes: Arc::new(ProbeSlots::new(
             wiring.limits.probe_concurrency,
             wiring.limits.probe_concurrency_per_tenant,
@@ -293,6 +295,7 @@ pub async fn run() -> Result<(), String> {
             limits: config.limits.clone(),
             credits: credits.clone(),
             metrics_token: config.metrics_token.clone(),
+            lag_guard: config.lag_guard,
         },
         cancel.child_token(),
     );

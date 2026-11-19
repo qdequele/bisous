@@ -61,6 +61,7 @@ struct FakeSource {
     probe: Arc<Probe>,
     config: Value,
     collection: String,
+    lag: Option<meili_connect_core::LagReporter>,
 }
 
 #[async_trait]
@@ -95,6 +96,7 @@ impl SourceFactory for FakeSources {
                 .first()
                 .map(|s| s.collection.clone())
                 .unwrap_or_default(),
+            lag: None,
         }))
     }
 }
@@ -177,8 +179,19 @@ impl Source for FakeSource {
             // Ignores cancellation: only an abort stops it.
             std::future::pending::<()>().await;
         }
+        if let Some(lag) = &self.lag {
+            lag.report(meili_connect_core::Lag {
+                seconds: Some(1.5),
+                bytes: Some(2048),
+                records: None,
+            });
+        }
         cancel.cancelled().await;
         Ok(())
+    }
+
+    fn report_lag(&mut self, reporter: meili_connect_core::LagReporter) {
+        self.lag = Some(reporter);
     }
 
     async fn teardown(&mut self) -> Result<(), SourceError> {
@@ -303,6 +316,7 @@ fn app_tweaked(
         lab_events: true,
         credits: None,
         metrics_token: Some(METRICS.into()),
+        lag_guard: Default::default(),
         limits,
     };
     tweak(&mut wiring);
@@ -1031,6 +1045,7 @@ async fn a_loopback_destination_is_host_not_allowed_with_the_real_sinks() {
             lab_events: false,
             credits: None,
             metrics_token: Some(METRICS.into()),
+            lag_guard: Default::default(),
             limits: Limits::default(),
         },
         CancellationToken::new(),
@@ -1773,10 +1788,14 @@ async fn pause_resume_status_and_release() {
     assert_eq!(st["has_checkpoint"], true);
     assert_eq!(st["progress"]["written"], 3);
     // The metered units: a first sync is a snapshot.
-    assert_eq!(st["documents"]["snapshot"], 3);
-    assert_eq!(st["documents"]["streamed"], 0);
-    assert_eq!(st["documents"]["resync"], 0);
+    assert_eq!(st["documents"]["documents_snapshot"], 3);
+    assert_eq!(st["documents"]["documents_streamed"], 0);
+    assert_eq!(st["documents"]["documents_resync"], 0);
     assert_eq!(st["bytes"], 3 * FAKE_BYTES_PER_DOC);
+    assert_eq!(st["dead_letters"], 0);
+    // The fake source reports its lag while streaming.
+    assert_eq!(st["lag"], json!({"seconds": 1.5, "bytes": 2048}));
+    assert!(st["lag_warning"].is_null(), "the guard is off");
 
     let (_, st) = call(&a.router, "POST", &format!("/syncs/{id}/pause"), &[], None).await;
     assert_eq!(
@@ -2401,6 +2420,12 @@ async fn metrics_take_only_the_metrics_token() {
     );
     assert!(text.contains(&format!("connect_bytes_total {}", 3 * FAKE_BYTES_PER_DOC)));
     assert!(text.contains("connect_batch_seconds_count 1"), "{text}");
+    // One running sync reporting 1.5 s of lag.
+    assert!(text.contains("connect_lag_seconds_count 1"), "{text}");
+    assert!(
+        text.contains("connect_lag_seconds_bucket{le=\"5\"} 1"),
+        "{text}"
+    );
     // Never a tenant or a sync id.
     assert!(!text.contains("team-a") && !text.contains(&id));
 

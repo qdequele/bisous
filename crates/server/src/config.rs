@@ -83,6 +83,52 @@ pub struct Config {
     /// (`CREDITS_CACHE_STALE_SECS`, 300 s).
     pub credits_fresh: Duration,
     pub credits_stale: Duration,
+    /// When a sync that makes no progress is reported as stuck
+    /// (`MAX_LAG_HOLD_BYTES`, `MAX_LAG_HOLD_SECS`; off by default).
+    pub lag_guard: LagGuard,
+}
+
+/// Past these, a sync that is not making progress gets a warning in its
+/// status. Nothing is dropped automatically: freeing a customer's
+/// replication slot or offsets loses its position, an operator decision.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct LagGuard {
+    pub max_bytes: Option<u64>,
+    pub max_seconds: Option<f64>,
+}
+
+/// A sync whose last checkpoint is older than this is not making progress.
+pub const LAG_STALL_AFTER: Duration = Duration::from_secs(300);
+
+impl LagGuard {
+    /// The warning for a sync `lag` behind with no checkpoint for
+    /// `since_checkpoint`, if it deserves one.
+    pub fn warning(
+        &self,
+        lag: Option<&meili_connect_core::Lag>,
+        since_checkpoint: Option<Duration>,
+    ) -> Option<String> {
+        let lag = lag?;
+        if since_checkpoint.is_some_and(|d| d < LAG_STALL_AFTER) {
+            return None;
+        }
+        let over_bytes = matches!((lag.bytes, self.max_bytes), (Some(b), Some(max)) if b > max);
+        let over_secs = matches!((lag.seconds, self.max_seconds), (Some(s), Some(max)) if s > max);
+        if !(over_bytes || over_secs) {
+            return None;
+        }
+        let what = match (over_bytes, lag.bytes, lag.seconds) {
+            (true, Some(b), _) => format!("{b} bytes of origin log"),
+            (_, _, Some(s)) => format!("{s:.0} s"),
+            _ => "too far".to_owned(),
+        };
+        Some(format!(
+            "the sync is {what} behind its origin and has saved no checkpoint for {} min: the \
+             origin keeps its log (WAL, binlog, oplog, offsets) for it meanwhile. Nothing is \
+             dropped automatically; fix the cause, or pause or delete the sync to release it",
+            since_checkpoint.map_or(0, |d| d.as_secs() / 60)
+        ))
+    }
 }
 
 impl Config {
@@ -226,6 +272,15 @@ impl Config {
             credits_check_interval: secs(&get, "CREDITS_CHECK_INTERVAL_SECS", 15, 1, 3600)?,
             credits_fresh,
             credits_stale,
+            lag_guard: LagGuard {
+                max_bytes: get("MAX_LAG_HOLD_BYTES")
+                    .map(|_| num(&get, "MAX_LAG_HOLD_BYTES", 0, 1, u64::MAX))
+                    .transpose()?,
+                max_seconds: get("MAX_LAG_HOLD_SECS")
+                    .map(|_| num(&get, "MAX_LAG_HOLD_SECS", 0, 1, 365 * 86_400))
+                    .transpose()?
+                    .map(|s| s as f64),
+            },
             limits: Limits {
                 stop_grace: shutdown_grace,
                 max_syncs_per_tenant: num(&get, "MAX_SYNCS_PER_TENANT", 20, 1, 1_000_000)?,
@@ -514,6 +569,43 @@ mod tests {
             vec![Endpoint::new("pg.internal", 7000)]
         );
         assert_eq!(state_db_endpoints("postgres:///x?host=/var/run"), vec![]);
+    }
+
+    #[test]
+    fn the_lag_guard_warns_only_about_a_stuck_sync_past_a_threshold() {
+        let off = cfg(&[("ADMIN_API_KEY", "k")]).unwrap().lag_guard;
+        assert_eq!(off, LagGuard::default());
+        let lag = meili_connect_core::Lag {
+            seconds: Some(7200.0),
+            bytes: Some(5_000_000_000),
+            records: None,
+        };
+        let stuck = Some(Duration::from_secs(3600));
+        assert_eq!(off.warning(Some(&lag), stuck), None, "off by default");
+
+        let g = cfg(&[
+            ("ADMIN_API_KEY", "k"),
+            ("MAX_LAG_HOLD_BYTES", "1000000000"),
+            ("MAX_LAG_HOLD_SECS", "3600"),
+        ])
+        .unwrap()
+        .lag_guard;
+        let w = g.warning(Some(&lag), stuck).unwrap();
+        assert!(
+            w.contains("5000000000 bytes") && w.contains("Nothing is dropped"),
+            "{w}"
+        );
+        // Making progress: no warning, however far behind.
+        assert_eq!(g.warning(Some(&lag), Some(Duration::from_secs(10))), None);
+        // Under both thresholds, or nothing known: no warning.
+        let small = meili_connect_core::Lag {
+            seconds: Some(5.0),
+            bytes: Some(10),
+            records: None,
+        };
+        assert_eq!(g.warning(Some(&small), stuck), None);
+        assert_eq!(g.warning(None, stuck), None);
+        assert!(cfg(&[("ADMIN_API_KEY", "k"), ("MAX_LAG_HOLD_SECS", "x")]).is_err());
     }
 
     #[test]

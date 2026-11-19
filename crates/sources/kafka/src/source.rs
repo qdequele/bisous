@@ -3,13 +3,14 @@
 //! offsets committed to the broker only serve lag monitoring.
 
 use std::collections::HashMap;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use meili_connect_core::{
     AckReceiver, Capabilities, CheckReport, CheckStatus, Checkpoint, CollectionInfo, EventSender,
-    Opened, Source, SourceError, SourceEvent,
+    Lag, LagReporter, Opened, Source, SourceError, SourceEvent, seconds_since_unix_millis,
 };
 use rdkafka::Message;
 use rdkafka::Offset;
@@ -41,7 +42,12 @@ pub struct KafkaSource {
     /// Positions changed by `open` (new partitions) and not yet saved.
     pending_checkpoint: bool,
     skipped: Arc<AtomicU64>,
+    lag: Option<LagReporter>,
 }
+
+/// How often a streaming source measures its lag (one watermark request
+/// per assigned partition, off the event loop).
+const LAG_INTERVAL: Duration = Duration::from_secs(15);
 
 impl KafkaSource {
     pub fn new(sync_id: &str, config: KafkaConfig, topics: Vec<String>) -> Self {
@@ -58,6 +64,7 @@ impl KafkaSource {
             positions: None,
             pending_checkpoint: false,
             skipped: Arc::default(),
+            lag: None,
         }
     }
 
@@ -256,7 +263,22 @@ impl Source for KafkaSource {
             since_checkpoint: 0,
             skipped: self.skipped.clone(),
             leads: HashMap::new(),
+            lag_positions: None,
+            last_record_ms: Arc::new(AtomicI64::new(0)),
         };
+        // Lag, measured off the loop: its watermark requests block.
+        let _lag_task = self.lag.clone().map(|reporter| {
+            let positions = Arc::new(Mutex::new(run.positions.clone()));
+            run.lag_positions = Some(Arc::clone(&positions));
+            LagTask(tokio::spawn(measure_lag(
+                consumer.clone(),
+                self.config.clone(),
+                positions,
+                Arc::clone(&run.last_record_ms),
+                reporter,
+                cancel.child_token(),
+            )))
+        });
         let tpl = run.assignment(None)?;
         consumer
             .assign(&tpl)
@@ -322,6 +344,10 @@ impl Source for KafkaSource {
         self.pending_checkpoint = run.dirty;
         consumer.unassign().ok();
         result
+    }
+
+    fn report_lag(&mut self, reporter: LagReporter) {
+        self.lag = Some(reporter);
     }
 
     async fn teardown(&mut self) -> Result<(), SourceError> {
@@ -405,10 +431,83 @@ enum Step {
 
 /// One consumed record, owned, so nothing borrowed from librdkafka lives
 /// across an `await`.
+/// Aborts the lag task when the stream ends, however it ends.
+struct LagTask(tokio::task::JoinHandle<()>);
+
+impl Drop for LagTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Records not read yet over the given positions (`high − position`, at
+/// least 0 per partition).
+fn records_behind(positions: &Positions, high: impl Fn(&str, i32) -> Option<i64>) -> Option<u64> {
+    let mut total: u64 = 0;
+    for (topic, parts) in positions {
+        for (&partition, &position) in parts {
+            let high = high(topic, partition)?;
+            total = total.saturating_add(u64::try_from(high - position).unwrap_or(0));
+        }
+    }
+    Some(total)
+}
+
+/// Every [`LAG_INTERVAL`], the records behind the high watermarks and the
+/// age of the last record read (`0` once nothing is behind).
+async fn measure_lag(
+    consumer: Arc<KafkaConsumer>,
+    config: KafkaConfig,
+    positions: Arc<Mutex<Positions>>,
+    last_record_ms: Arc<AtomicI64>,
+    reporter: LagReporter,
+    cancel: CancellationToken,
+) {
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => return,
+            _ = tokio::time::sleep(LAG_INTERVAL) => {}
+        }
+        let snapshot = positions.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let (c, cfg) = (consumer.clone(), config.clone());
+        let behind = client::blocking(move || {
+            let mut highs: HashMap<(String, i32), i64> = HashMap::new();
+            for (topic, parts) in &snapshot {
+                for &partition in parts.keys() {
+                    let wm = client::watermarks(&c, &cfg, topic, partition, Phase::Streaming)?;
+                    highs.insert((topic.clone(), partition), wm.high);
+                }
+            }
+            Ok(records_behind(&snapshot, |t, p| {
+                highs.get(&(t.to_owned(), p)).copied()
+            }))
+        })
+        .await;
+        let Ok(Some(records)) = behind else {
+            continue;
+        };
+        let last = last_record_ms.load(Ordering::Relaxed);
+        let seconds = if records == 0 {
+            Some(0.0)
+        } else if last > 0 {
+            Some(seconds_since_unix_millis(last))
+        } else {
+            None
+        };
+        reporter.report(Lag {
+            seconds,
+            bytes: None,
+            records: Some(records),
+        });
+    }
+}
+
 struct Record {
     topic: String,
     partition: i32,
     offset: i64,
+    /// The record's timestamp (create or log-append time), when it has one.
+    timestamp_ms: Option<i64>,
     outcome: Result<Decoded, DecodeError>,
     /// The value starts with the Confluent Schema Registry framing.
     schema_registry: bool,
@@ -443,6 +542,10 @@ struct Run {
     since_checkpoint: u64,
     skipped: Arc<AtomicU64>,
     leads: HashMap<(String, i32), Lead>,
+    /// The positions the lag task measures from, refreshed at checkpoints.
+    lag_positions: Option<Arc<Mutex<Positions>>>,
+    /// Timestamp of the last record read (0: none yet).
+    last_record_ms: Arc<AtomicI64>,
 }
 
 impl Run {
@@ -452,6 +555,7 @@ impl Run {
             topic: topic.to_owned(),
             partition: m.partition(),
             offset: m.offset(),
+            timestamp_ms: m.timestamp().to_millis(),
             outcome: self.decoder.decode(topic, m.key(), m.payload()),
             schema_registry: is_schema_registry_framed(m.payload()),
         }
@@ -497,6 +601,9 @@ impl Run {
         events: &EventSender,
         cancel: &CancellationToken,
     ) -> Result<bool, SourceError> {
+        if let Some(ts) = record.timestamp_ms {
+            self.last_record_ms.store(ts, Ordering::Relaxed);
+        }
         let lead_key = (record.topic.clone(), record.partition);
         let lead = self.leads.entry(lead_key.clone()).or_default();
         let proven = lead.proven;
@@ -581,6 +688,9 @@ impl Run {
         let cp = checkpoint::encode(&self.positions)?;
         if !send(events, SourceEvent::Checkpoint(cp), cancel).await {
             return Ok(false);
+        }
+        if let Some(shared) = &self.lag_positions {
+            *shared.lock().unwrap_or_else(|p| p.into_inner()) = self.positions.clone();
         }
         self.dirty = false;
         self.since_checkpoint = 0;
@@ -738,8 +848,27 @@ mod tests {
             since_checkpoint: 0,
             skipped: Arc::default(),
             leads: HashMap::new(),
+            lag_positions: None,
+            last_record_ms: Arc::new(AtomicI64::new(0)),
             config,
         }
+    }
+
+    #[test]
+    fn records_behind_sum_the_partitions_and_never_go_negative() {
+        let positions = Positions::from([
+            ("a".to_owned(), [(0, 10), (1, 5)].into()),
+            ("b".to_owned(), [(0, 7)].into()),
+        ]);
+        let highs = |t: &str, p: i32| match (t, p) {
+            ("a", 0) => Some(15),
+            ("a", 1) => Some(5),
+            // Behind the position (a watermark cached before our read).
+            ("b", 0) => Some(3),
+            _ => None,
+        };
+        assert_eq!(records_behind(&positions, highs), Some(5));
+        assert_eq!(records_behind(&positions, |_, _| None), None);
     }
 
     fn rec(run: &Run, partition: i32, offset: i64, value: &[u8]) -> Record {
@@ -747,6 +876,7 @@ mod tests {
             topic: "t".into(),
             partition,
             offset,
+            timestamp_ms: None,
             outcome: run.decoder.decode("t", Some(b"1"), Some(value)),
             schema_registry: is_schema_registry_framed(Some(value)),
         }

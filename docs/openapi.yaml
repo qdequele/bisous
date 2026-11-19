@@ -485,6 +485,30 @@ components:
             holds `DEAD_LETTERS_MAX_PER_SYNC` of them already (they are
             counted in `progress.rejected`). Clear the dead letters to keep
             new ones.
+        documents:
+          type: object
+          description: The metered document units since the sync was created (`docs/LAB_INTEGRATION.md`, "Pricing"). Only documents Meilisearch accepted.
+          properties:
+            documents_streamed: { type: integer, description: "Writes and deletes applied from the change stream." }
+            documents_snapshot: { type: integer, description: "Written by a first sync or a resync the user asked for." }
+            documents_resync: { type: integer, description: "Rewritten by a resync the engine started (position lost); free." }
+        bytes: { type: integer, description: "Uncompressed payload bytes sent to Meilisearch for accepted documents." }
+        sync_seconds: { type: integer, description: "Seconds spent snapshotting or streaming." }
+        lag:
+          type: [object, "null"]
+          description: How far behind its origin the sync is, while streaming and when the source can tell; `null` otherwise.
+          properties:
+            seconds: { type: [number, "null"], description: "Age of the newest change seen, 0 once caught up (Postgres, MongoDB, Kafka, DynamoDB)." }
+            bytes: { type: [integer, "null"], description: "WAL the replication slot retains past the confirmed position (Postgres)." }
+            records: { type: integer, description: "Records not read yet (Kafka only; absent otherwise)." }
+        lag_warning:
+          type: [string, "null"]
+          description: |
+            Set when the sync is past `MAX_LAG_HOLD_BYTES` or
+            `MAX_LAG_HOLD_SECS` and has saved no checkpoint for 5 minutes.
+            Nothing is dropped automatically: releasing the origin's log
+            (slot, offsets) is an operator decision.
+        dead_letters: { type: integer, description: "Dead letters waiting (GET /syncs/{id}/dead-letters)." }
 
     SourceSpec:
       type: object

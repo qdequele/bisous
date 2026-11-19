@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use chrono::Utc;
 use meili_connect_core::{
-    Checkpoint, Progress, ResyncReason, SinkError, StoreError, SyncPhase, SyncSpec, SyncState,
+    Checkpoint, Lag, Progress, ResyncReason, SinkError, StoreError, SyncPhase, SyncSpec, SyncState,
     Usage,
 };
 use thiserror::Error;
@@ -90,6 +90,11 @@ pub struct SyncStatus {
     /// Failures since the last healthy run.
     pub consecutive_failures: u32,
     pub last_error: Option<String>,
+    /// How far behind its origin the sync is, when its source can tell
+    /// (only while streaming).
+    pub lag: Option<Lag>,
+    /// Since the last saved checkpoint (or the start of supervision).
+    pub since_checkpoint: Option<Duration>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -104,6 +109,7 @@ struct Entry {
     cancel: CancellationToken,
     handle: Option<JoinHandle<()>>,
     info: Arc<Mutex<RunInfo>>,
+    monitor: RunMonitor,
 }
 
 /// One-shot requests for the next run.
@@ -255,10 +261,10 @@ impl Supervisor {
     }
 
     pub async fn status(&self, sync_id: &str) -> Result<Option<SyncStatus>, SupervisorError> {
-        let info = {
+        let (info, monitor) = {
             let syncs = lock(&self.syncs);
             match syncs.get(sync_id) {
-                Some(entry) => lock(&entry.info).clone(),
+                Some(entry) => (lock(&entry.info).clone(), entry.monitor.clone()),
                 None => return Ok(None),
             }
         };
@@ -272,6 +278,8 @@ impl Supervisor {
             checkpoint: state.and_then(|s| s.checkpoint),
             consecutive_failures: info.consecutive_failures,
             last_error: info.last_error,
+            lag: if info.running { monitor.lag() } else { None },
+            since_checkpoint: monitor.since_last_checkpoint(),
         }))
     }
 
@@ -305,6 +313,11 @@ impl Supervisor {
             running: true,
             ..RunInfo::default()
         }));
+        // Shared by every attempt, so the resync budget spans them.
+        let monitor = RunMonitor::new(
+            self.config.max_consecutive_resyncs,
+            self.config.healthy_after,
+        );
         let handle = tokio::spawn(supervise(
             spec.clone(),
             self.deps.clone(),
@@ -312,6 +325,7 @@ impl Supervisor {
             launch,
             cancel.clone(),
             Arc::clone(&info),
+            monitor.clone(),
         ));
         syncs.insert(
             spec.id.clone(),
@@ -320,6 +334,7 @@ impl Supervisor {
                 cancel,
                 handle: Some(handle),
                 info,
+                monitor,
             },
         );
         Ok(())
@@ -413,6 +428,7 @@ async fn supervise(
     launch: Launch,
     cancel: CancellationToken,
     info: Arc<Mutex<RunInfo>>,
+    monitor: RunMonitor,
 ) {
     let sync_id = spec.id.clone();
     let mut options = config.sync.clone();
@@ -421,8 +437,6 @@ async fn supervise(
     options.resync_reason = ResyncReason::User;
     options.release_hold = launch.release_hold;
     let mut failures: u32 = 0;
-    // Shared by every attempt, so the resync budget spans them.
-    let monitor = RunMonitor::new(config.max_consecutive_resyncs, config.healthy_after);
     let mut stuck = StuckSink::default();
     info!(%sync_id, "sync supervised");
 

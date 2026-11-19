@@ -762,7 +762,19 @@ impl SyncManager {
 
     /// The lag in seconds of every running sync whose source can tell.
     pub async fn lag_seconds(&self) -> Vec<f64> {
-        Vec::new()
+        let all: Vec<(String, Arc<Supervisor>)> = lock(&self.supervisors)
+            .iter()
+            .map(|(id, s)| (id.clone(), Arc::clone(s)))
+            .collect();
+        let mut out = Vec::with_capacity(all.len());
+        for (id, sup) in all {
+            if let Ok(Some(st)) = sup.status(&id).await
+                && let Some(seconds) = st.lag.and_then(|l| l.seconds)
+            {
+                out.push(seconds);
+            }
+        }
+        out
     }
 
     pub fn running_ids(&self) -> Vec<String> {
