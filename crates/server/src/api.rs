@@ -13,7 +13,7 @@ use chrono::{DateTime, Days, NaiveDate, Utc};
 use meili_connect_core::{
     MeiliDestination, Source, SourceSpec, StreamMapping, SyncPhase, SyncSpec,
 };
-use meili_connect_store::{DeadLetterPage, StoredSync};
+use meili_connect_store::{DeadLetterPage, StoredSync, SyncRow};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -249,7 +249,31 @@ pub fn view(stored: &StoredSync) -> ApiResult<SyncView> {
     })
 }
 
-async fn owned(state: &AppState, scope: &Scope, id: &str) -> ApiResult<StoredSync> {
+/// What the API shows of a row: the redacted spec, or, for a row whose spec
+/// cannot be read, its id, name and kind flagged `unreadable`.
+fn row_view(row: &SyncRow) -> ApiResult<Value> {
+    match row {
+        SyncRow::Readable(stored) => serde_json::to_value(view(stored)?)
+            .map_err(|_| ApiError::internal("cannot serialize the sync")),
+        SyncRow::Unreadable(u) => Ok(json!({
+            "id": u.id,
+            "tenant": u.tenant,
+            "name": u.name,
+            "source": { "kind": u.kind },
+            "unreadable": true,
+            "error": UNREADABLE,
+            "created_at": u.created_at,
+            "updated_at": u.updated_at,
+        })),
+    }
+}
+
+/// Fixed text for an unreadable row: the cause is in the server log.
+pub const UNREADABLE: &str = "the stored spec of this sync cannot be read (another \
+     CONNECT_SECRET_KEY, or a damaged row); it can only be deleted, with ?force=true";
+
+/// The sync exists in the caller's scope (readable or not).
+async fn owned(state: &AppState, scope: &Scope, id: &str) -> ApiResult<SyncRow> {
     state
         .repo()
         .get_sync(scope.tenant(), id)
@@ -281,7 +305,7 @@ pub async fn create_sync(
 
 pub async fn list_syncs(State(state): State<AppState>, scope: Scope) -> ApiResult<Json<Value>> {
     let syncs = state.repo().list_syncs(scope.tenant()).await?;
-    let views = syncs.iter().map(view).collect::<ApiResult<Vec<_>>>()?;
+    let views = syncs.iter().map(row_view).collect::<ApiResult<Vec<_>>>()?;
     Ok(Json(json!({ "syncs": views })))
 }
 
@@ -289,8 +313,8 @@ pub async fn get_sync(
     State(state): State<AppState>,
     scope: Scope,
     Path(id): Path<String>,
-) -> ApiResult<Json<SyncView>> {
-    Ok(Json(view(&owned(&state, &scope, &id).await?)?))
+) -> ApiResult<Json<Value>> {
+    Ok(Json(row_view(&owned(&state, &scope, &id).await?)?))
 }
 
 pub async fn update_sync(

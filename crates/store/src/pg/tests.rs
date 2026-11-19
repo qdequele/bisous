@@ -104,10 +104,15 @@ async fn specs_are_sealed_at_rest() {
         key: SecretKey::generate(),
         limits: DeadLetterLimits::default(),
     };
-    assert!(matches!(
-        other.get_sync(Some("t"), "s1").await,
-        Err(RepoError::Fatal(_))
-    ));
+    let row = other.get_sync(Some("t"), "s1").await.unwrap().unwrap();
+    assert!(
+        matches!(&row, SyncRow::Unreadable(u) if u.name == "a"),
+        "{row:?}"
+    );
+    // One unreadable row does not hide the others.
+    let listed = other.list_syncs(Some("t")).await.unwrap();
+    assert!(listed.iter().all(|r| matches!(r, SyncRow::Unreadable(_))));
+    assert!(!listed.is_empty());
 
     // A blob moved onto another tenant's row is refused, and boot reports
     // the bad row without failing the others.
@@ -118,7 +123,7 @@ async fn specs_are_sealed_at_rest() {
         .unwrap();
     assert!(matches!(
         store.get_sync(Some("u"), "s2").await,
-        Err(RepoError::Fatal(_))
+        Ok(Some(SyncRow::Unreadable(_)))
     ));
     let boot = store.list_all_for_boot().await.unwrap();
     assert_eq!(boot.len(), 2);
@@ -169,6 +174,8 @@ async fn tenant_isolation_on_every_method() {
             .await
             .unwrap()
             .unwrap()
+            .readable()
+            .unwrap()
             .spec,
         a
     );
@@ -177,7 +184,7 @@ async fn tenant_isolation_on_every_method() {
     assert!(store.get_sync(Some("ta"), "g1").await.unwrap().is_none());
 
     // list
-    let ids = |v: Vec<StoredSync>| v.into_iter().map(|s| s.spec.id).collect::<Vec<_>>();
+    let ids = |v: Vec<SyncRow>| v.iter().map(|s| s.id().to_owned()).collect::<Vec<_>>();
     assert_eq!(ids(store.list_syncs(Some("ta")).await.unwrap()), ["a1"]);
     assert_eq!(ids(store.list_syncs(Some("tb")).await.unwrap()), ["b1"]);
     assert_eq!(ids(store.list_syncs(None).await.unwrap()), ["g1"]);
@@ -201,6 +208,8 @@ async fn tenant_isolation_on_every_method() {
             .get_sync(Some("ta"), "a1")
             .await
             .unwrap()
+            .unwrap()
+            .readable()
             .unwrap()
             .spec,
         renamed
@@ -802,7 +811,14 @@ async fn invalid_specs_are_refused() {
         ));
     }
     assert_eq!(
-        store.get_sync(Some("t"), "s").await.unwrap().unwrap().spec,
+        store
+            .get_sync(Some("t"), "s")
+            .await
+            .unwrap()
+            .unwrap()
+            .readable()
+            .unwrap()
+            .spec,
         spec("s", Some("t"), "n")
     );
 }

@@ -18,8 +18,8 @@ use uuid::Uuid;
 use crate::error::from_sqlx;
 use crate::{
     BootSync, DailyProgress, DeadLetterLimits, DeadLetterPage, LabOutbox, OutboxEvent, OutboxLease,
-    RepoError, RetryBackoff, SecretKey, StoredDeadLetter, StoredSync, SyncRepository, bound_letter,
-    to_i64, to_u64, validate_spec,
+    RepoError, RetryBackoff, SecretKey, StoredDeadLetter, StoredSync, SyncRepository, SyncRow,
+    UnreadableSync, bound_letter, to_i64, to_u64, validate_spec,
 };
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
@@ -100,15 +100,30 @@ impl PgStore {
         &self.pool
     }
 
-    fn row_to_sync(&self, row: &PgRow) -> Result<StoredSync, RepoError> {
+    fn row_to_sync(&self, row: &PgRow) -> Result<SyncRow, RepoError> {
         let id: String = row.try_get("id").map_err(from_sqlx)?;
         let tenant: Option<String> = row.try_get("tenant_id").map_err(from_sqlx)?;
         let sealed: Vec<u8> = row.try_get("spec_sealed").map_err(from_sqlx)?;
-        let spec = self.unseal(&id, tenant.as_deref(), &sealed)?;
-        Ok(StoredSync {
-            spec,
-            created_at: row.try_get("created_at").map_err(from_sqlx)?,
-            updated_at: row.try_get("updated_at").map_err(from_sqlx)?,
+        let created_at = row.try_get("created_at").map_err(from_sqlx)?;
+        let updated_at = row.try_get("updated_at").map_err(from_sqlx)?;
+        Ok(match self.unseal(&id, tenant.as_deref(), &sealed) {
+            Ok(spec) => SyncRow::Readable(StoredSync {
+                spec,
+                created_at,
+                updated_at,
+            }),
+            Err(e) => {
+                tracing::warn!(sync_id = %id, error = %e, "a stored sync cannot be read");
+                SyncRow::Unreadable(UnreadableSync {
+                    name: row.try_get("name").map_err(from_sqlx)?,
+                    kind: row.try_get("kind").map_err(from_sqlx)?,
+                    id,
+                    tenant,
+                    error: e.to_string(),
+                    created_at,
+                    updated_at,
+                })
+            }
         })
     }
 
@@ -339,13 +354,9 @@ impl SyncRepository for PgStore {
         })
     }
 
-    async fn get_sync(
-        &self,
-        tenant: Option<&str>,
-        id: &str,
-    ) -> Result<Option<StoredSync>, RepoError> {
+    async fn get_sync(&self, tenant: Option<&str>, id: &str) -> Result<Option<SyncRow>, RepoError> {
         let row = sqlx::query(
-            "SELECT id, tenant_id, spec_sealed, created_at, updated_at FROM syncs
+            "SELECT id, tenant_id, name, kind, spec_sealed, created_at, updated_at FROM syncs
              WHERE id = $1 AND tenant_id IS NOT DISTINCT FROM $2",
         )
         .bind(id)
@@ -356,9 +367,9 @@ impl SyncRepository for PgStore {
         row.map(|r| self.row_to_sync(&r)).transpose()
     }
 
-    async fn list_syncs(&self, tenant: Option<&str>) -> Result<Vec<StoredSync>, RepoError> {
+    async fn list_syncs(&self, tenant: Option<&str>) -> Result<Vec<SyncRow>, RepoError> {
         let rows = sqlx::query(
-            "SELECT id, tenant_id, spec_sealed, created_at, updated_at FROM syncs
+            "SELECT id, tenant_id, name, kind, spec_sealed, created_at, updated_at FROM syncs
              WHERE tenant_id IS NOT DISTINCT FROM $1 ORDER BY name",
         )
         .bind(tenant)

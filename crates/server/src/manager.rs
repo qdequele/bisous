@@ -28,7 +28,7 @@ use meili_connect_engine::{
     EngineError, Supervisor, SupervisorConfig, SupervisorError, SyncDeps, SyncStatus,
     shadow_index_uid,
 };
-use meili_connect_store::StoredSync;
+use meili_connect_store::{StoredSync, SyncRow};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
@@ -145,12 +145,14 @@ impl SyncManager {
         }
     }
 
-    /// The stored row, read inside the lock.
+    /// The stored row, read inside the lock. A row whose spec cannot be
+    /// read can only be deleted (with `force`).
     async fn row(&self, tenant: Option<&str>, id: &str) -> ApiResult<StoredSync> {
-        self.backend
-            .get_sync(tenant, id)
-            .await?
-            .ok_or_else(|| ApiError::sync_not_found(id))
+        match self.backend.get_sync(tenant, id).await? {
+            Some(SyncRow::Readable(stored)) => Ok(stored),
+            Some(SyncRow::Unreadable(_)) => Err(unreadable()),
+            None => Err(ApiError::sync_not_found(id)),
+        }
     }
 
     fn supervisor(&self, sync_id: &str) -> Option<Arc<Supervisor>> {
@@ -350,10 +352,25 @@ impl SyncManager {
         Ok(stored)
     }
 
-    /// Tear the sync down on the origin and delete it with its state.
+    /// Tear the sync down on the origin and delete it with its state. A
+    /// sync whose spec cannot be read cannot be torn down: it is deleted
+    /// with `force` only.
     pub async fn delete(&self, tenant: Option<&str>, id: &str, force: bool) -> ApiResult<()> {
         let op = self.serialize(id).await;
-        let current = self.row(tenant, id).await?;
+        let current = match self.backend.get_sync(tenant, id).await? {
+            None => return Err(ApiError::sync_not_found(id)),
+            Some(SyncRow::Unreadable(_)) if !force => return Err(unreadable()),
+            Some(SyncRow::Unreadable(_)) => {
+                warn!(sync_id = %id, "deleting an unreadable sync; its origin is not cleaned up");
+                self.retire(id).await;
+                self.meter.forget(id);
+                self.backend.delete_sync(tenant, id).await?;
+                drop(op);
+                self.forget_lock(id);
+                return Ok(());
+            }
+            Some(SyncRow::Readable(current)) => current,
+        };
         match self.remove_locked(&current.spec, force).await {
             Ok(()) => {}
             Err(RemoveError::Teardown(message)) => {
@@ -553,6 +570,14 @@ impl SyncManager {
     pub fn running_ids(&self) -> Vec<String> {
         lock(&self.supervisors).keys().cloned().collect()
     }
+}
+
+fn unreadable() -> ApiError {
+    ApiError::new(
+        StatusCode::CONFLICT,
+        "sync_unreadable",
+        crate::api::UNREADABLE,
+    )
 }
 
 /// What a `PUT` changed, by the reaction it needs.

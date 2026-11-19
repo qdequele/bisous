@@ -594,7 +594,15 @@ async fn put_keeps_redacted_secrets() {
     assert_no_secret(&updated);
     assert_eq!(updated["name"], "renamed");
 
-    let stored = a.store.get_sync(None, &id).await.unwrap().unwrap().spec;
+    let stored = a
+        .store
+        .get_sync(None, &id)
+        .await
+        .unwrap()
+        .unwrap()
+        .readable()
+        .unwrap()
+        .spec;
     assert_eq!(
         stored.destination.api_key.expose(),
         format!("meili-{SECRET_MARK}")
@@ -614,7 +622,15 @@ async fn put_keeps_redacted_secrets() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    let stored = a.store.get_sync(None, &id).await.unwrap().unwrap().spec;
+    let stored = a
+        .store
+        .get_sync(None, &id)
+        .await
+        .unwrap()
+        .unwrap()
+        .readable()
+        .unwrap()
+        .spec;
     assert_eq!(stored.source.config["password"], "new-pass");
 
     // A placeholder with nothing stored behind it is refused.
@@ -670,7 +686,15 @@ async fn put_keeps_redacted_secrets() {
     .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
     assert_eq!(body["code"], "secret_required");
-    let stored = a.store.get_sync(None, &id).await.unwrap().unwrap().spec;
+    let stored = a
+        .store
+        .get_sync(None, &id)
+        .await
+        .unwrap()
+        .unwrap()
+        .readable()
+        .unwrap()
+        .spec;
     assert_eq!(
         stored.destination.url, "http://meili:7700",
         "nothing changed"
@@ -679,7 +703,15 @@ async fn put_keeps_redacted_secrets() {
     moved["destination"]["api_key"] = json!("other-key");
     let (status, _) = call(&a.router, "PUT", &format!("/syncs/{id}"), &[], Some(moved)).await;
     assert_eq!(status, StatusCode::OK);
-    let stored = a.store.get_sync(None, &id).await.unwrap().unwrap().spec;
+    let stored = a
+        .store
+        .get_sync(None, &id)
+        .await
+        .unwrap()
+        .unwrap()
+        .readable()
+        .unwrap()
+        .spec;
     assert_eq!(stored.destination.url, "http://attacker.example:7700");
     assert_eq!(stored.destination.api_key.expose(), "other-key");
 
@@ -1272,6 +1304,61 @@ async fn dead_letters_overflow_is_reported() {
     assert_eq!(page["items"].as_array().unwrap().len(), 2);
 }
 
+// ------------------------------------------------------------- unreadable rows
+
+#[tokio::test]
+async fn an_unreadable_row_never_hides_the_others() {
+    let a = app(AuthConfig::open());
+    let good = create(&a, &[], "a-good").await;
+    let bad = create(&a, &[], "b-bad").await;
+    a.store.make_unreadable(&bad);
+
+    let (status, list) = call(&a.router, "GET", "/syncs", &[], None).await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    let syncs = list["syncs"].as_array().unwrap();
+    assert_eq!(syncs.len(), 2);
+    assert_eq!(syncs[0]["id"], good.as_str());
+    assert_eq!(syncs[0]["destination"]["api_key"], "<redacted>");
+    assert_eq!(
+        (syncs[1]["id"].as_str(), syncs[1]["unreadable"].as_bool()),
+        (Some(bad.as_str()), Some(true))
+    );
+    assert_eq!(syncs[1]["name"], "b-bad");
+    assert_eq!(syncs[1]["source"]["kind"], "postgres");
+
+    let (status, one) = call(&a.router, "GET", &format!("/syncs/{bad}"), &[], None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(one["unreadable"], true);
+    // Its status still answers; changes are refused; force deletes it.
+    let (status, _) = call(&a.router, "GET", &format!("/syncs/{bad}/status"), &[], None).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) = call(
+        &a.router,
+        "POST",
+        &format!("/syncs/{bad}/resume"),
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (StatusCode::CONFLICT, Some("sync_unreadable"))
+    );
+    let (status, _) = call(&a.router, "DELETE", &format!("/syncs/{bad}"), &[], None).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let (status, _) = call(
+        &a.router,
+        "DELETE",
+        &format!("/syncs/{bad}?force=true"),
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, list) = call(&a.router, "GET", "/syncs", &[], None).await;
+    assert_eq!(list["syncs"].as_array().unwrap().len(), 1);
+}
+
 // ------------------------------------------------------------- create
 
 /// A sync that cannot start is not kept: the client gets the error and
@@ -1425,13 +1512,29 @@ async fn a_new_origin_is_torn_down_with_the_old_spec_and_synced_fresh() {
         (StatusCode::BAD_GATEWAY, Some("teardown_failed")),
         "{resp}"
     );
-    let stored = a.store.get_sync(None, &id).await.unwrap().unwrap().spec;
+    let stored = a
+        .store
+        .get_sync(None, &id)
+        .await
+        .unwrap()
+        .unwrap()
+        .readable()
+        .unwrap()
+        .spec;
     assert_eq!(stored.source.config["host"], "new-db");
     assert_eq!(a.state.manager.running_ids(), vec![id.clone()]);
     streaming(&a, &id).await;
     let (status, _) = put(&a, &id, "?force=true", body).await;
     assert_eq!(status, StatusCode::OK);
-    let stored = a.store.get_sync(None, &id).await.unwrap().unwrap().spec;
+    let stored = a
+        .store
+        .get_sync(None, &id)
+        .await
+        .unwrap()
+        .unwrap()
+        .readable()
+        .unwrap()
+        .spec;
     assert_eq!(stored.source.config["host"], "third-db");
 }
 

@@ -405,7 +405,8 @@ components:
             `conflict`, `source_config`, `source_paused`, `source_unavailable`,
             `source_error`, `source_timeout`, `teardown_failed`,
             `store_unavailable`, `shutting_down`, `engine`, `internal`,
-            `sync_quota_exceeded` (409: the tenant owns
+            `sync_unreadable` (409: the stored spec cannot be read; delete it
+            with `?force=true`),             `sync_quota_exceeded` (409: the tenant owns
             `MAX_SYNCS_PER_TENANT` syncs), `too_many_probes` (429: too many
             checks or discoveries running; retry), `request_timeout` (503:
             the request took longer than `REQUEST_TIMEOUT_SECS`; a change to
@@ -505,6 +506,14 @@ components:
             tenant: { type: [string, "null"] }
             created_at: { type: string, format: date-time }
             updated_at: { type: string, format: date-time }
+            unreadable:
+              type: boolean
+              description: |
+                Present and `true` when the stored spec cannot be read
+                (another `CONNECT_SECRET_KEY`, a damaged row): only `id`,
+                `tenant`, `name`, `source.kind` and `error` are given. Such a
+                sync answers `409 sync_unreadable` to every change and can
+                only be deleted with `?force=true`.
 
     CheckItem:
       type: object

@@ -39,6 +39,47 @@ pub struct StoredSync {
     pub updated_at: DateTime<Utc>,
 }
 
+/// A stored sync whose spec cannot be read (unsealed with another key,
+/// tampered, copied onto another row). Listed so one bad row does not hide
+/// the others; it can only be deleted.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnreadableSync {
+    pub id: String,
+    pub tenant: Option<String>,
+    pub name: String,
+    /// The source kind as stored next to the sealed spec.
+    pub kind: String,
+    /// Why it cannot be read (for the operator's log, not for tenants).
+    pub error: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// One row of [`SyncRepository::list_syncs`] and
+/// [`SyncRepository::get_sync`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum SyncRow {
+    Readable(StoredSync),
+    Unreadable(UnreadableSync),
+}
+
+impl SyncRow {
+    pub fn id(&self) -> &str {
+        match self {
+            SyncRow::Readable(s) => &s.spec.id,
+            SyncRow::Unreadable(u) => &u.id,
+        }
+    }
+
+    /// The stored sync, when its spec can be read.
+    pub fn readable(self) -> Option<StoredSync> {
+        match self {
+            SyncRow::Readable(s) => Some(s),
+            SyncRow::Unreadable(_) => None,
+        }
+    }
+}
+
 /// One row of [`SyncRepository::list_all_for_boot`]. A row that cannot be
 /// unsealed (wrong key, tampered) is reported with its error instead of
 /// failing the whole boot.
@@ -191,15 +232,13 @@ pub trait SyncRepository: Send + Sync {
         spec: &SyncSpec,
     ) -> Result<StoredSync, RepoError>;
 
-    /// `None` when missing or owned by another scope.
-    async fn get_sync(
-        &self,
-        tenant: Option<&str>,
-        id: &str,
-    ) -> Result<Option<StoredSync>, RepoError>;
+    /// `None` when missing or owned by another scope. A row whose spec
+    /// cannot be read is [`SyncRow::Unreadable`], not an error.
+    async fn get_sync(&self, tenant: Option<&str>, id: &str) -> Result<Option<SyncRow>, RepoError>;
 
-    /// The scope's syncs, ordered by name.
-    async fn list_syncs(&self, tenant: Option<&str>) -> Result<Vec<StoredSync>, RepoError>;
+    /// The scope's syncs, ordered by name. A row whose spec cannot be read
+    /// is listed as [`SyncRow::Unreadable`] and never hides the others.
+    async fn list_syncs(&self, tenant: Option<&str>) -> Result<Vec<SyncRow>, RepoError>;
 
     /// Replace the spec of an existing sync (matched by `spec.id`).
     /// `spec.tenant` must equal `tenant`: a sync never changes owner.

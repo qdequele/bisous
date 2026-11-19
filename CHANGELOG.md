@@ -65,6 +65,10 @@ All notable changes to meili-connect are listed here. The format follows
   A paused sync stays paused.
 - A `DELETE` whose teardown fails now persists the sync as `paused` with
   the reason, so it stays stopped across restarts as the answer says.
+- A stored sync whose spec cannot be unsealed no longer fails `GET /syncs` for
+  the whole scope: it is listed (and returned by `GET /syncs/{id}`) flagged
+  `unreadable`, refuses changes with `409 sync_unreadable`, and can be
+  deleted with `?force=true`.
 - `POST /syncs` is all or nothing: a sync that cannot be started is removed
   again and the error returned, instead of being kept and started
   unannounced at the next boot.

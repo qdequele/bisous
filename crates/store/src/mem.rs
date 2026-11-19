@@ -18,8 +18,8 @@ use uuid::Uuid;
 
 use crate::{
     BootSync, DailyProgress, DeadLetterLimits, DeadLetterPage, LabOutbox, OutboxEvent, OutboxLease,
-    RepoError, RetryBackoff, StoredDeadLetter, StoredSync, SyncRepository, bound_letter,
-    validate_spec,
+    RepoError, RetryBackoff, StoredDeadLetter, StoredSync, SyncRepository, SyncRow, UnreadableSync,
+    bound_letter, validate_spec,
 };
 
 #[derive(Default)]
@@ -31,6 +31,9 @@ struct Inner {
     /// written, deleted, rejected, dead letters dropped.
     progress: BTreeMap<(String, NaiveDate), [u64; 4]>,
     outbox: Vec<OutboxRow>,
+    /// Test hook: rows reported as unreadable, like a Postgres row sealed
+    /// with another key.
+    unreadable: std::collections::HashSet<String>,
 }
 
 struct OutboxRow {
@@ -47,6 +50,22 @@ impl Inner {
         match self.syncs.get(id) {
             Some(s) if s.spec.tenant.as_deref() == tenant => Ok(()),
             _ => Err(RepoError::NotFound(format!("sync {id}"))),
+        }
+    }
+
+    fn row(&self, s: &StoredSync) -> SyncRow {
+        if self.unreadable.contains(&s.spec.id) {
+            SyncRow::Unreadable(UnreadableSync {
+                id: s.spec.id.clone(),
+                tenant: s.spec.tenant.clone(),
+                name: s.spec.name.clone(),
+                kind: s.spec.source.kind.as_str().to_owned(),
+                error: "the spec cannot be unsealed".into(),
+                created_at: s.created_at,
+                updated_at: s.updated_at,
+            })
+        } else {
+            SyncRow::Readable(s.clone())
         }
     }
 
@@ -76,6 +95,14 @@ impl MemStore {
         Self {
             permissive: true,
             ..Self::default()
+        }
+    }
+
+    /// Test helper: from now on report this sync as unreadable, as
+    /// Postgres does for a row sealed with another key.
+    pub fn make_unreadable(&self, id: &str) {
+        if let Ok(mut inner) = self.lock() {
+            inner.unreadable.insert(id.to_owned());
         }
     }
 
@@ -195,29 +222,24 @@ impl SyncRepository for MemStore {
         Ok(stored)
     }
 
-    async fn get_sync(
-        &self,
-        tenant: Option<&str>,
-        id: &str,
-    ) -> Result<Option<StoredSync>, RepoError> {
+    async fn get_sync(&self, tenant: Option<&str>, id: &str) -> Result<Option<SyncRow>, RepoError> {
         let inner = self.lock()?;
         Ok(inner
             .syncs
             .get(id)
             .filter(|s| s.spec.tenant.as_deref() == tenant)
-            .cloned())
+            .map(|s| inner.row(s)))
     }
 
-    async fn list_syncs(&self, tenant: Option<&str>) -> Result<Vec<StoredSync>, RepoError> {
+    async fn list_syncs(&self, tenant: Option<&str>) -> Result<Vec<SyncRow>, RepoError> {
         let inner = self.lock()?;
-        let mut out: Vec<StoredSync> = inner
+        let mut out: Vec<&StoredSync> = inner
             .syncs
             .values()
             .filter(|s| s.spec.tenant.as_deref() == tenant)
-            .cloned()
             .collect();
         out.sort_by(|a, b| a.spec.name.cmp(&b.spec.name));
-        Ok(out)
+        Ok(out.into_iter().map(|s| inner.row(s)).collect())
     }
 
     async fn update_sync(
@@ -261,7 +283,10 @@ impl SyncRepository for MemStore {
             .map(|s| BootSync {
                 id: s.spec.id.clone(),
                 tenant: s.spec.tenant.clone(),
-                spec: Ok(s.spec.clone()),
+                spec: match inner.row(s) {
+                    SyncRow::Readable(r) => Ok(r.spec),
+                    SyncRow::Unreadable(u) => Err(RepoError::Fatal(u.error)),
+                },
             })
             .collect();
         out.sort_by(|a, b| a.id.cmp(&b.id));
@@ -614,10 +639,12 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap()
+                .readable()
+                .unwrap()
                 .spec,
             a
         );
-        let ids = |v: Vec<StoredSync>| v.into_iter().map(|s| s.spec.id).collect::<Vec<_>>();
+        let ids = |v: Vec<SyncRow>| v.iter().map(|s| s.id().to_owned()).collect::<Vec<_>>();
         assert_eq!(ids(store.list_syncs(Some("ta")).await.unwrap()), ["a1"]);
         assert_eq!(ids(store.list_syncs(None).await.unwrap()), ["g1"]);
 
