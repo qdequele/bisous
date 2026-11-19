@@ -323,10 +323,12 @@ pub(crate) fn map_task_error(context: &str, error: &MeiliError) -> SinkError {
 pub(crate) enum DocFailure {
     /// One or more documents in the payload are at fault: bisect.
     PerDocument(String),
-    /// The embedder failed. Bisected like a per-document error, but turned
-    /// into a transient error when no document of the run got through
-    /// (embedder outage rather than a bad document).
-    Embedding(String),
+    /// Could be one document or an outage: `vector_embedding_error` (bad
+    /// document or embedder down) and `internal` (Meilisearch reports some
+    /// malformed fields, e.g. a non-object `_vectors`, as internal errors).
+    /// Bisected like a per-document error, but turned into a transient error
+    /// when no document of the run got through.
+    Suspect(String),
     /// Not the documents' fault.
     Global(SinkError),
 }
@@ -334,13 +336,14 @@ pub(crate) enum DocFailure {
 pub(crate) fn classify_doc_failure(error: &MeiliError) -> DocFailure {
     let msg = || format!("document task failed: {error}");
     match error.kind.as_str() {
-        "internal" | "system" => DocFailure::Global(SinkError::Transient(msg())),
+        "system" => DocFailure::Global(SinkError::Transient(msg())),
+        "internal" => DocFailure::Suspect(error.message.clone()),
         "auth" => DocFailure::Global(SinkError::Config(msg())),
         "invalid_request" => {
             if is_config_code(&error.code) {
                 DocFailure::Global(SinkError::Config(msg()))
             } else if error.code == "vector_embedding_error" {
-                DocFailure::Embedding(error.message.clone())
+                DocFailure::Suspect(error.message.clone())
             } else if matches!(
                 error.code.as_str(),
                 "index_not_found"

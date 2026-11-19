@@ -252,7 +252,7 @@ fn classification() {
     ));
     assert!(matches!(
         classify_doc_failure(&e("vector_embedding_error", "invalid_request")),
-        DocFailure::Embedding(_)
+        DocFailure::Suspect(_)
     ));
     assert!(matches!(
         classify_doc_failure(&e(
@@ -263,7 +263,7 @@ fn classification() {
     ));
     assert!(matches!(
         classify_doc_failure(&e("internal", "internal")),
-        DocFailure::Global(SinkError::Transient(_))
+        DocFailure::Suspect(_)
     ));
     assert!(matches!(
         classify_doc_failure(&e("no_space_left_on_device", "system")),

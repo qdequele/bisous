@@ -156,7 +156,7 @@ enum WriteOutcome {
     /// Meilisearch refused the payload in a way bisection can narrow down.
     Refused {
         reason: String,
-        embedding: bool,
+        suspect: bool,
     },
 }
 
@@ -178,7 +178,7 @@ impl Chunk {
     }
 }
 
-/// Rejections and successes of one run, before the embedding check.
+/// Rejections and successes of one run, before the suspect check.
 #[derive(Default)]
 struct RunTally {
     ok: u64,
@@ -243,7 +243,7 @@ impl MeiliSink {
 
         if tally.ok == 0
             && !tally.rejected.is_empty()
-            && tally.rejected.iter().all(|(_, _, embedding)| *embedding)
+            && tally.rejected.iter().all(|(_, _, suspect)| *suspect)
         {
             let reason = tally
                 .rejected
@@ -251,7 +251,7 @@ impl MeiliSink {
                 .map(|(_, r, _)| r.clone())
                 .unwrap_or_default();
             return Err(SinkError::Transient(format!(
-                "embedder failed for every document of the batch: {reason}"
+                "every document of the batch failed with a possibly transient error: {reason}"
             )));
         }
         match kind {
@@ -289,9 +289,9 @@ impl MeiliSink {
         while let Some((a, b)) = stack.pop() {
             match self.write_once(target, kind, &chunk.lines[a..b]).await? {
                 WriteOutcome::Written => tally.ok += (b - a) as u64,
-                WriteOutcome::Refused { reason, embedding } => {
+                WriteOutcome::Refused { reason, suspect } => {
                     if b - a == 1 {
-                        tally.rejected.push((chunk.idx[a], reason, embedding));
+                        tally.rejected.push((chunk.idx[a], reason, suspect));
                     } else {
                         let mid = a + (b - a) / 2;
                         tracing::debug!(index = %target.uid, size = b - a, "bisecting refused payload");
@@ -366,7 +366,7 @@ impl MeiliSink {
             Err(api) if api.status == StatusCode::PAYLOAD_TOO_LARGE => {
                 return Ok(WriteOutcome::Refused {
                     reason: format!("over the instance's payload limit: {}", api.error),
-                    embedding: false,
+                    suspect: false,
                 });
             }
             Err(api) => return Err(map_api_error("writing documents", &api)),
@@ -387,11 +387,11 @@ impl MeiliSink {
                 match classify_doc_failure(&error) {
                     DocFailure::PerDocument(reason) => Ok(WriteOutcome::Refused {
                         reason,
-                        embedding: false,
+                        suspect: false,
                     }),
-                    DocFailure::Embedding(reason) => Ok(WriteOutcome::Refused {
+                    DocFailure::Suspect(reason) => Ok(WriteOutcome::Refused {
                         reason,
-                        embedding: true,
+                        suspect: true,
                     }),
                     DocFailure::Global(e) => Err(e),
                 }
