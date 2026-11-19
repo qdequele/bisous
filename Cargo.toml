@@ -1,0 +1,67 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/core",
+    "crates/sink",
+    "crates/engine",
+    "crates/store",
+    "crates/server",
+    "crates/sources/postgres",
+    "crates/sources/mysql",
+    "crates/sources/mongodb",
+    "crates/sources/kafka",
+    "crates/sources/dynamodb",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+license = "MIT"
+repository = "https://github.com/qdequele/meili-connect"
+
+[workspace.dependencies]
+meili-connect-core = { path = "crates/core", version = "0.1.0" }
+meili-connect-sink = { path = "crates/sink", version = "0.1.0" }
+meili-connect-engine = { path = "crates/engine", version = "0.1.0" }
+meili-connect-store = { path = "crates/store", version = "0.1.0" }
+meili-connect-source-postgres = { path = "crates/sources/postgres", version = "0.1.0" }
+meili-connect-source-mysql = { path = "crates/sources/mysql", version = "0.1.0" }
+meili-connect-source-mongodb = { path = "crates/sources/mongodb", version = "0.1.0" }
+meili-connect-source-kafka = { path = "crates/sources/kafka", version = "0.1.0" }
+meili-connect-source-dynamodb = { path = "crates/sources/dynamodb", version = "0.1.0" }
+
+async-trait = "0.1"
+axum = "0.8"
+base64 = "0.22"
+bytes = "1"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
+futures = "0.3"
+hex = "0.4"
+rand = "0.9"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "gzip", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+subtle = "2"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+uuid = { version = "1", features = ["v4", "v7", "serde"] }
+wiremock = "0.6"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
+dbg_macro = "deny"
+todo = "warn"
+
+[profile.release]
+lto = "thin"
+codegen-units = 4
+strip = true
