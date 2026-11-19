@@ -366,8 +366,18 @@ async fn supervise(
             &monitor,
         )
         .await;
-        options.resync = false;
-        options.release_hold = false;
+        // One-shot requests stay set until a run actually consumed them:
+        // a run that failed early retries them.
+        if monitor.take_resync_consumed() {
+            options.resync = false;
+        }
+        let released = monitor.take_release_consumed();
+        // A run that streamed healthily is past whatever was held: a
+        // release left pending must not let a later guard through.
+        let healthy = monitor.take_streamed_healthily();
+        if released || healthy {
+            options.release_hold = false;
+        }
         if cancel.is_cancelled() {
             break;
         }

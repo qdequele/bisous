@@ -372,3 +372,50 @@ async fn progress_resets_the_transient_sink_count() {
     wait_status(&s, "streaming", streaming).await;
     s.shutdown().await;
 }
+
+#[tokio::test]
+async fn a_release_survives_a_run_that_failed_before_applying_it() {
+    let h = Harness::new();
+    h.origin
+        .seed(vec![upsert(1, json!({})), upsert(2, json!({}))]);
+    let s = supervisor(&h);
+    s.start(spec()).expect("start");
+    wait_status(&s, "streaming", streaming).await;
+    wait_for("2 docs", 5, || h.sink.docs(INDEX).len() == 2).await;
+    h.origin.truncate(COLLECTION);
+    wait_status(&s, "held", |st| !st.running && st.phase == SyncPhase::Held).await;
+
+    // The released run dies before reaching the truncate.
+    h.origin
+        .state()
+        .open_faults
+        .push_back(SourceError::Transient("connection reset".into()));
+    s.release(SYNC_ID).await.expect("release");
+    wait_for("cleared", 5, || h.sink.docs(INDEX).is_empty()).await;
+    wait_status(&s, "streaming", |st| streaming(st) && st.message.is_none()).await;
+    s.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_resync_survives_a_run_that_failed_before_starting_it() {
+    let h = Harness::new();
+    h.origin
+        .seed(vec![upsert(1, json!({})), upsert(2, json!({}))]);
+    let s = supervisor(&h);
+    s.start(spec()).expect("start");
+    wait_status(&s, "streaming", streaming).await;
+    wait_for("2 docs", 5, || h.sink.docs(INDEX).len() == 2).await;
+
+    // Saving `resyncing` fails once: the first run never starts the resync.
+    h.store.inner().fail_once = Some(Box::new(|s| s.resyncing));
+    s.resync(SYNC_ID).await.expect("resync");
+    wait_for("second snapshot", 5, || h.origin.state().snapshots == 2).await;
+    wait_status(&s, "streaming", |st| streaming(st) && !st.resyncing).await;
+    assert!(
+        h.sink
+            .calls()
+            .iter()
+            .any(|c| c == "swap products products__connect_01234567")
+    );
+    s.shutdown().await;
+}
