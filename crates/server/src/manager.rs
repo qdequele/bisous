@@ -357,11 +357,18 @@ impl SyncManager {
         match self.remove_locked(&current.spec, force).await {
             Ok(()) => {}
             Err(RemoveError::Teardown(message)) => {
+                // Kept, stopped: say so durably, so a restart of the server
+                // does not start it again and the status explains why.
+                let note = format!(
+                    "deletion failed, the sync is stopped: {message}. Retry the deletion, or \
+                     delete with ?force=true and clean up the origin by hand"
+                );
+                persist_phase(&*self.store, id, SyncPhase::Paused, Some(note)).await?;
                 return Err(ApiError::new(
                     StatusCode::BAD_GATEWAY,
                     "teardown_failed",
                     format!(
-                        "{message}; the sync is kept (stopped). Retry, or delete with \
+                        "{message}; the sync is kept (paused). Retry, or delete with \
                          ?force=true and clean up the origin by hand"
                     ),
                 ));

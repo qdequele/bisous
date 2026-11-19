@@ -1510,6 +1510,19 @@ async fn delete_tears_down_and_keeps_the_sync_when_teardown_fails() {
     );
     let (status, _) = call(&a.router, "GET", &format!("/syncs/{id}"), &[], None).await;
     assert_eq!(status, StatusCode::OK, "kept for a retry");
+    // Kept stopped, durably: paused with the reason, not started at boot.
+    let (_, st) = call(&a.router, "GET", &format!("/syncs/{id}/status"), &[], None).await;
+    assert_eq!(
+        (st["phase"].as_str(), st["running"].as_bool()),
+        (Some("paused"), Some(false)),
+        "{st}"
+    );
+    assert!(
+        st["message"].as_str().unwrap().contains("deletion failed"),
+        "{st}"
+    );
+    let rebooted = app_with(AuthConfig::open(), Arc::clone(&a.store));
+    assert_eq!(boot_syncs(&rebooted.state).await.unwrap(), 0);
     // A retry once the origin is back succeeds.
     a.probe.teardown_fails.store(false, Ordering::SeqCst);
     let (status, _) = call(&a.router, "DELETE", &format!("/syncs/{id}"), &[], None).await;

@@ -184,7 +184,8 @@ Stops the sync, deletes leftover shadow indexes, tears the source down on the
 origin (replication slot and publication, consumer group), then deletes the
 sync with its state, dead letters and progress. The Meilisearch indexes are
 kept. If the origin cannot be reached the answer is `502 teardown_failed` and
-the sync is kept, stopped, so the call can be retried; `?force=true` deletes
+the sync is kept, paused (its status says why; it stays stopped across
+restarts), so the call can be retried; `?force=true` deletes
 it anyway (drop the slot by hand then, or it retains WAL).
 
 ## Configuration

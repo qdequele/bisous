@@ -189,8 +189,8 @@ paths:
         on the origin (replication slot, publication, consumer group), then
         deletes the sync with its state, dead letters and progress. The
         Meilisearch indexes are kept. When the teardown fails the answer is
-        `502 teardown_failed` and the sync is kept (stopped) so the call can be
-        retried; `?force=true` deletes it anyway.
+        `502 teardown_failed` and the sync is kept, paused with the reason as
+        its status message, so the call can be retried; `?force=true` deletes it anyway.
       parameters:
         - name: force
           in: query

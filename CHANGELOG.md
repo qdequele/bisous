@@ -63,6 +63,8 @@ All notable changes to meili-connect are listed here. The format follows
   `?force=true`) and synced fresh; new streams or another Meilisearch URL
   clear the checkpoint so the data is backfilled; anything else restarts.
   A paused sync stays paused.
+- A `DELETE` whose teardown fails now persists the sync as `paused` with
+  the reason, so it stays stopped across restarts as the answer says.
 - `POST /syncs` is all or nothing: a sync that cannot be started is removed
   again and the error returned, instead of being kept and started
   unannounced at the next boot.
