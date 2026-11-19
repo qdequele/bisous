@@ -683,15 +683,15 @@ impl Runner<'_> {
         }
     }
 
+    /// Empties the index of a truncated collection, keeping its settings.
+    /// `SyncSpec::validate` guarantees one index per collection and one
+    /// collection per index, so nothing else lives in it.
     async fn truncate(&mut self, collection: &str) -> Result<(), Halt> {
         let mut to_clear: Vec<(IndexTarget, u64)> = Vec::new();
         for &index in self.mapper.indexes_for(collection) {
             let Some(target) = self.live.get(index).cloned() else {
                 continue;
             };
-            if to_clear.iter().any(|(t, _)| t.uid == target.uid) {
-                continue;
-            }
             let count = guarded(self.cancel, self.deps.sink.document_count(&target.uid)).await?;
             if let Some(count) = count
                 && count > 0
@@ -713,25 +713,13 @@ impl Runner<'_> {
             self.hold_or_release(message).await?;
         }
         for (target, _) in to_clear {
-            self.clear_index(&target).await?;
+            guarded(
+                self.cancel,
+                self.deps.sink.delete_all_documents(&target.uid),
+            )
+            .await?;
+            info!(sync_id = %self.spec.id, index = %target.uid, "index cleared after a truncate");
         }
-        Ok(())
-    }
-
-    /// Empties an index but keeps its settings: swap in an empty shadow
-    /// built with the same settings, then drop the old content.
-    async fn clear_index(&mut self, live: &IndexTarget) -> Result<(), Halt> {
-        let sink = Arc::clone(&self.deps.sink);
-        let shadow = IndexTarget {
-            uid: shadow_index_uid(&live.uid, &self.spec.id),
-            primary_key: live.primary_key.clone(),
-        };
-        guarded(self.cancel, sink.delete_index(&shadow.uid)).await?;
-        guarded(self.cancel, sink.ensure_index(&shadow)).await?;
-        guarded(self.cancel, sink.copy_settings(&live.uid, &shadow.uid)).await?;
-        guarded(self.cancel, sink.swap(&live.uid, &shadow.uid)).await?;
-        guarded(self.cancel, sink.delete_index(&shadow.uid)).await?;
-        info!(sync_id = %self.spec.id, index = %live.uid, "index cleared after a truncate");
         Ok(())
     }
 

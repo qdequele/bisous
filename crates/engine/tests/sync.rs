@@ -422,6 +422,15 @@ async fn truncate_is_held_then_released() {
         json!({"rankingRules": ["words"]}),
         "settings survive the truncate"
     );
+    // Cleared in place: no shadow index to leak on a crash.
+    let calls = h.sink.calls();
+    assert!(calls.contains(&format!("delete_all {INDEX}")), "{calls:?}");
+    assert!(
+        !calls
+            .iter()
+            .any(|c| c.starts_with("swap") || c.contains("__connect_")),
+        "{calls:?}"
+    );
     assert!(h.store.state(SYNC_ID).expect("state").message.is_none());
     h.assert_acks_sound();
 }
