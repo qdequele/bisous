@@ -1,8 +1,11 @@
 //! In-memory store for tests and single-node trials. Nothing survives a
 //! restart.
 //!
-//! Unlike [`crate::PgStore`], the [`StateStore`] methods do not require the
-//! sync to exist in the repository, so engine tests can use it bare.
+//! [`MemStore::new`] behaves like [`crate::PgStore`]: the [`StateStore`]
+//! writes (`save`, `push_dead_letters`, `record_progress`) for a sync that
+//! does not exist fail with [`StoreError::NotFound`], as the foreign keys do
+//! in Postgres. [`MemStore::permissive`] accepts unknown sync ids, for
+//! engine tests that never create a spec.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Mutex, MutexGuard};
@@ -53,11 +56,30 @@ impl Inner {
 #[derive(Default)]
 pub struct MemStore {
     inner: Mutex<Inner>,
+    permissive: bool,
 }
 
 impl MemStore {
+    /// A store that, like Postgres, refuses state for unknown syncs.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Test helper: a store whose [`StateStore`] methods accept sync ids
+    /// that were never created, so an engine can run without specs.
+    pub fn permissive() -> Self {
+        Self {
+            permissive: true,
+            ..Self::default()
+        }
+    }
+
+    fn check_sync(&self, inner: &Inner, sync_id: &str) -> Result<(), StoreError> {
+        if self.permissive || inner.syncs.contains_key(sync_id) {
+            Ok(())
+        } else {
+            Err(StoreError::NotFound(format!("sync {sync_id}")))
+        }
     }
 
     fn lock(&self) -> Result<MutexGuard<'_, Inner>, StoreError> {
@@ -80,14 +102,18 @@ impl StateStore for MemStore {
     }
 
     async fn save(&self, state: &SyncState) -> Result<(), StoreError> {
-        self.lock()?
-            .states
-            .insert(state.sync_id.clone(), state.clone());
+        let mut inner = self.lock()?;
+        self.check_sync(&inner, &state.sync_id)?;
+        inner.states.insert(state.sync_id.clone(), state.clone());
         Ok(())
     }
 
     async fn push_dead_letters(&self, letters: &[DeadLetter]) -> Result<(), StoreError> {
         let mut inner = self.lock()?;
+        // All or nothing, like the single INSERT in Postgres.
+        for letter in letters {
+            self.check_sync(&inner, &letter.sync_id)?;
+        }
         for letter in letters {
             inner.next_dead_letter += 1;
             let id = inner.next_dead_letter;
@@ -105,6 +131,7 @@ impl StateStore for MemStore {
     ) -> Result<(), StoreError> {
         let day = Utc::now().date_naive();
         let mut inner = self.lock()?;
+        self.check_sync(&inner, sync_id)?;
         let c = inner.progress.entry((sync_id.to_owned(), day)).or_default();
         c[0] = c[0].saturating_add(written);
         c[1] = c[1].saturating_add(deleted);
@@ -374,11 +401,15 @@ impl LabOutbox for MemStore {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::test_support::{letter, spec, state};
+    use crate::test_support::{invalid_specs, letter, spec, state};
 
     #[tokio::test]
     async fn state_round_trip() {
         let store = MemStore::new();
+        store
+            .create_sync(None, &spec("s1", None, "n"))
+            .await
+            .unwrap();
         assert!(store.load("s1").await.unwrap().is_none());
         let st = state("s1");
         store.save(&st).await.unwrap();
@@ -387,6 +418,72 @@ mod tests {
         st2.resyncing = true;
         store.save(&st2).await.unwrap();
         assert_eq!(store.load("s1").await.unwrap(), Some(st2));
+    }
+
+    /// Same contract as the Postgres foreign keys.
+    #[tokio::test]
+    async fn unknown_syncs_are_not_found_like_postgres() {
+        let store = MemStore::new();
+        assert!(matches!(
+            store.save(&state("ghost")).await,
+            Err(StoreError::NotFound(_))
+        ));
+        assert!(matches!(
+            store.record_progress("ghost", 1, 0, 0).await,
+            Err(StoreError::NotFound(_))
+        ));
+        store
+            .create_sync(None, &spec("s", None, "n"))
+            .await
+            .unwrap();
+        // One unknown sync fails the whole batch.
+        assert!(matches!(
+            store
+                .push_dead_letters(&[letter("s", "1"), letter("ghost", "2")])
+                .await,
+            Err(StoreError::NotFound(_))
+        ));
+        assert!(
+            store
+                .list_dead_letters(None, "s", DeadLetterPage::default())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        store.push_dead_letters(&[letter("s", "1")]).await.unwrap();
+        store.record_progress("s", 1, 0, 0).await.unwrap();
+        store.save(&state("s")).await.unwrap();
+
+        // The test helper accepts anything.
+        let loose = MemStore::permissive();
+        loose.save(&state("ghost")).await.unwrap();
+        loose
+            .push_dead_letters(&[letter("ghost", "1")])
+            .await
+            .unwrap();
+        loose.record_progress("ghost", 1, 0, 0).await.unwrap();
+        assert!(loose.load("ghost").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn invalid_specs_are_refused() {
+        let store = MemStore::new();
+        for bad in invalid_specs("s", None) {
+            assert!(matches!(
+                store.create_sync(None, &bad).await,
+                Err(RepoError::Invalid(_))
+            ));
+        }
+        store
+            .create_sync(None, &spec("s", None, "n"))
+            .await
+            .unwrap();
+        for bad in invalid_specs("s", None) {
+            assert!(matches!(
+                store.update_sync(None, &bad).await,
+                Err(RepoError::Invalid(_))
+            ));
+        }
     }
 
     #[tokio::test]

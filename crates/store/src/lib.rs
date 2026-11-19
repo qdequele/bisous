@@ -211,6 +211,7 @@ pub(crate) fn validate_spec(tenant: Option<&str>, spec: &SyncSpec) -> Result<(),
     if spec.id.is_empty() {
         return Err(RepoError::Invalid("sync id is empty".into()));
     }
+    spec.validate().map_err(RepoError::Invalid)?;
     if spec.name.is_empty() {
         return Err(RepoError::Invalid("sync name is empty".into()));
     }
@@ -281,6 +282,17 @@ pub(crate) mod test_support {
             resyncing: false,
             updated_at: now(),
         }
+    }
+
+    /// A spec `SyncSpec::validate` refuses.
+    pub fn invalid_specs(id: &str, tenant: Option<&str>) -> Vec<SyncSpec> {
+        let mut no_streams = spec(id, tenant, "n");
+        no_streams.streams.clear();
+        let mut bad_index = spec(id, tenant, "n");
+        bad_index.streams[0].index = "bad uid".into();
+        let mut bad_guard = spec(id, tenant, "n");
+        bad_guard.mass_delete_guard = Some(2.0);
+        vec![no_streams, bad_index, bad_guard]
     }
 
     pub fn letter(sync_id: &str, doc: &str) -> DeadLetter {

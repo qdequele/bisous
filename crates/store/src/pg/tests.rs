@@ -9,7 +9,7 @@ use std::sync::Arc;
 use sqlx::Connection;
 
 use super::*;
-use crate::test_support::{letter, spec, state};
+use crate::test_support::{invalid_specs, letter, spec, state};
 
 async fn store_with_key(key: SecretKey) -> Option<PgStore> {
     store_with(key, &[]).await
@@ -718,4 +718,39 @@ async fn outbox_prunes_old_sent_events_in_batches() {
         .await
         .unwrap();
     assert_eq!(left, [unsent]);
+}
+
+#[tokio::test]
+async fn invalid_specs_are_refused() {
+    let Some(store) = store().await else { return };
+    for bad in invalid_specs("s", Some("t")) {
+        assert!(matches!(
+            store.create_sync(Some("t"), &bad).await,
+            Err(RepoError::Invalid(_))
+        ));
+    }
+    store
+        .create_sync(Some("t"), &spec("s", Some("t"), "n"))
+        .await
+        .unwrap();
+    for bad in invalid_specs("s", Some("t")) {
+        assert!(matches!(
+            store.update_sync(Some("t"), &bad).await,
+            Err(RepoError::Invalid(_))
+        ));
+    }
+    assert_eq!(
+        store.get_sync(Some("t"), "s").await.unwrap().unwrap().spec,
+        spec("s", Some("t"), "n")
+    );
+}
+
+/// What `MemStore::new` mirrors: state of an unknown sync is not found.
+#[tokio::test]
+async fn unknown_syncs_are_not_found() {
+    let Some(store) = store().await else { return };
+    assert!(matches!(
+        store.record_progress("ghost", 1, 0, 0).await,
+        Err(StoreError::NotFound(_))
+    ));
 }
