@@ -48,7 +48,7 @@ pub struct MongoSource {
     /// The stream `open(Some(..))` validated, reused by `stream`. In a
     /// mutex only to make the source `Sync` (it is never contended: every
     /// access goes through `&mut self`).
-    stream: std::sync::Mutex<Option<ChangeStream<Document>>>,
+    stream: std::sync::Mutex<Option<Held>>,
     idle_checkpoint: Duration,
 }
 
@@ -61,6 +61,13 @@ impl std::fmt::Debug for MongoSource {
             .field("position", &self.position)
             .finish_non_exhaustive()
     }
+}
+
+/// A stream opened and validated by `open`, with the event (if any) its
+/// validating read returned.
+struct Held {
+    stream: ChangeStream<Document>,
+    first: Option<(Document, Option<ResumeToken>)>,
 }
 
 enum Flow {
@@ -98,7 +105,7 @@ impl MongoSource {
         })
     }
 
-    fn held_stream(&mut self) -> &mut Option<ChangeStream<Document>> {
+    fn held_stream(&mut self) -> &mut Option<Held> {
         self.stream
             .get_mut()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -564,12 +571,28 @@ impl Source for MongoSource {
             }
             Some(cp) => {
                 let position = Position::from_checkpoint(&cp)?;
-                // The server checks the resume point when the stream opens:
-                // a token older than the oplog fails here with
-                // ChangeStreamHistoryLost (→ PositionLost).
-                let stream = self.open_stream(&client, Some(&position)).await?;
+                // The server checks the resume point lazily, on the first
+                // read: open the stream and read once (at most one event,
+                // kept for `stream`). A token older than the oplog fails
+                // with ChangeStreamHistoryLost (→ PositionLost); a token the
+                // server cannot decode is just as unusable.
+                let resume_err = |e: SourceError| match e {
+                    SourceError::Fatal(m) => SourceError::PositionLost(format!(
+                        "the saved resume token is unusable: {m}"
+                    )),
+                    other => other,
+                };
+                let mut stream = self
+                    .open_stream(&client, Some(&position))
+                    .await
+                    .map_err(resume_err)?;
+                let first = stream
+                    .next_if_any()
+                    .await
+                    .map_err(|e| resume_err(self.err(&e, "resuming the change stream")))?
+                    .map(|ev| (ev, stream.resume_token()));
                 tracing::info!(sync_id = %self.sync_id, "mongodb: resumed from checkpoint");
-                *self.held_stream() = Some(stream);
+                *self.held_stream() = Some(Held { stream, first });
                 self.position = Some(position);
                 Ok(Opened::Resumed)
             }
@@ -632,13 +655,16 @@ impl Source for MongoSource {
             .clone()
             .ok_or_else(|| SourceError::Fatal("stream called before open".into()))?;
         let held = self.held_stream().take();
-        let mut stream = match held {
-            Some(s) => s,
-            None => tokio::select! {
-                biased;
-                _ = cancel.cancelled() => return Ok(()),
-                s = self.open_stream(&client, Some(&position)) => s?,
-            },
+        let (mut stream, mut pending) = match held {
+            Some(h) => (h.stream, h.first),
+            None => (
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => return Ok(()),
+                    s = self.open_stream(&client, Some(&position)) => s?,
+                },
+                None,
+            ),
         };
         // The open position is already durable (the engine saved it or
         // resumed from it).
@@ -647,16 +673,20 @@ impl Source for MongoSource {
         let mut last_checkpoint = Instant::now();
 
         loop {
-            let next = tokio::select! {
-                biased;
-                _ = cancel.cancelled() => return Ok(()),
-                n = stream.next_if_any() => n,
-            };
-            let event = match next {
-                Ok(e) => e,
-                Err(e) => return Err(self.err(&e, "reading the change stream")),
-            };
-            let token: Option<ResumeToken> = stream.resume_token();
+            let (event, token): (Option<Document>, Option<ResumeToken>) =
+                if let Some((ev, token)) = pending.take() {
+                    (Some(ev), token)
+                } else {
+                    let next = tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => return Ok(()),
+                        n = stream.next_if_any() => n,
+                    };
+                    match next {
+                        Ok(e) => (e, stream.resume_token()),
+                        Err(e) => return Err(self.err(&e, "reading the change stream")),
+                    }
+                };
 
             let Some(event) = event else {
                 // The batch is exhausted: the post-batch resume token covers

@@ -22,6 +22,8 @@
 //!   recognisable when Atlas says "paused" in the error; otherwise it looks
 //!   like an unreachable server (`Transient`).
 
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
 pub mod config;
 pub mod convert;
 pub mod error;
