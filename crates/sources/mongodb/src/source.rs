@@ -19,7 +19,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::{FullDocumentMode, MongoConfig, Target, resolve_targets};
 use crate::convert::{bson_to_json, document_to_json};
-use crate::error::{Scrubber, codes, error_code, map_error};
+use crate::error::{Scrubber, codes, error_code, map_error, map_resume_error};
 use crate::event::{Mapped, Namespaces, map_event};
 use crate::position::Position;
 
@@ -574,22 +574,14 @@ impl Source for MongoSource {
                 // The server checks the resume point lazily, on the first
                 // read: open the stream and read once (at most one event,
                 // kept for `stream`). A token older than the oplog fails
-                // with ChangeStreamHistoryLost (→ PositionLost); a token the
-                // server cannot decode is just as unusable.
-                let resume_err = |e: SourceError| match e {
-                    SourceError::Fatal(m) => SourceError::PositionLost(format!(
-                        "the saved resume token is unusable: {m}"
-                    )),
-                    other => other,
-                };
-                let mut stream = self
-                    .open_stream(&client, Some(&position))
-                    .await
-                    .map_err(resume_err)?;
+                // with ChangeStreamHistoryLost (→ PositionLost). Any other
+                // error keeps its own classification: a blip is retried,
+                // not turned into a full resync.
+                let mut stream = self.open_stream(&client, Some(&position)).await?;
                 let first = stream
                     .next_if_any()
                     .await
-                    .map_err(|e| resume_err(self.err(&e, "resuming the change stream")))?
+                    .map_err(|e| map_resume_error(&e, "resuming the change stream", &self.scrub))?
                     .map(|ev| (ev, stream.resume_token()));
                 tracing::info!(sync_id = %self.sync_id, "mongodb: resumed from checkpoint");
                 *self.held_stream() = Some(Held { stream, first });

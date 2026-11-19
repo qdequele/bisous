@@ -426,12 +426,14 @@ async fn resume_from_checkpoint_and_patches() {
         "nothing before the checkpoint is replayed"
     );
 
-    // A token the server cannot use is a lost position.
+    // A token the server cannot decode is refused. Only the history-lost
+    // codes trigger a resync; a corrupt token (Overflow, 15) is not one of
+    // them and keeps its own classification instead of being swallowed.
     let mut source = build(&url, json!({}), &[&name]);
     let bogus =
         Checkpoint(json!({"resume_token": {"_data": "8265A1F0C2000000012B022C0100296E5A1004"}}));
     let err = source.open(Some(bogus)).await.unwrap_err();
-    assert!(matches!(err, SourceError::PositionLost(_)), "{err:?}");
+    assert!(!matches!(err, SourceError::PositionLost(_)), "{err:?}");
 
     c.database(&db).drop().await.unwrap();
 }
