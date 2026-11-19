@@ -189,6 +189,26 @@ pub async fn discover_source(
     Ok(Json(json!({ "collections": collections })))
 }
 
+/// What a tenant puts in its DynamoDB role's trust policy: the external ID
+/// this server assumes the role with for it, and the server's principal.
+pub async fn dynamodb_trust(State(state): State<AppState>, scope: Scope) -> ApiResult<Json<Value>> {
+    let Some(binding) = state.external_id_binding(scope.tenant.as_deref()) else {
+        return Err(ApiError::invalid(
+            "the external ID is chosen by this server only for a tenant's syncs on a hosted \
+             server: here, choose your own `external_id`",
+        ));
+    };
+    let ids = binding.ids.ok_or_else(ApiError::external_id_unavailable)?;
+    let external_id = ids.for_tenant(&binding.tenant);
+    let principal = state.aws_principal.get().await;
+    Ok(Json(json!({
+        "external_id": external_id,
+        "principal": principal,
+        "trust_policy": crate::external_id::trust_policy(principal.as_deref(), &external_id),
+        "note": principal.is_none().then_some(crate::external_id::PRINCIPAL_UNKNOWN),
+    })))
+}
+
 // ---------------------------------------------------------------- syncs
 
 /// The writable part of a sync. `id`, `tenant`, `created_at` and

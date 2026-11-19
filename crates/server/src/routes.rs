@@ -33,6 +33,7 @@ pub const ROUTES: &[RouteSpec] = &[
     auth("GET", "/usage"),
     auth("POST", "/sources/check"),
     auth("POST", "/sources/discover"),
+    auth("GET", "/sources/dynamodb/trust"),
     auth("POST", "/syncs"),
     auth("GET", "/syncs"),
     auth("GET", "/syncs/{id}"),

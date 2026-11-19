@@ -38,7 +38,7 @@ use tracing::{error, info, warn};
 use crate::auth::AuthConfig;
 use crate::config::{Config, LogFormat};
 use crate::credits::CreditCache;
-use crate::external_id::ExternalIds;
+use crate::external_id::{AwsPrincipal, ExternalIds};
 use crate::limits::{Limits, ProbeSlots};
 use crate::manager::{ManagerDeps, SinkFactory, SyncManager, meili_sinks};
 use crate::metrics::Metrics;
@@ -54,6 +54,7 @@ pub fn router(state: AppState) -> Router {
         .route("/metrics", get(metrics::metrics))
         .route("/sources/check", post(api::check_source))
         .route("/sources/discover", post(api::discover_source))
+        .route("/sources/dynamodb/trust", get(api::dynamodb_trust))
         .route("/usage", get(api::usage))
         .route("/syncs", post(api::create_sync).get(api::list_syncs))
         .route(
@@ -103,6 +104,8 @@ pub struct Wiring {
     /// without `CONNECT_SECRET_KEY` (assume-role is then refused for
     /// tenants on a hosted server).
     pub external_ids: Option<Arc<ExternalIds>>,
+    /// The server's own AWS principal, for `GET /sources/dynamodb/trust`.
+    pub aws_principal: Arc<AwsPrincipal>,
 }
 
 /// Assemble the shared state around a backend. The engine gets the
@@ -157,6 +160,7 @@ pub fn build_state(
         lag_guard: wiring.lag_guard,
         hosted: wiring.hosted,
         external_ids: wiring.external_ids,
+        aws_principal: wiring.aws_principal,
         usage_reader: match &wiring.tinybird {
             Some(tb) => match TinybirdReader::new(tb.clone()) {
                 Ok(reader) => Some(Arc::new(reader)),
@@ -332,6 +336,7 @@ pub async fn run() -> Result<(), String> {
             tinybird: config.tinybird.clone(),
             hosted: config.hosted(),
             external_ids,
+            aws_principal: Arc::new(AwsPrincipal::from_host()),
         },
         cancel.child_token(),
     );

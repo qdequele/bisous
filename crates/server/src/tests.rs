@@ -24,7 +24,7 @@ use tokio_util::sync::CancellationToken;
 use tower::ServiceExt;
 
 use crate::auth::{AuthConfig, H_TENANT_ID};
-use crate::external_id::ExternalIds;
+use crate::external_id::{AwsPrincipal, ExternalIds};
 use crate::limits::Limits;
 use crate::manager::SinkFactory;
 use crate::routes::ROUTES;
@@ -321,6 +321,7 @@ fn app_tweaked(
         tinybird: None,
         hosted: false,
         external_ids: None,
+        aws_principal: test_principal(),
         limits,
     };
     tweak(&mut wiring);
@@ -1053,6 +1054,7 @@ async fn a_loopback_destination_is_host_not_allowed_with_the_real_sinks() {
             tinybird: None,
             hosted: false,
             external_ids: None,
+            aws_principal: test_principal(),
             limits: Limits::default(),
         },
         CancellationToken::new(),
@@ -2653,6 +2655,16 @@ fn dynamo_body(name: &str, credentials: Value) -> Value {
     })
 }
 
+const TEST_PRINCIPAL: &str = "arn:aws:iam::111122223333:role/meili-connect";
+
+fn test_principal() -> Arc<AwsPrincipal> {
+    Arc::new(AwsPrincipal::with_lookup(Arc::new(|| {
+        Box::pin(async {
+            Ok("arn:aws:sts::111122223333:assumed-role/meili-connect/pod".to_owned())
+        })
+    })))
+}
+
 fn test_external_ids() -> Arc<ExternalIds> {
     Arc::new(ExternalIds::new(&SecretKey::from_bytes([9; 32])))
 }
@@ -2934,6 +2946,115 @@ async fn a_tenant_assumes_its_role_with_the_external_id_the_server_derives() {
             .await
             .get("external_id"),
         None
+    );
+}
+
+#[tokio::test]
+async fn the_trust_route_gives_each_tenant_its_own_external_id_and_policy() {
+    let a = hosted_app(Arc::new(MemStore::new()));
+    let ids = test_external_ids();
+    let mut seen = Vec::new();
+    for tenant in ["team-a", "team-b"] {
+        let (status, body) = call(
+            &a.router,
+            "GET",
+            "/sources/dynamodb/trust",
+            &lab(tenant),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let expected = ids.for_tenant(tenant);
+        assert_eq!(body["external_id"], expected.as_str());
+        assert_eq!(body["principal"], TEST_PRINCIPAL);
+        assert_eq!(body["note"], Value::Null);
+        let statement = &body["trust_policy"]["Statement"][0];
+        assert_eq!(body["trust_policy"]["Version"], "2012-10-17");
+        assert_eq!(statement["Effect"], "Allow");
+        assert_eq!(statement["Action"], "sts:AssumeRole");
+        assert_eq!(statement["Principal"]["AWS"], TEST_PRINCIPAL);
+        assert_eq!(
+            statement["Condition"]["StringEquals"]["sts:ExternalId"],
+            expected.as_str()
+        );
+        seen.push(expected);
+    }
+    assert_ne!(seen[0], seen[1]);
+    // The admin acting for a tenant gets that tenant's.
+    let mut tenant_admin = admin();
+    tenant_admin.push((H_TENANT_ID, "team-a".to_owned()));
+    let (_, body) = call(
+        &a.router,
+        "GET",
+        "/sources/dynamodb/trust",
+        &tenant_admin,
+        None,
+    )
+    .await;
+    assert_eq!(body["external_id"], seen[0].as_str());
+
+    // The global scope and a server that is not hosted choose their own.
+    let (status, body) = call(&a.router, "GET", "/sources/dynamodb/trust", &admin(), None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let s = app(locked());
+    let (status, _) = call(
+        &s.router,
+        "GET",
+        "/sources/dynamodb/trust",
+        &lab("team-a"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // No CONNECT_SECRET_KEY: no external IDs. An unknown principal: null,
+    // a note, and a placeholder in the policy.
+    let unknown = app_tweaked(
+        locked(),
+        Arc::new(MemStore::new()),
+        HostPolicy::any(),
+        Limits::default(),
+        Duration::from_millis(200),
+        |w| w.hosted = true,
+    );
+    let (status, body) = call(
+        &unknown.router,
+        "GET",
+        "/sources/dynamodb/trust",
+        &lab("team-a"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["code"], "external_id_unavailable");
+    let unknown = app_tweaked(
+        locked(),
+        Arc::new(MemStore::new()),
+        HostPolicy::any(),
+        Limits::default(),
+        Duration::from_millis(200),
+        |w| {
+            w.hosted = true;
+            w.external_ids = Some(test_external_ids());
+            w.aws_principal = Arc::new(AwsPrincipal::with_lookup(Arc::new(|| {
+                Box::pin(async { Err("no credentials".to_owned()) })
+            })));
+        },
+    );
+    let (status, body) = call(
+        &unknown.router,
+        "GET",
+        "/sources/dynamodb/trust",
+        &lab("team-a"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["principal"], Value::Null);
+    assert!(body["note"].as_str().unwrap().contains("operator"));
+    assert_eq!(
+        body["trust_policy"]["Statement"][0]["Principal"]["AWS"],
+        crate::external_id::PRINCIPAL_PLACEHOLDER
     );
 }
 

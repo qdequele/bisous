@@ -25,13 +25,19 @@
 //! - Without `CONNECT_SECRET_KEY` (the in-memory store) there is no key:
 //!   assume-role is refused for tenants.
 //! - The global scope (standalone admin) keeps a free-form `external_id`.
+//! - `GET /sources/dynamodb/trust` gives a tenant its external ID, the
+//!   server's AWS principal ([`AwsPrincipal`]) and the trust policy to put
+//!   on its role ([`trust_policy`]).
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use hmac::{Hmac, Mac};
 use meili_connect_core::{SourceKind, SourceSpec};
 use meili_connect_store::SecretKey;
-use serde_json::Value;
+use serde_json::{Value, json};
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
 
@@ -188,10 +194,153 @@ pub fn bind(spec: &SourceSpec, binding: &Binding) -> Result<SourceSpec, Refusal>
     Ok(bound)
 }
 
+// ------------------------------------------------------------ trust policy
+
+/// Stands for the principal in a trust policy when it is not known.
+pub const PRINCIPAL_PLACEHOLDER: &str = "<AWS principal ARN of this Meilisearch Connect server>";
+
+/// The `note` of `GET /sources/dynamodb/trust` when the principal is not known.
+pub const PRINCIPAL_UNKNOWN: &str = "this server could not resolve its own AWS principal \
+     (sts:GetCallerIdentity): ask its operator for it and put it in place of the placeholder \
+     in `trust_policy`";
+
+/// How long a resolved principal, or a failure to resolve it, is reused.
+const PRINCIPAL_TTL: Duration = Duration::from_secs(3600);
+const PRINCIPAL_RETRY: Duration = Duration::from_secs(60);
+const PRINCIPAL_TIMEOUT: Duration = Duration::from_secs(5);
+
+type Lookup =
+    Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>> + Send + Sync>;
+
+/// The server's own AWS principal, resolved with `sts:GetCallerIdentity`
+/// on first use and cached (an hour; a minute after a failure).
+pub struct AwsPrincipal {
+    lookup: Lookup,
+    cached: tokio::sync::Mutex<Option<(Instant, Option<String>)>>,
+}
+
+impl AwsPrincipal {
+    /// The identity of the host's default AWS provider chain.
+    pub fn from_host() -> Self {
+        Self::with_lookup(Arc::new(|| {
+            Box::pin(meili_connect_source_dynamodb::host_caller_arn(
+                PRINCIPAL_TIMEOUT,
+            ))
+        }))
+    }
+
+    /// Resolve with `lookup` instead (tests).
+    pub fn with_lookup(lookup: Lookup) -> Self {
+        Self {
+            lookup,
+            cached: tokio::sync::Mutex::new(None),
+        }
+    }
+
+    /// The principal to trust, `None` when it cannot be resolved.
+    pub async fn get(&self) -> Option<String> {
+        let mut cached = self.cached.lock().await;
+        if let Some((at, value)) = &*cached {
+            let ttl = if value.is_some() {
+                PRINCIPAL_TTL
+            } else {
+                PRINCIPAL_RETRY
+            };
+            if at.elapsed() < ttl {
+                return value.clone();
+            }
+        }
+        let value = match (self.lookup)().await {
+            Ok(arn) => Some(trust_principal(&arn)),
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot resolve this server's AWS principal");
+                None
+            }
+        };
+        *cached = Some((Instant::now(), value.clone()));
+        value
+    }
+}
+
+/// The principal a trust policy names for a caller ARN: the role of an
+/// assumed-role session (`arn:aws:sts::1:assumed-role/R/s` →
+/// `arn:aws:iam::1:role/R`), any other ARN as it is.
+pub fn trust_principal(caller_arn: &str) -> String {
+    let parts: Vec<&str> = caller_arn.splitn(6, ':').collect();
+    if let [arn, partition, "sts", "", account, resource] = parts.as_slice()
+        && let Some(rest) = resource.strip_prefix("assumed-role/")
+        && let Some((role, _session)) = rest.split_once('/')
+    {
+        return format!("{arn}:{partition}:iam::{account}:role/{role}");
+    }
+    caller_arn.to_owned()
+}
+
+/// The trust policy a customer's role needs: `principal` may assume it,
+/// only with `external_id`.
+pub fn trust_policy(principal: Option<&str>, external_id: &str) -> Value {
+    json!({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Allow",
+            "Principal": { "AWS": principal.unwrap_or(PRINCIPAL_PLACEHOLDER) },
+            "Action": "sts:AssumeRole",
+            "Condition": { "StringEquals": { "sts:ExternalId": external_id } },
+        }],
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn the_trust_principal_of_an_assumed_role_is_its_role() {
+        assert_eq!(
+            trust_principal("arn:aws:sts::123456789012:assumed-role/connect/i-0abc"),
+            "arn:aws:iam::123456789012:role/connect"
+        );
+        assert_eq!(
+            trust_principal("arn:aws-cn:sts::1:assumed-role/r/s"),
+            "arn:aws-cn:iam::1:role/r"
+        );
+        for arn in ["arn:aws:iam::1:user/u", "arn:aws:iam::1:root", "nonsense"] {
+            assert_eq!(trust_principal(arn), arn);
+        }
+        let policy = trust_policy(Some("arn:aws:iam::1:role/r"), "mc-x");
+        let statement = &policy["Statement"][0];
+        assert_eq!(statement["Principal"]["AWS"], "arn:aws:iam::1:role/r");
+        assert_eq!(statement["Action"], "sts:AssumeRole");
+        assert_eq!(
+            statement["Condition"]["StringEquals"]["sts:ExternalId"],
+            "mc-x"
+        );
+        assert_eq!(
+            trust_policy(None, "mc-x")["Statement"][0]["Principal"]["AWS"],
+            PRINCIPAL_PLACEHOLDER
+        );
+    }
+
+    #[tokio::test]
+    async fn the_principal_is_resolved_once_and_cached() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&calls);
+        let principal = AwsPrincipal::with_lookup(Arc::new(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok("arn:aws:sts::1:assumed-role/r/s".to_owned()) })
+        }));
+        for _ in 0..3 {
+            assert_eq!(
+                principal.get().await.as_deref(),
+                Some("arn:aws:iam::1:role/r")
+            );
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let failing =
+            AwsPrincipal::with_lookup(Arc::new(|| Box::pin(async { Err("no creds".to_owned()) })));
+        assert_eq!(failing.get().await, None);
+    }
 
     fn ids(byte: u8) -> Arc<ExternalIds> {
         Arc::new(ExternalIds::new(&SecretKey::from_bytes([byte; 32])))

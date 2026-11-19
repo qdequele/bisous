@@ -33,6 +33,7 @@ pub mod source;
 pub mod stream;
 mod util;
 
+pub use client::host_caller_arn;
 pub use config::{CredentialsConfig, DynamoConfig, ScanOptions, StreamOptions};
 pub use lineage::{ShardCheckpoint, StreamCheckpoint, TableCheckpoint};
 pub use source::{DynamoSource, DynamoSourceFactory};

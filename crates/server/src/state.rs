@@ -42,6 +42,8 @@ pub struct AppState {
     /// Derives the external ID of a tenant's DynamoDB roles
     /// (`crate::external_id`); `None` without `CONNECT_SECRET_KEY`.
     pub external_ids: Option<Arc<crate::external_id::ExternalIds>>,
+    /// The server's own AWS principal (`GET /sources/dynamodb/trust`).
+    pub aws_principal: Arc<crate::external_id::AwsPrincipal>,
     /// `GET /usage` reads Tinybird when configured.
     pub usage_reader: Option<Arc<crate::tinybird::TinybirdReader>>,
     /// The only credential `GET /metrics` accepts.
