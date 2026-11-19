@@ -40,6 +40,9 @@ pub fn from_sqlstate(code: &str, message: &str, ctx: Context, supabase: bool) ->
         "53400" => SourceError::Config(text),
         // Slot active elsewhere, serialization, lock, too many connections.
         "55006" | "55P03" | "40001" | "40P01" | "53300" => SourceError::Transient(text),
+        // Slot or publication already exists: another instance raced us to
+        // create it. The next open sorts out whose it is.
+        "42710" => SourceError::Transient(text),
         // Admin shutdown, crash shutdown, cannot connect now (starting up,
         // recovering), idle session timeout.
         c if c.starts_with("57") => SourceError::Transient(text),
@@ -64,8 +67,33 @@ pub fn from_pg(err: &tokio_postgres::Error, ctx: Context, supabase: bool) -> Sou
     if let Some(db) = err.as_db_error() {
         return from_sqlstate(db.code().code(), db.message(), ctx, supabase);
     }
-    let msg = err.to_string();
+    // `tokio-postgres` displays "error connecting to server" and keeps the
+    // cause (DNS, refused, TLS) in the source chain.
+    let mut msg = err.to_string();
+    let mut source = std::error::Error::source(err);
+    while let Some(cause) = source {
+        msg.push_str(": ");
+        msg.push_str(&cause.to_string());
+        source = cause.source();
+    }
     io_like(&msg, supabase)
+}
+
+/// What a Supabase host that does not resolve looks like (see `io_like`).
+const UNRESOLVED: &str = "the Supabase project does not answer (paused or deleted?)";
+
+/// Before a sync has ever run (`check`, an `open` without a resume
+/// checkpoint), a Supabase host that does not resolve is a mistyped or
+/// deleted project: the user must fix it, so it is a Config error and not
+/// a paused project retried quietly forever.
+pub fn first_contact(err: SourceError) -> SourceError {
+    match err {
+        SourceError::Paused(msg) if msg.starts_with(UNRESOLVED) => SourceError::Config(format!(
+            "the Supabase host does not resolve: check the project reference (or the project \
+             was deleted): {msg}"
+        )),
+        other => other,
+    }
 }
 
 /// `pgwire-replication` errors. Server errors are formatted
@@ -103,9 +131,7 @@ fn io_like(msg: &str, supabase: bool) -> SourceError {
             || lower.contains("no such host")
             || is_paused_message(&lower))
     {
-        return SourceError::Paused(format!(
-            "the Supabase project does not answer (paused or deleted?): {msg}"
-        ));
+        return SourceError::Paused(format!("{UNRESOLVED}: {msg}"));
     }
     if lower.contains("password authentication failed") || lower.contains("certificate") {
         return SourceError::Config(msg.to_owned());
@@ -194,6 +220,11 @@ mod tests {
             from_sqlstate("42601", "syntax error", q, false),
             SourceError::Fatal(_)
         ));
+        // Two instances racing to create the same slot or publication.
+        assert!(matches!(
+            from_sqlstate("42710", "replication slot \"s\" already exists", q, false),
+            SourceError::Transient(_)
+        ));
     }
 
     #[test]
@@ -225,6 +256,15 @@ mod tests {
             "failed to lookup address information",
         )));
         assert!(matches!(from_wire(&dns, s, true), SourceError::Paused(_)));
+        assert!(matches!(
+            first_contact(from_wire(&dns, s, true)),
+            SourceError::Config(_)
+        ));
+        // An explicit "paused" answer stays paused, even on first contact.
+        assert!(matches!(
+            first_contact(from_sqlstate("XX000", "project is paused", s, true)),
+            SourceError::Paused(_)
+        ));
         assert!(matches!(
             from_wire(&dns, s, false),
             SourceError::Transient(_)

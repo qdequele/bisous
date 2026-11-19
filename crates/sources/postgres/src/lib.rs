@@ -118,6 +118,33 @@ mod tests {
         }
     }
 
+    /// A project ref that does not resolve: a typo or a deleted project
+    /// before the sync ever ran needs the user, not a silent "paused".
+    #[tokio::test]
+    async fn unknown_supabase_host_is_config_before_the_first_run() {
+        let spec = SourceSpec {
+            kind: SourceKind::Supabase,
+            config: json!({"host": "db.zzzzzzzzzzzzzzzzzzzzqq.supabase.co",
+                           "user": "postgres", "password": "pw"}),
+        };
+        let f = PostgresSourceFactory::new();
+        let mut src = f
+            .build_source("s1", &spec, &[mapping("public.items")])
+            .unwrap();
+        let report = src.check().await.unwrap();
+        assert_eq!(
+            report.items[0].status,
+            meili_connect_core::CheckStatus::Failed,
+            "{report:#?}"
+        );
+        let err = src.open(None).await.unwrap_err();
+        assert!(matches!(err, SourceError::Config(_)), "{err:?}");
+        // A sync that already ran: the same failure is a paused project.
+        let resume = meili_connect_core::Checkpoint(json!({"lsn": "0/16B3748"}));
+        let err = src.open(Some(resume)).await.unwrap_err();
+        assert!(matches!(err, SourceError::Paused(_)), "{err:?}");
+    }
+
     #[test]
     fn factory_rejects_other_kinds_and_poolers() {
         let f = PostgresSourceFactory::new();

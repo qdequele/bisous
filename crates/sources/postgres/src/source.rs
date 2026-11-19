@@ -354,6 +354,54 @@ impl PostgresSource {
         })
     }
 
+    async fn open_inner(&mut self, resume: Option<Checkpoint>) -> Result<Opened, SourceError> {
+        self.pending = None;
+        self.start = None;
+        if self.targets.is_empty() {
+            return Err(SourceError::Config("no table is mapped".into()));
+        }
+        self.connect().await?;
+        if self.version < MIN_VERSION {
+            return Err(SourceError::Config(too_old(self.version)));
+        }
+        let tables = self.mapped_tables().await?;
+        self.warm_types(&tables).await?;
+        match resume {
+            Some(cp) => self.open_resume(cp).await,
+            None => self.open_fresh().await,
+        }
+    }
+
+    /// A START_REPLICATION failure. The server reports an invalidated slot
+    /// only as "can no longer get changes" (SQLSTATE 55000), the reason
+    /// being in a DETAIL the driver drops: look at the slot to tell it from
+    /// a configuration problem.
+    async fn start_error(&mut self, err: &pgwire_replication::PgWireError) -> SourceError {
+        let mapped = error::from_wire(err, Context::Stream, self.supabase());
+        let pgwire_replication::PgWireError::Server(text) = err else {
+            return mapped;
+        };
+        if !text.ends_with("(SQLSTATE 55000)") {
+            return mapped;
+        }
+        let slot_name = self.settings.slot.clone();
+        let Ok(sql) = self.db() else {
+            return mapped;
+        };
+        match catalog::slot(sql, &slot_name).await {
+            Ok(None) => SourceError::PositionLost(format!(
+                "{text}: replication slot {slot_name} no longer exists"
+            )),
+            Ok(Some(slot)) => match slot.lost_reason() {
+                Some(reason) => SourceError::PositionLost(format!(
+                    "{text}: replication slot {slot_name} cannot stream any more: {reason}"
+                )),
+                None => mapped,
+            },
+            Err(_) => mapped,
+        }
+    }
+
     async fn snapshot_tables(
         &mut self,
         snapshot: &str,
@@ -568,20 +616,10 @@ impl Source for PostgresSource {
     }
 
     async fn open(&mut self, resume: Option<Checkpoint>) -> Result<Opened, SourceError> {
-        self.pending = None;
-        self.start = None;
-        if self.targets.is_empty() {
-            return Err(SourceError::Config("no table is mapped".into()));
-        }
-        self.connect().await?;
-        if self.version < MIN_VERSION {
-            return Err(SourceError::Config(too_old(self.version)));
-        }
-        let tables = self.mapped_tables().await?;
-        self.warm_types(&tables).await?;
-        match resume {
-            Some(cp) => self.open_resume(cp).await,
-            None => self.open_fresh().await,
+        if resume.is_some() {
+            self.open_inner(resume).await
+        } else {
+            self.open_inner(None).await.map_err(error::first_contact)
         }
     }
 
@@ -637,9 +675,16 @@ impl Source for PostgresSource {
         );
         let wire =
             |e: pgwire_replication::PgWireError| error::from_wire(&e, Context::Stream, supabase);
-        let mut client = ReplicationClient::connect(cfg).await.map_err(wire)?;
+        let mut client = match ReplicationClient::connect(cfg).await {
+            Ok(client) => client,
+            Err(e) => return Err(self.start_error(&e).await),
+        };
         tokio::select! {
-            r = client.wait_started() => r.map_err(wire)?,
+            r = client.wait_started() => {
+                if let Err(e) = r {
+                    return Err(self.start_error(&e).await);
+                }
+            }
             () = cancel.cancelled() => return Ok(()),
         }
         tracing::info!(slot = %self.settings.slot, %start, "replication started");

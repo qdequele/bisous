@@ -26,6 +26,18 @@ fn url() -> Option<String> {
     }
 }
 
+/// Tests that change server-wide settings (`ALTER SYSTEM`) also need
+/// `PG_TEST_ALTER_SYSTEM=1`: run them alone, on a throwaway server.
+fn alter_system_url() -> Option<String> {
+    let url = url()?;
+    if std::env::var("PG_TEST_ALTER_SYSTEM").as_deref() == Ok("1") {
+        Some(url)
+    } else {
+        eprintln!("PG_TEST_ALTER_SYSTEM is not 1: skipping a test that changes server settings");
+        None
+    }
+}
+
 /// A Postgres older than 14 (`PG_OLD_TEST_URL`), for the version gate.
 fn old_url() -> Option<String> {
     match std::env::var("PG_OLD_TEST_URL") {
@@ -1229,5 +1241,72 @@ async fn key_change_with_unchanged_toast_gives_whole_documents() {
         );
     }
     let mut src = s.stop().await;
+    src.teardown().await.unwrap();
+}
+
+/// The slot is invalidated after `open` checked it and before
+/// START_REPLICATION: the server says only "can no longer get changes"
+/// (SQLSTATE 55000), the reason being in the DETAIL.
+#[tokio::test]
+async fn slot_invalidated_before_start_replication_is_position_lost() {
+    let Some(url) = alter_system_url() else {
+        return;
+    };
+    let db = admin(&url).await;
+    let table = unique("inv");
+    create_items(&db, &table).await;
+    let sync_id = unique("inv");
+    let slot = format!("meili_connect_{sync_id}");
+    let collection = format!("public.{table}");
+    let mut src = source(&url, &sync_id, &[&collection]);
+    let Opened::Fresh { start } = src.open(None).await.unwrap() else {
+        panic!()
+    };
+    drop(src);
+    let mut src = source(&url, &sync_id, &[&collection]);
+    assert_eq!(src.open(Some(start)).await.unwrap(), Opened::Resumed);
+
+    db.batch_execute("ALTER SYSTEM SET max_slot_wal_keep_size = '1MB'")
+        .await
+        .unwrap();
+    db.batch_execute("SELECT pg_reload_conf()").await.unwrap();
+    let mut lost = false;
+    for i in 0..10 {
+        db.batch_execute(&format!(
+            "INSERT INTO {table} VALUES ({i}, 0, repeat('x', 10000))"
+        ))
+        .await
+        .unwrap();
+        db.batch_execute("SELECT pg_switch_wal()").await.unwrap();
+        db.batch_execute("CHECKPOINT").await.unwrap();
+        let status: Option<String> = db
+            .query_one(
+                "SELECT wal_status FROM pg_replication_slots WHERE slot_name = $1",
+                &[&slot],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        if status.as_deref() == Some("lost") {
+            lost = true;
+            break;
+        }
+    }
+    db.batch_execute("ALTER SYSTEM RESET max_slot_wal_keep_size")
+        .await
+        .unwrap();
+    db.batch_execute("SELECT pg_reload_conf()").await.unwrap();
+    assert!(lost, "could not invalidate the slot");
+
+    let (tx, _rx) = mpsc::channel(4);
+    let (_ack, acks) = ack_channel();
+    let err = tokio::time::timeout(
+        Duration::from_secs(20),
+        src.stream(tx, acks, CancellationToken::new()),
+    )
+    .await
+    .expect("stream fails fast")
+    .unwrap_err();
+    assert!(matches!(err, SourceError::PositionLost(_)), "{err:?}");
     src.teardown().await.unwrap();
 }

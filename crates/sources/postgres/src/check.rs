@@ -8,7 +8,7 @@ use crate::source::{MIN_VERSION, PostgresSource, too_old};
 
 pub async fn run(src: &mut PostgresSource) -> Result<CheckReport, SourceError> {
     let mut report = CheckReport::default();
-    if let Err(e) = src.connect().await {
+    if let Err(e) = src.connect().await.map_err(crate::error::first_contact) {
         let mut message = e.to_string();
         if src.supabase() && matches!(e, SourceError::Transient(_)) {
             message.push_str(
