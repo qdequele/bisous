@@ -121,6 +121,8 @@ fn source(brokers: &str, topics: &[&str], extra: Value) -> Box<dyn Source> {
 
 struct Running {
     rx: mpsc::Receiver<SourceEvent>,
+    /// Positions of the `Skipped` events seen so far.
+    skipped: Vec<String>,
     acks: AckSender,
     cancel: CancellationToken,
     handle: JoinHandle<(Box<dyn Source>, Result<(), SourceError>)>,
@@ -137,6 +139,7 @@ fn spawn_stream(mut source: Box<dyn Source>) -> Running {
     });
     Running {
         rx,
+        skipped: Vec::new(),
         acks,
         cancel,
         handle,
@@ -155,6 +158,7 @@ impl Running {
                 .expect("stream ended");
             match ev {
                 SourceEvent::Change(c) => out.push(c),
+                SourceEvent::Skipped { position, .. } => self.skipped.push(position),
                 SourceEvent::Checkpoint(cp) if out.len() >= n => return (out, cp),
                 _ => {}
             }
@@ -326,7 +330,87 @@ async fn tombstones_delete_and_bad_records_are_skipped() {
     assert_eq!(changes[0].op, Op::Delete);
     assert_eq!(cp.0, json!({ &topic: {"0": 3} }));
     assert_eq!(skipped.load(std::sync::atomic::Ordering::Relaxed), 2);
+    assert_eq!(
+        run.skipped,
+        vec![format!("{topic}/0@0"), format!("{topic}/0@1")]
+    );
     run.stop().await;
+}
+
+/// Runs a stream that must fail; returns its error and the furthest
+/// checkpointed offset of partition 0.
+async fn stream_failure(mut run: Running, topic: &str) -> (SourceError, Option<i64>) {
+    let mut furthest = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while let Ok(Some(ev)) = tokio::time::timeout_at(deadline, run.rx.recv()).await {
+        match ev {
+            SourceEvent::Checkpoint(cp) => furthest = cp.0[topic]["0"].as_i64(),
+            SourceEvent::Change(_) | SourceEvent::Skipped { .. } => {
+                panic!("nothing is emitted for a topic in the wrong format: {ev:?}")
+            }
+            _ => {}
+        }
+    }
+    let (_, r) = tokio::time::timeout(Duration::from_secs(5), run.handle)
+        .await
+        .expect("stream did not fail")
+        .unwrap();
+    (r.expect_err("stream must fail"), furthest)
+}
+
+#[tokio::test]
+async fn a_topic_in_another_format_stops_the_sync() {
+    let Some(b) = brokers() else { return };
+    let topic = unique("wrongfmt");
+    create_topic(&b, &topic, 1).await;
+    for i in 0..5 {
+        produce(&b, &topic, 0, Some(&i.to_string()), Some("plain text")).await;
+    }
+    let mut s = source(&b, &[&topic], json!({"max_leading_decode_failures": 5}));
+    s.open(None).await.unwrap();
+    let (err, furthest) = stream_failure(spawn_stream(s), &topic).await;
+    match err {
+        SourceError::Config(m) => assert!(m.contains("does not look like"), "{m}"),
+        other => panic!("{other:?}"),
+    }
+    assert!(
+        furthest.is_none_or(|o| o == 0),
+        "checkpointed past: {furthest:?}"
+    );
+}
+
+#[tokio::test]
+async fn schema_registry_records_stop_the_sync() {
+    let Some(b) = brokers() else { return };
+    let topic = unique("avro");
+    create_topic(&b, &topic, 1).await;
+    let producer: FutureProducer = ClientConfig::new()
+        .set("bootstrap.servers", &b)
+        .create()
+        .unwrap();
+    let value: &[u8] = &[0, 0, 0, 0, 42, 6, 102, 111, 111];
+    producer
+        .send(
+            FutureRecord::<str, [u8]>::to(&topic)
+                .partition(0)
+                .key("1")
+                .payload(value),
+            Duration::from_secs(10),
+        )
+        .await
+        .map_err(|(e, _)| e)
+        .unwrap();
+    let mut s = source(&b, &[&topic], json!({}));
+    s.open(None).await.unwrap();
+    let (err, furthest) = stream_failure(spawn_stream(s), &topic).await;
+    match err {
+        SourceError::Config(m) => assert!(m.contains("Schema Registry"), "{m}"),
+        other => panic!("{other:?}"),
+    }
+    assert!(
+        furthest.is_none_or(|o| o == 0),
+        "checkpointed past: {furthest:?}"
+    );
 }
 
 #[tokio::test]
