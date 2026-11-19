@@ -439,6 +439,65 @@ async fn resume_from_checkpoint_and_patches() {
 }
 
 #[tokio::test]
+async fn mixed_id_types_get_distinct_ids_in_snapshot_and_stream() {
+    let Some(url) = url() else { return };
+    let c = client(&url).await;
+    let db = unique_db();
+    let a = c.database(&db).collection::<Document>("a");
+    let oid = mongodb::bson::oid::ObjectId::new();
+    a.insert_many([
+        doc! {"_id": 1, "t": "int"},
+        doc! {"_id": "1", "t": "string"},
+        doc! {"_id": oid, "t": "oid"},
+        doc! {"_id": oid.to_hex(), "t": "hex"},
+    ])
+    .await
+    .unwrap();
+    let name = format!("{db}.a");
+    let mut source = build(&url, json!({}), &[&name]);
+    source.open(None).await.unwrap();
+    let (tx, mut rx) = mpsc::channel(16);
+    source.snapshot(tx, CancellationToken::new()).await.unwrap();
+    let mut ids = std::collections::BTreeSet::new();
+    while let Some(SourceEvent::Change(ch)) = rx.recv().await {
+        ids.insert(meili_connect_core::document_id(&ch.key));
+    }
+    assert_eq!(ids.len(), 4, "{ids:?}");
+
+    // Deleting one of a colliding pair targets only its own id.
+    let w = a.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        w.delete_one(doc! {"_id": "1"}).await.unwrap();
+    });
+    let (tx2, mut rx2) = mpsc::channel(16);
+    let (_ack_tx, ack_rx) = ack_channel();
+    let cancel = CancellationToken::new();
+    let task_cancel = cancel.clone();
+    let handle = tokio::spawn(async move { source.stream(tx2, ack_rx, task_cancel).await });
+    let deleted = loop {
+        match tokio::time::timeout(Duration::from_secs(20), rx2.recv())
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            SourceEvent::Change(ch) if ch.op == Op::Delete => {
+                break meili_connect_core::document_id(&ch.key);
+            }
+            _ => {}
+        }
+    };
+    cancel.cancel();
+    handle.await.unwrap().unwrap();
+    assert!(ids.contains(&deleted));
+    assert_ne!(
+        deleted, "1",
+        "the string _id must not delete the integer one"
+    );
+    c.database(&db).drop().await.unwrap();
+}
+
+#[tokio::test]
 async fn drop_and_rename_truncate() {
     let Some(url) = url() else { return };
     let c = client(&url).await;

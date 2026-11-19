@@ -18,9 +18,10 @@ use mongodb::{Client, Database};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{FullDocumentMode, MongoConfig, Target, resolve_targets};
-use crate::convert::{bson_to_json, document_to_json};
+use crate::convert::document_to_json;
 use crate::error::{Scrubber, codes, error_code, map_error, map_resume_error};
 use crate::event::{Mapped, Namespaces, map_event};
+use crate::key::key_of;
 use crate::position::Position;
 
 /// Longest a `getMore` waits for new events; also the cancellation latency
@@ -618,7 +619,7 @@ impl Source for MongoSource {
                 })?;
                 let change = Change {
                     collection: t.name.clone(),
-                    key: vec![bson_to_json(id)],
+                    key: vec![key_of(id)],
                     op: Op::Upsert {
                         doc: document_to_json(&doc),
                     },
@@ -736,7 +737,7 @@ impl Source for MongoSource {
                     if let Some(doc) = found {
                         let change = Change {
                             collection,
-                            key: vec![bson_to_json(&id)],
+                            key: vec![key_of(&id)],
                             op: Op::Upsert {
                                 doc: document_to_json(&doc),
                             },
