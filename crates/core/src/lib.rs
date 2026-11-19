@@ -30,4 +30,6 @@ pub use spec::{
     FieldSelection, MeiliDestination, SourceKind, SourceSpec, StreamMapping, SyncSpec,
     VectorMapping,
 };
-pub use store::{DeadLetter, StateStore, SyncPhase, SyncState};
+pub use store::{
+    DeadLetter, DocumentKind, Progress, ResyncReason, StateStore, SyncPhase, SyncState, Usage,
+};

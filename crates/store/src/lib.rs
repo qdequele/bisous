@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{DateTime, NaiveDate, Utc};
-use meili_connect_core::{DeadLetter, SyncSpec};
+use meili_connect_core::{DeadLetter, SyncSpec, Usage};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -132,6 +132,9 @@ pub struct DailyProgress {
     /// [`DeadLetterLimits::max_per_sync`] (they are counted in `rejected`).
     #[serde(default)]
     pub dead_letters_dropped: u64,
+    /// The metered units of the day (`documents_streamed`, …).
+    #[serde(flatten)]
+    pub usage: Usage,
 }
 
 /// What one sync may keep in the dead-letter table.
@@ -361,8 +364,8 @@ pub(crate) fn to_i64(v: u64) -> i64 {
 pub(crate) mod test_support {
     use chrono::{DateTime, Utc};
     use meili_connect_core::{
-        Checkpoint, DeadLetter, MeiliDestination, Secret, SourceKind, SourceSpec, StreamMapping,
-        SyncPhase, SyncSpec, SyncState,
+        Checkpoint, DeadLetter, MeiliDestination, Progress, Secret, SourceKind, SourceSpec,
+        StreamMapping, SyncPhase, SyncSpec, SyncState, Usage,
     };
     use serde_json::json;
 
@@ -396,6 +399,31 @@ pub(crate) mod test_support {
         }
     }
 
+    /// Progress of a batch: counters only, no units.
+    pub fn pr(written: u64, deleted: u64, rejected: u64) -> Progress {
+        Progress {
+            written,
+            deleted,
+            rejected,
+            usage: Default::default(),
+        }
+    }
+
+    /// Progress carrying units.
+    pub fn units(streamed: u64, snapshot: u64, resync: u64, bytes: u64, seconds: u64) -> Progress {
+        Progress {
+            written: streamed + snapshot + resync,
+            usage: Usage {
+                documents_streamed: streamed,
+                documents_snapshot: snapshot,
+                documents_resync: resync,
+                bytes,
+                sync_seconds: seconds,
+            },
+            ..Progress::default()
+        }
+    }
+
     pub fn state(sync_id: &str) -> SyncState {
         SyncState {
             sync_id: sync_id.into(),
@@ -403,6 +431,7 @@ pub(crate) mod test_support {
             checkpoint: Some(Checkpoint(json!({ "lsn": "0/16B3748" }))),
             message: None,
             resyncing: false,
+            resync_reason: None,
             updated_at: now(),
         }
     }

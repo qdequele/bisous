@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{SecondsFormat, Utc};
-use meili_connect_core::{DeadLetter, StateStore, StoreError, SyncState};
+use meili_connect_core::{DeadLetter, Progress, StateStore, StoreError, SyncState};
 use meili_connect_store::{LabOutbox, RepoError};
 use serde_json::{Value, json};
 
@@ -223,17 +223,10 @@ impl StateStore for MeteredStore {
         self.inner.push_dead_letters(letters).await
     }
 
-    async fn record_progress(
-        &self,
-        sync_id: &str,
-        written: u64,
-        deleted: u64,
-        rejected: u64,
-    ) -> Result<(), StoreError> {
-        self.inner
-            .record_progress(sync_id, written, deleted, rejected)
-            .await?;
-        self.meter.add(sync_id, written.saturating_add(deleted));
+    async fn record_progress(&self, sync_id: &str, progress: &Progress) -> Result<(), StoreError> {
+        self.inner.record_progress(sync_id, progress).await?;
+        self.meter
+            .add(sync_id, progress.written.saturating_add(progress.deleted));
         Ok(())
     }
 }
@@ -251,10 +244,19 @@ mod tests {
         let meter = Arc::new(UsageMeter::new());
         meter.register("s1", Some("team-a"));
         let store = MeteredStore::new(mem.clone(), meter.clone());
-        store.record_progress("s1", 10, 5, 3).await.unwrap();
-        store.record_progress("s1", 1, 0, 0).await.unwrap();
+        let pr = |written, deleted, rejected| Progress {
+            written,
+            deleted,
+            rejected,
+            ..Progress::default()
+        };
+        store.record_progress("s1", &pr(10, 5, 3)).await.unwrap();
+        store.record_progress("s1", &pr(1, 0, 0)).await.unwrap();
         // Unregistered syncs are ignored: bounded by the registered set.
-        store.record_progress("other", 100, 0, 0).await.unwrap();
+        store
+            .record_progress("other", &pr(100, 0, 0))
+            .await
+            .unwrap();
         assert_eq!(meter.pending("s1"), 16);
         assert_eq!(meter.pending("other"), 0);
     }

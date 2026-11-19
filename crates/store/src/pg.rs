@@ -8,7 +8,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use chrono::{DateTime, NaiveDate, Utc};
 use meili_connect_core::{
-    Checkpoint, DeadLetter, Secret, StateStore, StoreError, SyncPhase, SyncSpec, SyncState,
+    Checkpoint, DeadLetter, Progress, ResyncReason, Secret, StateStore, StoreError, SyncPhase,
+    SyncSpec, SyncState, Usage,
 };
 use sqlx::Row;
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions, PgRow};
@@ -179,6 +180,36 @@ fn parse_phase(s: &str) -> Result<SyncPhase, StoreError> {
     })
 }
 
+fn reason_str(r: ResyncReason) -> &'static str {
+    match r {
+        ResyncReason::User => "user",
+        ResyncReason::System => "system",
+    }
+}
+
+/// An unknown value (a newer server wrote it) reads as `system`: never
+/// bill what cannot be told apart.
+fn parse_reason(s: Option<&str>) -> Option<ResyncReason> {
+    s.map(|s| match s {
+        "user" => ResyncReason::User,
+        _ => ResyncReason::System,
+    })
+}
+
+/// The usage columns of a `sync_progress` row.
+pub(crate) fn usage_of(r: &PgRow) -> Result<Usage, RepoError> {
+    let col = |name: &str| -> Result<u64, RepoError> {
+        Ok(to_u64(r.try_get::<i64, _>(name).map_err(from_sqlx)?))
+    };
+    Ok(Usage {
+        documents_streamed: col("documents_streamed")?,
+        documents_snapshot: col("documents_snapshot")?,
+        documents_resync: col("documents_resync")?,
+        bytes: col("bytes")?,
+        sync_seconds: col("sync_seconds")?,
+    })
+}
+
 fn store_err(e: sqlx::Error) -> StoreError {
     from_sqlx(e).into()
 }
@@ -187,7 +218,7 @@ fn store_err(e: sqlx::Error) -> StoreError {
 impl StateStore for PgStore {
     async fn load(&self, sync_id: &str) -> Result<Option<SyncState>, StoreError> {
         let row = sqlx::query(
-            "SELECT sync_id, phase, checkpoint, message, resyncing, updated_at
+            "SELECT sync_id, phase, checkpoint, message, resyncing, resync_reason, updated_at
              FROM sync_state WHERE sync_id = $1",
         )
         .bind(sync_id)
@@ -198,12 +229,14 @@ impl StateStore for PgStore {
         let phase: String = row.try_get("phase").map_err(store_err)?;
         let checkpoint: Option<Json<serde_json::Value>> =
             row.try_get("checkpoint").map_err(store_err)?;
+        let reason: Option<String> = row.try_get("resync_reason").map_err(store_err)?;
         Ok(Some(SyncState {
             sync_id: row.try_get("sync_id").map_err(store_err)?,
             phase: parse_phase(&phase)?,
             checkpoint: checkpoint.map(|Json(v)| Checkpoint(v)),
             message: row.try_get("message").map_err(store_err)?,
             resyncing: row.try_get("resyncing").map_err(store_err)?,
+            resync_reason: parse_reason(reason.as_deref()),
             updated_at: row.try_get("updated_at").map_err(store_err)?,
         }))
     }
@@ -211,13 +244,15 @@ impl StateStore for PgStore {
     async fn save(&self, state: &SyncState) -> Result<(), StoreError> {
         // One autocommitted statement: durable once it returns.
         sqlx::query(
-            "INSERT INTO sync_state (sync_id, phase, checkpoint, message, resyncing, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $6)
+            "INSERT INTO sync_state
+                (sync_id, phase, checkpoint, message, resyncing, resync_reason, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)
              ON CONFLICT (sync_id) DO UPDATE SET
                 phase = EXCLUDED.phase,
                 checkpoint = EXCLUDED.checkpoint,
                 message = EXCLUDED.message,
                 resyncing = EXCLUDED.resyncing,
+                resync_reason = EXCLUDED.resync_reason,
                 updated_at = EXCLUDED.updated_at",
         )
         .bind(&state.sync_id)
@@ -225,6 +260,7 @@ impl StateStore for PgStore {
         .bind(state.checkpoint.as_ref().map(|c| Json(&c.0)))
         .bind(state.message.as_deref())
         .bind(state.resyncing)
+        .bind(state.resync_reason.map(reason_str))
         .bind(state.updated_at)
         .execute(&self.pool)
         .await
@@ -298,26 +334,32 @@ impl StateStore for PgStore {
         Ok(())
     }
 
-    async fn record_progress(
-        &self,
-        sync_id: &str,
-        written: u64,
-        deleted: u64,
-        rejected: u64,
-    ) -> Result<(), StoreError> {
+    async fn record_progress(&self, sync_id: &str, p: &Progress) -> Result<(), StoreError> {
+        let u = &p.usage;
         sqlx::query(
-            "INSERT INTO sync_progress (sync_id, day, written, deleted, rejected)
-             VALUES ($1, $2, $3, $4, $5)
+            "INSERT INTO sync_progress (sync_id, day, written, deleted, rejected,
+                documents_streamed, documents_snapshot, documents_resync, bytes, sync_seconds)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
              ON CONFLICT (sync_id, day) DO UPDATE SET
                 written = sync_progress.written + EXCLUDED.written,
                 deleted = sync_progress.deleted + EXCLUDED.deleted,
-                rejected = sync_progress.rejected + EXCLUDED.rejected",
+                rejected = sync_progress.rejected + EXCLUDED.rejected,
+                documents_streamed = sync_progress.documents_streamed + EXCLUDED.documents_streamed,
+                documents_snapshot = sync_progress.documents_snapshot + EXCLUDED.documents_snapshot,
+                documents_resync = sync_progress.documents_resync + EXCLUDED.documents_resync,
+                bytes = sync_progress.bytes + EXCLUDED.bytes,
+                sync_seconds = sync_progress.sync_seconds + EXCLUDED.sync_seconds",
         )
         .bind(sync_id)
         .bind(Utc::now().date_naive())
-        .bind(to_i64(written))
-        .bind(to_i64(deleted))
-        .bind(to_i64(rejected))
+        .bind(to_i64(p.written))
+        .bind(to_i64(p.deleted))
+        .bind(to_i64(p.rejected))
+        .bind(to_i64(u.documents_streamed))
+        .bind(to_i64(u.documents_snapshot))
+        .bind(to_i64(u.documents_resync))
+        .bind(to_i64(u.bytes))
+        .bind(to_i64(u.sync_seconds))
         .execute(&self.pool)
         .await
         .map_err(store_err)?;
@@ -516,8 +558,9 @@ impl SyncRepository for PgStore {
     ) -> Result<Vec<DailyProgress>, RepoError> {
         self.ensure_owned(tenant, sync_id).await?;
         let rows = sqlx::query(
-            "SELECT day, written, deleted, rejected, dead_letters_dropped FROM sync_progress
-             WHERE sync_id = $1 AND day BETWEEN $2 AND $3 ORDER BY day",
+            "SELECT day, written, deleted, rejected, dead_letters_dropped, documents_streamed,
+                    documents_snapshot, documents_resync, bytes, sync_seconds
+             FROM sync_progress WHERE sync_id = $1 AND day BETWEEN $2 AND $3 ORDER BY day",
         )
         .bind(sync_id)
         .bind(from)
@@ -535,6 +578,7 @@ impl SyncRepository for PgStore {
                     dead_letters_dropped: to_u64(
                         r.try_get("dead_letters_dropped").map_err(from_sqlx)?,
                     ),
+                    usage: usage_of(r)?,
                 })
             })
             .collect()

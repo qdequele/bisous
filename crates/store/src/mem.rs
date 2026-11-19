@@ -13,7 +13,9 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{DateTime, NaiveDate, Utc};
-use meili_connect_core::{DeadLetter, StateStore, StoreError, SyncSpec, SyncState};
+use meili_connect_core::{
+    DeadLetter, Progress, StateStore, StoreError, SyncSpec, SyncState, Usage,
+};
 use uuid::Uuid;
 
 use crate::{
@@ -28,8 +30,8 @@ struct Inner {
     states: HashMap<String, SyncState>,
     dead_letters: BTreeMap<i64, DeadLetter>,
     next_dead_letter: i64,
-    /// written, deleted, rejected, dead letters dropped.
-    progress: BTreeMap<(String, NaiveDate), [u64; 4]>,
+    /// written, deleted, rejected, dead letters dropped; the units.
+    progress: BTreeMap<(String, NaiveDate), ([u64; 4], Usage)>,
     outbox: Vec<OutboxRow>,
     /// Test hook: rows reported as unreadable, like a Postgres row sealed
     /// with another key.
@@ -160,7 +162,7 @@ impl StateStore for MemStore {
                 .filter(|d| d.sync_id == letter.sync_id)
                 .count() as u64;
             if stored >= self.limits.max_per_sync {
-                let c = inner
+                let (c, _) = inner
                     .progress
                     .entry((letter.sync_id.clone(), day))
                     .or_default();
@@ -176,20 +178,15 @@ impl StateStore for MemStore {
         Ok(())
     }
 
-    async fn record_progress(
-        &self,
-        sync_id: &str,
-        written: u64,
-        deleted: u64,
-        rejected: u64,
-    ) -> Result<(), StoreError> {
+    async fn record_progress(&self, sync_id: &str, p: &Progress) -> Result<(), StoreError> {
         let day = Utc::now().date_naive();
         let mut inner = self.lock()?;
         self.check_sync(&inner, sync_id)?;
-        let c = inner.progress.entry((sync_id.to_owned(), day)).or_default();
-        c[0] = c[0].saturating_add(written);
-        c[1] = c[1].saturating_add(deleted);
-        c[2] = c[2].saturating_add(rejected);
+        let (c, usage) = inner.progress.entry((sync_id.to_owned(), day)).or_default();
+        c[0] = c[0].saturating_add(p.written);
+        c[1] = c[1].saturating_add(p.deleted);
+        c[2] = c[2].saturating_add(p.rejected);
+        usage.add(&p.usage);
         Ok(())
     }
 }
@@ -363,12 +360,13 @@ impl SyncRepository for MemStore {
         Ok(inner
             .progress
             .range((sync_id.to_owned(), from)..=(sync_id.to_owned(), to))
-            .map(|((_, day), c)| DailyProgress {
+            .map(|((_, day), (c, usage))| DailyProgress {
                 day: *day,
                 written: c[0],
                 deleted: c[1],
                 rejected: c[2],
                 dead_letters_dropped: c[3],
+                usage: *usage,
             })
             .collect())
     }
@@ -496,7 +494,7 @@ impl LabOutbox for MemStore {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::test_support::{invalid_specs, letter, skipped_letter, spec, state};
+    use crate::test_support::{invalid_specs, letter, pr, skipped_letter, spec, state};
 
     #[tokio::test]
     async fn state_round_trip() {
@@ -524,7 +522,7 @@ mod tests {
             Err(StoreError::NotFound(_))
         ));
         assert!(matches!(
-            store.record_progress("ghost", 1, 0, 0).await,
+            store.record_progress("ghost", &pr(1, 0, 0)).await,
             Err(StoreError::NotFound(_))
         ));
         store
@@ -546,7 +544,7 @@ mod tests {
                 .is_empty()
         );
         store.push_dead_letters(&[letter("s", "1")]).await.unwrap();
-        store.record_progress("s", 1, 0, 0).await.unwrap();
+        store.record_progress("s", &pr(1, 0, 0)).await.unwrap();
         store.save(&state("s")).await.unwrap();
 
         // The test helper accepts anything.
@@ -556,7 +554,7 @@ mod tests {
             .push_dead_letters(&[letter("ghost", "1")])
             .await
             .unwrap();
-        loose.record_progress("ghost", 1, 0, 0).await.unwrap();
+        loose.record_progress("ghost", &pr(1, 0, 0)).await.unwrap();
         assert!(loose.load("ghost").await.unwrap().is_some());
     }
 
@@ -685,7 +683,7 @@ mod tests {
         let letters: Vec<_> = (0..5).map(|i| letter("s", &i.to_string())).collect();
         store.push_dead_letters(&letters).await.unwrap();
         store.push_dead_letters(&[letter("o", "x")]).await.unwrap();
-        store.record_progress("s", 3, 1, 0).await.unwrap();
+        store.record_progress("s", &pr(3, 1, 0)).await.unwrap();
 
         let p1 = store
             .list_dead_letters(
@@ -744,8 +742,8 @@ mod tests {
             .create_sync(None, &spec("s", None, "n"))
             .await
             .unwrap();
-        store.record_progress("s", 3, 1, 0).await.unwrap();
-        store.record_progress("s", 2, 0, 4).await.unwrap();
+        store.record_progress("s", &pr(3, 1, 0)).await.unwrap();
+        store.record_progress("s", &pr(2, 0, 4)).await.unwrap();
         let today = Utc::now().date_naive();
         let p = store.progress(None, "s", today, today).await.unwrap();
         assert_eq!(
@@ -756,12 +754,46 @@ mod tests {
                 deleted: 1,
                 rejected: 4,
                 dead_letters_dropped: 0,
+                usage: Default::default(),
             }]
         );
         assert!(matches!(
             store.progress(Some("x"), "s", today, today).await,
             Err(RepoError::NotFound(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn units_add_up_per_day() {
+        let store = MemStore::new();
+        store
+            .create_sync(None, &spec("s", None, "n"))
+            .await
+            .unwrap();
+        store
+            .record_progress("s", &crate::test_support::units(2, 3, 4, 100, 7))
+            .await
+            .unwrap();
+        store
+            .record_progress("s", &crate::test_support::units(1, 0, 0, 10, 1))
+            .await
+            .unwrap();
+        let today = Utc::now().date_naive();
+        let p = store.progress(None, "s", today, today).await.unwrap();
+        assert_eq!(
+            p[0].usage,
+            Usage {
+                documents_streamed: 3,
+                documents_snapshot: 3,
+                documents_resync: 4,
+                bytes: 110,
+                sync_seconds: 8,
+            }
+        );
+        // The API shape: units flattened next to the counters.
+        let json = serde_json::to_value(&p[0]).unwrap();
+        assert_eq!(json["documents_streamed"], 3);
+        assert_eq!(json["sync_seconds"], 8);
     }
 
     #[tokio::test]

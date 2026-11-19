@@ -32,6 +32,8 @@ use crate::{Wiring, boot_syncs, build_state, router};
 const LAB: &str = "lab-token";
 const ADMIN: &str = "admin-key";
 const SECRET_MARK: &str = "hunter2";
+/// Bytes the fake sink reports per accepted document.
+const FAKE_BYTES_PER_DOC: u64 = 100;
 
 // ------------------------------------------------------------- fakes
 
@@ -211,6 +213,7 @@ impl Sink for FakeSink {
         Ok(ApplyReport {
             written: ops.len() as u64 - deleted,
             deleted,
+            bytes: ops.len() as u64 * FAKE_BYTES_PER_DOC,
             rejected: vec![],
         })
     }
@@ -1749,6 +1752,11 @@ async fn pause_resume_status_and_release() {
     assert_eq!(st["running"], true);
     assert_eq!(st["has_checkpoint"], true);
     assert_eq!(st["progress"]["written"], 3);
+    // The metered units: a first sync is a snapshot.
+    assert_eq!(st["documents"]["snapshot"], 3);
+    assert_eq!(st["documents"]["streamed"], 0);
+    assert_eq!(st["documents"]["resync"], 0);
+    assert_eq!(st["bytes"], 3 * FAKE_BYTES_PER_DOC);
 
     let (_, st) = call(&a.router, "POST", &format!("/syncs/{id}/pause"), &[], None).await;
     assert_eq!(

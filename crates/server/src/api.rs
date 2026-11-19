@@ -428,11 +428,13 @@ async fn status_json(state: &AppState, scope: &Scope, id: &str) -> ApiResult<Val
         .progress(scope.tenant(), id, first_day, today)
         .await?;
     let (mut written, mut deleted, mut rejected, mut dropped) = (0u64, 0u64, 0u64, 0u64);
+    let mut units = meili_connect_core::Usage::default();
     for d in &days {
         written = written.saturating_add(d.written);
         deleted = deleted.saturating_add(d.deleted);
         rejected = rejected.saturating_add(d.rejected);
         dropped = dropped.saturating_add(d.dead_letters_dropped);
+        units.add(&d.usage);
     }
     let phase = saved.as_ref().map_or(SyncPhase::Pending, |s| s.phase);
     Ok(json!({
@@ -446,6 +448,14 @@ async fn status_json(state: &AppState, scope: &Scope, id: &str) -> ApiResult<Val
         "consecutive_failures": live.as_ref().map_or(0, |s| s.consecutive_failures),
         "last_error": live.as_ref().and_then(|s| s.last_error.clone()),
         "progress": { "written": written, "deleted": deleted, "rejected": rejected },
+        // The metered units since the sync was created.
+        "documents": {
+            "streamed": units.documents_streamed,
+            "snapshot": units.documents_snapshot,
+            "resync": units.documents_resync,
+        },
+        "bytes": units.bytes,
+        "sync_seconds": units.sync_seconds,
         // Rejected documents not kept as dead letters: the sync reached
         // DEAD_LETTERS_MAX_PER_SYNC. Clear the dead letters to keep more.
         "dead_letters_overflow": dropped,

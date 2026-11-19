@@ -219,7 +219,14 @@ impl Chunk {
 #[derive(Default)]
 struct RunTally {
     ok: u64,
+    /// Wire bytes of the accepted lines, one separator each.
+    ok_bytes: u64,
     rejected: Vec<(usize, String)>,
+}
+
+/// Wire bytes of some lines, one separator (newline or comma) each.
+fn wire_bytes(lines: &[Vec<u8>]) -> u64 {
+    lines.iter().map(|l| l.len() as u64 + 1).sum()
 }
 
 /// Deepest JSON nesting Meilisearch accepts in a document, the top-level
@@ -339,6 +346,7 @@ impl MeiliSink {
             Kind::Delete => report.deleted += tally.ok,
             _ => report.written += tally.ok,
         }
+        report.bytes += tally.ok_bytes;
         if !tally.rejected.is_empty() {
             tracing::warn!(
                 index = %target.uid,
@@ -373,7 +381,10 @@ impl MeiliSink {
         let mut stack = vec![(0usize, chunk.lines.len())];
         while let Some((a, b)) = stack.pop() {
             match self.write_once(target, kind, &chunk.lines[a..b]).await? {
-                WriteOutcome::Written => tally.ok += (b - a) as u64,
+                WriteOutcome::Written => {
+                    tally.ok += (b - a) as u64;
+                    tally.ok_bytes += wire_bytes(&chunk.lines[a..b]);
+                }
                 WriteOutcome::Refused { reason, suspect } => {
                     if b - a == 1 {
                         let i = chunk.idx[a];
@@ -385,7 +396,10 @@ impl MeiliSink {
                             _ => Settled::Rejected(reason),
                         };
                         match settled {
-                            Settled::Written => tally.ok += 1,
+                            Settled::Written => {
+                                tally.ok += 1;
+                                tally.ok_bytes += wire_bytes(&chunk.lines[a..b]);
+                            }
                             Settled::Rejected(reason) => tally.rejected.push((i, reason)),
                         }
                     } else {

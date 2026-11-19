@@ -7,7 +7,10 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use chrono::Utc;
-use meili_connect_core::{Checkpoint, SinkError, StoreError, SyncPhase, SyncSpec, SyncState};
+use meili_connect_core::{
+    Checkpoint, Progress, ResyncReason, SinkError, StoreError, SyncPhase, SyncSpec, SyncState,
+    Usage,
+};
 use thiserror::Error;
 use tokio::sync::OwnedMutexGuard;
 use tokio::task::JoinHandle;
@@ -39,6 +42,9 @@ pub struct SupervisorConfig {
     /// checkpoint does not move (the same batch keeps failing) before the
     /// sync is held with the sink's message. `0` disables the bound.
     pub max_sink_transient_failures: u32,
+    /// How often the time a sync spends in `snapshotting` or `streaming`
+    /// is recorded (`sync_seconds`); the rest is recorded when a run ends.
+    pub seconds_interval: Duration,
 }
 
 impl Default for SupervisorConfig {
@@ -51,6 +57,7 @@ impl Default for SupervisorConfig {
             paused_retry: Duration::from_secs(60),
             max_consecutive_resyncs: 3,
             max_sink_transient_failures: 10,
+            seconds_interval: Duration::from_secs(15),
         }
     }
 }
@@ -104,6 +111,29 @@ struct Entry {
 struct Launch {
     resync: bool,
     release_hold: bool,
+}
+
+/// Records the whole seconds a sync spent in `snapshotting` or
+/// `streaming` since the last call.
+async fn record_seconds(
+    store: &dyn meili_connect_core::StateStore,
+    sync_id: &str,
+    monitor: &RunMonitor,
+) {
+    let seconds = monitor.take_active_seconds();
+    if seconds == 0 {
+        return;
+    }
+    let progress = Progress {
+        usage: Usage {
+            sync_seconds: seconds,
+            ..Usage::default()
+        },
+        ..Progress::default()
+    };
+    if let Err(e) = store.record_progress(sync_id, &progress).await {
+        warn!(sync_id, error = %e, seconds, "could not record the sync time");
+    }
 }
 
 pub struct Supervisor {
@@ -354,6 +384,7 @@ async fn persist_phase(
         checkpoint: None,
         message: None,
         resyncing: false,
+        resync_reason: None,
         updated_at: Utc::now(),
     });
     state.phase = phase;
@@ -386,6 +417,8 @@ async fn supervise(
     let sync_id = spec.id.clone();
     let mut options = config.sync.clone();
     options.resync = launch.resync;
+    // A resync launched from outside is the user's.
+    options.resync_reason = ResyncReason::User;
     options.release_hold = launch.release_hold;
     let mut failures: u32 = 0;
     // Shared by every attempt, so the resync budget spans them.
@@ -398,14 +431,27 @@ async fn supervise(
             break;
         }
         let started = Instant::now();
-        let result = run_sync_monitored(
-            spec.clone(),
-            deps.clone(),
-            options.clone(),
-            cancel.child_token(),
-            &monitor,
-        )
-        .await;
+        let result = {
+            let run = run_sync_monitored(
+                spec.clone(),
+                deps.clone(),
+                options.clone(),
+                cancel.child_token(),
+                &monitor,
+            );
+            tokio::pin!(run);
+            let mut tick = tokio::time::interval_at(
+                Instant::now() + config.seconds_interval,
+                config.seconds_interval.max(Duration::from_millis(10)),
+            );
+            loop {
+                tokio::select! {
+                    r = &mut run => break r,
+                    _ = tick.tick() => record_seconds(&*deps.store, &sync_id, &monitor).await,
+                }
+            }
+        };
+        record_seconds(&*deps.store, &sync_id, &monitor).await;
         // One-shot requests stay set until a run actually consumed them:
         // a run that failed early retries them.
         if monitor.take_resync_consumed() {
@@ -468,6 +514,7 @@ async fn supervise(
             Reaction::Resync => {
                 warn!(%sync_id, error = %message, "position lost again, resyncing");
                 options.resync = true;
+                options.resync_reason = ResyncReason::System;
                 backoff_delay(failures, config.backoff_initial, config.backoff_max)
             }
             Reaction::SourcePaused => {

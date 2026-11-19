@@ -69,6 +69,25 @@ Rules the engine enforces:
   `copy_settings(live → shadow)` happens before the snapshot,
   `swap(live, shadow)` after, then `delete_index(shadow)`.
 
+## Metering
+
+The units of `docs/LAB_INTEGRATION.md` ("Pricing") are measured in the
+engine and recorded with each batch's progress (`core::Progress`, carrying a
+`core::Usage`):
+
+- `documents_streamed` / `documents_snapshot` / `documents_resync`: the
+  documents Meilisearch accepted (`ApplyReport.written + deleted`, never the
+  rejected or skipped ones), by why they were written: the change stream, a
+  first sync or a resync the user asked for, a resync the engine started
+  after `PositionLost`. Why a resync runs is persisted with it
+  (`SyncState::resync_reason`), so a crash in the middle of it does not
+  change how the rest is metered.
+- `bytes`: `ApplyReport.bytes`, the uncompressed wire form of each accepted
+  document plus a separator, counted once whatever the retries.
+- `sync_seconds`: time in `snapshotting` or `streaming`, accumulated by the
+  run monitor and recorded by the supervisor every `seconds_interval` and at
+  the end of each run. A paused or held sync accrues nothing.
+
 ## Sources
 
 | Kind | Mechanism | Checkpoint | Snapshot |

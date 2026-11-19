@@ -356,6 +356,7 @@ impl SyncManager {
                     checkpoint: None,
                     message: None,
                     resyncing: false,
+                    resync_reason: None,
                     updated_at: Utc::now(),
                 })
                 .await?;
@@ -639,6 +640,7 @@ async fn persist_phase(
         checkpoint: None,
         message: None,
         resyncing: false,
+        resync_reason: None,
         updated_at: Utc::now(),
     });
     state.phase = phase;

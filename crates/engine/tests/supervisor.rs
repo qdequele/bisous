@@ -458,3 +458,33 @@ async fn a_resync_survives_a_run_that_failed_before_starting_it() {
     );
     s.shutdown().await;
 }
+
+#[tokio::test]
+async fn time_in_streaming_is_metered_and_a_held_sync_costs_nothing() {
+    let h = Harness::new();
+    seed_rows_sup(&h);
+    let config = SupervisorConfig {
+        sync: options(),
+        seconds_interval: Duration::from_millis(50),
+        ..SupervisorConfig::default()
+    };
+    let s = Supervisor::new(h.deps(), config, CancellationToken::new());
+    s.start(spec()).await.expect("start");
+    wait_status(&s, "streaming", streaming).await;
+    let seconds = || {
+        h.store
+            .inner()
+            .usage
+            .get(SYNC_ID)
+            .map_or(0, |u| u.sync_seconds)
+    };
+    wait_for("a second metered", 5, || seconds() >= 1).await;
+    s.stop(SYNC_ID).await.expect("stop");
+    let at_stop = seconds();
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    assert_eq!(seconds(), at_stop, "a stopped sync accrues nothing");
+}
+
+fn seed_rows_sup(h: &Harness) {
+    h.origin.seed(vec![upsert(1, json!({}))]);
+}

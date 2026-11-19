@@ -11,9 +11,9 @@ use async_trait::async_trait;
 use meili_connect_core::{
     AckReceiver, ApplyReport, Capabilities, Change, CheckReport, Checkpoint, CollectionInfo,
     DeadLetter, DocOp, Document, EventSender, FieldSelection, IndexTarget, MeiliDestination, Op,
-    Opened, RejectedDoc, Secret, Sink, SinkError, Source, SourceError, SourceEvent, SourceFactory,
-    SourceKind, SourceSpec, StateStore, StoreError, StreamMapping, SyncPhase, SyncSpec, SyncState,
-    document_id,
+    Opened, Progress, RejectedDoc, ResyncReason, Secret, Sink, SinkError, Source, SourceError,
+    SourceEvent, SourceFactory, SourceKind, SourceSpec, StateStore, StoreError, StreamMapping,
+    SyncPhase, SyncSpec, SyncState, Usage, document_id,
 };
 use meili_connect_engine::{SyncDeps, SyncOptions};
 use serde_json::{Value, json};
@@ -23,6 +23,8 @@ use tokio_util::sync::CancellationToken;
 pub const COLLECTION: &str = "public.products";
 pub const INDEX: &str = "products";
 pub const SYNC_ID: &str = "0123456789abcdef";
+/// Bytes the fake sink reports per accepted document.
+pub const BYTES_PER_DOC: u64 = 10;
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
@@ -582,6 +584,7 @@ impl Sink for FakeSink {
                     doc.insert(target.primary_key.clone(), Value::String(id.clone()));
                     index.docs.insert(id, doc);
                     report.written += 1;
+                    report.bytes += BYTES_PER_DOC;
                 }
                 DocOp::Merge { id, doc, unset } => {
                     let entry = index.docs.entry(id.clone()).or_default();
@@ -591,10 +594,12 @@ impl Sink for FakeSink {
                     }
                     entry.insert(target.primary_key.clone(), Value::String(id));
                     report.written += 1;
+                    report.bytes += BYTES_PER_DOC;
                 }
                 DocOp::Delete { id } => {
                     index.docs.remove(&id);
                     report.deleted += 1;
+                    report.bytes += BYTES_PER_DOC;
                 }
             }
         }
@@ -655,6 +660,8 @@ pub struct StoreState {
     pub history: Vec<SyncState>,
     pub dead: Vec<DeadLetter>,
     pub progress: HashMap<String, (u64, u64, u64)>,
+    /// Metered units per sync.
+    pub usage: HashMap<String, Usage>,
     /// The next save matching this fails once with a transient error.
     pub fail_once: Option<SavePredicate>,
 }
@@ -708,18 +715,13 @@ impl StateStore for MemStore {
         Ok(())
     }
 
-    async fn record_progress(
-        &self,
-        sync_id: &str,
-        written: u64,
-        deleted: u64,
-        rejected: u64,
-    ) -> Result<(), StoreError> {
+    async fn record_progress(&self, sync_id: &str, p: &Progress) -> Result<(), StoreError> {
         let mut st = self.inner();
         let entry = st.progress.entry(sync_id.into()).or_default();
-        entry.0 += written;
-        entry.1 += deleted;
-        entry.2 += rejected;
+        entry.0 += p.written;
+        entry.1 += p.deleted;
+        entry.2 += p.rejected;
+        st.usage.entry(sync_id.into()).or_default().add(&p.usage);
         Ok(())
     }
 }
@@ -794,6 +796,7 @@ pub fn options() -> SyncOptions {
         shutdown_grace: Duration::from_secs(2),
         release_hold: false,
         resync: false,
+        resync_reason: ResyncReason::User,
     }
 }
 

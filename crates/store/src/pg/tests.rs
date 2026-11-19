@@ -9,7 +9,7 @@ use std::sync::Arc;
 use sqlx::Connection;
 
 use super::*;
-use crate::test_support::{invalid_specs, letter, skipped_letter, spec, state};
+use crate::test_support::{invalid_specs, letter, pr, skipped_letter, spec, state};
 
 async fn store_with_key(key: SecretKey) -> Option<PgStore> {
     store_with(key, &[]).await
@@ -76,7 +76,49 @@ async fn state_round_trip() {
     st.checkpoint = None;
     st.resyncing = true;
     store.save(&st).await.unwrap();
-    assert_eq!(store.load("s1").await.unwrap(), Some(st));
+    assert_eq!(store.load("s1").await.unwrap(), Some(st.clone()));
+    // The resync's reason survives a restart.
+    for reason in [ResyncReason::System, ResyncReason::User] {
+        st.resync_reason = Some(reason);
+        store.save(&st).await.unwrap();
+        assert_eq!(store.load("s1").await.unwrap(), Some(st.clone()));
+    }
+    // A row written before the column existed reads as no reason.
+    sqlx::query("UPDATE sync_state SET resync_reason = NULL")
+        .execute(store.pool())
+        .await
+        .unwrap();
+    assert_eq!(store.load("s1").await.unwrap().unwrap().resync_reason, None);
+}
+
+#[tokio::test]
+async fn units_add_up_per_day() {
+    let Some(store) = store().await else { return };
+    store
+        .create_sync(None, &spec("s", None, "a"))
+        .await
+        .unwrap();
+    store
+        .record_progress("s", &crate::test_support::units(2, 3, 4, 100, 7))
+        .await
+        .unwrap();
+    store
+        .record_progress("s", &crate::test_support::units(1, 0, 0, 10, 1))
+        .await
+        .unwrap();
+    let today = Utc::now().date_naive();
+    let p = store.progress(None, "s", today, today).await.unwrap();
+    assert_eq!(
+        p[0].usage,
+        Usage {
+            documents_streamed: 3,
+            documents_snapshot: 3,
+            documents_resync: 4,
+            bytes: 110,
+            sync_seconds: 8,
+        }
+    );
+    assert_eq!(p[0].written, 10);
 }
 
 #[tokio::test]
@@ -226,7 +268,7 @@ async fn tenant_isolation_on_every_method() {
 
     // dead letters, progress, delete
     store.push_dead_letters(&[letter("a1", "1")]).await.unwrap();
-    store.record_progress("a1", 1, 0, 1).await.unwrap();
+    store.record_progress("a1", &pr(1, 0, 1)).await.unwrap();
     let today = Utc::now().date_naive();
     let page = DeadLetterPage::default();
     for t in [Some("tb"), None] {
@@ -291,8 +333,8 @@ async fn delete_cascades() {
         .push_dead_letters(&[letter("s", "1"), letter("s", "2"), letter("o", "3")])
         .await
         .unwrap();
-    store.record_progress("s", 1, 1, 1).await.unwrap();
-    store.record_progress("o", 1, 1, 1).await.unwrap();
+    store.record_progress("s", &pr(1, 1, 1)).await.unwrap();
+    store.record_progress("o", &pr(1, 1, 1)).await.unwrap();
 
     store.delete_sync(None, "s").await.unwrap();
     for table in ["sync_state", "dead_letters", "sync_progress"] {
@@ -400,7 +442,7 @@ async fn progress_is_additive() {
     for _ in 0..20 {
         let store = store.clone();
         tasks.push(tokio::spawn(async move {
-            store.record_progress("s", 3, 2, 1).await.unwrap();
+            store.record_progress("s", &pr(3, 2, 1)).await.unwrap();
         }));
     }
     for t in tasks {
@@ -426,6 +468,7 @@ async fn progress_is_additive() {
                 deleted: 0,
                 rejected: 0,
                 dead_letters_dropped: 0,
+                usage: Default::default(),
             },
             DailyProgress {
                 day: today,
@@ -433,6 +476,7 @@ async fn progress_is_additive() {
                 deleted: 40,
                 rejected: 20,
                 dead_letters_dropped: 0,
+                usage: Default::default(),
             }
         ]
     );
@@ -828,7 +872,7 @@ async fn invalid_specs_are_refused() {
 async fn unknown_syncs_are_not_found() {
     let Some(store) = store().await else { return };
     assert!(matches!(
-        store.record_progress("ghost", 1, 0, 0).await,
+        store.record_progress("ghost", &pr(1, 0, 0)).await,
         Err(StoreError::NotFound(_))
     ));
 }
