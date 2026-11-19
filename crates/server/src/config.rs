@@ -72,6 +72,14 @@ pub struct Config {
     pub host_policy: HostPolicy,
     /// Quotas and bounds.
     pub limits: Limits,
+    /// Lab mode: how often the teams' credits are checked
+    /// (`CREDITS_CHECK_INTERVAL_SECS`).
+    pub credits_check_interval: Duration,
+    /// How long a credits answer is reused (`CREDITS_CACHE_FRESH_SECS`,
+    /// 30 s) and kept quiet when the Lab cannot answer
+    /// (`CREDITS_CACHE_STALE_SECS`, 300 s).
+    pub credits_fresh: Duration,
+    pub credits_stale: Duration,
 }
 
 impl Config {
@@ -176,6 +184,13 @@ impl Config {
         }
 
         let shutdown_grace = secs(&get, "SHUTDOWN_GRACE_SECS", 30, 1, 600)?;
+        let credits_fresh = secs(&get, "CREDITS_CACHE_FRESH_SECS", 30, 1, 3600)?;
+        let credits_stale = secs(&get, "CREDITS_CACHE_STALE_SECS", 300, 1, 86_400)?;
+        if credits_stale < credits_fresh {
+            return Err(ConfigError(
+                "CREDITS_CACHE_STALE_SECS must be at least CREDITS_CACHE_FRESH_SECS".into(),
+            ));
+        }
         Ok(Self {
             listen_addr,
             database_url,
@@ -191,6 +206,9 @@ impl Config {
             lab_send_interval: secs(&get, "LAB_SEND_INTERVAL_SECS", 2, 1, 300)?,
             source_probe_timeout: secs(&get, "SOURCE_PROBE_TIMEOUT_SECS", 30, 1, 600)?,
             shutdown_grace,
+            credits_check_interval: secs(&get, "CREDITS_CHECK_INTERVAL_SECS", 15, 1, 3600)?,
+            credits_fresh,
+            credits_stale,
             limits: Limits {
                 stop_grace: shutdown_grace,
                 max_syncs_per_tenant: num(&get, "MAX_SYNCS_PER_TENANT", 20, 1, 1_000_000)?,

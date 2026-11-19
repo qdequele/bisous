@@ -279,19 +279,34 @@ fn app_build(
     limits: Limits,
     probe_timeout: Duration,
 ) -> App {
+    app_tweaked(auth, store, policy, limits, probe_timeout, |_| {})
+}
+
+/// [`app_build`], with a last say on the wiring.
+fn app_tweaked(
+    auth: AuthConfig,
+    store: Arc<MemStore>,
+    policy: HostPolicy,
+    limits: Limits,
+    probe_timeout: Duration,
+    tweak: impl FnOnce(&mut Wiring),
+) -> App {
     let probe = Arc::new(Probe::default());
+    let mut wiring = Wiring {
+        sources: Arc::new(FakeSources(Arc::clone(&probe))),
+        sinks: fake_sinks(),
+        policy: Arc::new(policy),
+        supervisor: SupervisorConfig::default(),
+        auth,
+        probe_timeout,
+        lab_events: true,
+        credits: None,
+        limits,
+    };
+    tweak(&mut wiring);
     let state = build_state(
         Arc::clone(&store) as Arc<dyn Backend>,
-        Wiring {
-            sources: Arc::new(FakeSources(Arc::clone(&probe))),
-            sinks: fake_sinks(),
-            policy: Arc::new(policy),
-            supervisor: SupervisorConfig::default(),
-            auth,
-            probe_timeout,
-            lab_events: true,
-            limits,
-        },
+        wiring,
         CancellationToken::new(),
     );
     App {
@@ -1012,6 +1027,7 @@ async fn a_loopback_destination_is_host_not_allowed_with_the_real_sinks() {
             auth: AuthConfig::open(),
             probe_timeout: Duration::from_millis(200),
             lab_events: false,
+            credits: None,
             limits: Limits::default(),
         },
         CancellationToken::new(),
@@ -1908,6 +1924,42 @@ async fn boot_starts_every_sync_but_the_paused_ones() {
     assert_eq!(st["phase"], "paused");
 }
 
+#[tokio::test]
+async fn boot_keeps_a_sync_held_for_credits_until_they_are_back() {
+    let store = Arc::new(MemStore::new());
+    let first = app_with(locked(), Arc::clone(&store));
+    let id = create(&first, &lab(TEAM), "s").await;
+    first.state.manager.shutdown(Duration::from_secs(5)).await;
+    let mut state = store.load(&id).await.unwrap().unwrap();
+    state.phase = SyncPhase::Held;
+    state.message = Some("out_of_credits".into());
+    store.save(&state).await.unwrap();
+
+    let lab_server = wiremock::MockServer::start().await;
+    lab_answers(&lab_server, true).await;
+    let second = app_tweaked(
+        locked(),
+        store,
+        HostPolicy::any(),
+        Limits::default(),
+        Duration::from_millis(200),
+        |w| {
+            w.credits = Some(Arc::new(
+                crate::credits::CreditCache::new(crate::config::LabEventsConfig {
+                    url: lab_server.uri(),
+                    instance_id: "inst".into(),
+                    instance_secret: "secret".into(),
+                })
+                .unwrap(),
+            ))
+        },
+    );
+    assert_eq!(boot_syncs(&second.state).await.unwrap(), 0);
+    assert!(second.state.manager.is_credit_held(&id));
+    second.state.manager.enforce_credits().await;
+    wait_for(async || status_of(&second, &id).await["phase"] == "streaming").await;
+}
+
 // ------------------------------------------------------------- usage
 
 #[tokio::test]
@@ -2122,4 +2174,152 @@ async fn phase_names_match_the_spec() {
         })
         .collect();
     assert_eq!(documented, actual);
+}
+
+// ------------------------------------------------------------- credits
+
+const TEAM: &str = "11111111-2222-3333-4444-555555555555";
+
+/// The fake Lab answers the account lookup with `can_spend`.
+async fn lab_answers(server: &wiremock::MockServer, can_spend: bool) {
+    use wiremock::matchers::{method, path};
+    server.reset().await;
+    wiremock::Mock::given(method("GET"))
+        .and(path(format!("/internal/accounts/{TEAM}")))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(json!({"active": true, "can_spend": can_spend})),
+        )
+        .mount(server)
+        .await;
+}
+
+fn app_with_credits(server: &wiremock::MockServer) -> App {
+    let credits = crate::credits::CreditCache::new(crate::config::LabEventsConfig {
+        url: server.uri(),
+        instance_id: "inst".into(),
+        instance_secret: "secret".into(),
+    })
+    .unwrap()
+    // Always ask: the test flips the answer.
+    .with_windows(Duration::ZERO, Duration::from_secs(300));
+    app_tweaked(
+        locked(),
+        Arc::new(MemStore::new()),
+        HostPolicy::any(),
+        Limits::default(),
+        Duration::from_millis(200),
+        |w| w.credits = Some(Arc::new(credits)),
+    )
+}
+
+async fn status_of(a: &App, id: &str) -> Value {
+    call(
+        &a.router,
+        "GET",
+        &format!("/syncs/{id}/status"),
+        &lab(TEAM),
+        None,
+    )
+    .await
+    .1
+}
+
+#[tokio::test]
+async fn a_team_out_of_credits_is_held_and_resumes_with_its_credits() {
+    let lab_server = wiremock::MockServer::start().await;
+    lab_answers(&lab_server, true).await;
+    let a = app_with_credits(&lab_server);
+    let id = create(&a, &lab(TEAM), "s").await;
+    wait_for(async || status_of(&a, &id).await["phase"] == "streaming").await;
+    let other_team = create(&a, &lab("team-b"), "other").await;
+
+    // The Lab says the team cannot spend: its running syncs are held,
+    // nothing torn down; another team is untouched.
+    lab_answers(&lab_server, false).await;
+    a.state.manager.enforce_credits().await;
+    let st = status_of(&a, &id).await;
+    assert_eq!(
+        (
+            st["phase"].as_str(),
+            st["message"].as_str(),
+            st["running"].as_bool()
+        ),
+        (Some("held"), Some("out_of_credits"), Some(false)),
+        "{st}"
+    );
+    assert_eq!(a.probe.teardowns.load(Ordering::SeqCst), 0);
+    let (_, other) = call(
+        &a.router,
+        "GET",
+        &format!("/syncs/{other_team}/status"),
+        &lab("team-b"),
+        None,
+    )
+    .await;
+    assert_eq!(other["running"], true);
+
+    // Releasing, resuming or resyncing it is refused with a clear code.
+    for action in ["release", "resume", "resync"] {
+        let (status, body) = call(
+            &a.router,
+            "POST",
+            &format!("/syncs/{id}/{action}"),
+            &lab(TEAM),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::PAYMENT_REQUIRED, "{action}: {body}");
+        assert_eq!(body["code"], "out_of_credits");
+    }
+    // A new sync can be created; it starts held.
+    let new = create(&a, &lab(TEAM), "new").await;
+    let st = status_of(&a, &new).await;
+    assert_eq!(
+        (st["phase"].as_str(), st["message"].as_str()),
+        (Some("held"), Some("out_of_credits"))
+    );
+
+    // Credits are back: both resume by themselves.
+    lab_answers(&lab_server, true).await;
+    a.state.manager.enforce_credits().await;
+    for sync in [&id, &new] {
+        wait_for(async || status_of(&a, sync).await["phase"] == "streaming").await;
+        let st = status_of(&a, sync).await;
+        assert_eq!(st["running"], true);
+        assert!(st["message"].is_null(), "{st}");
+    }
+}
+
+#[tokio::test]
+async fn a_paused_sync_stays_paused_through_a_credit_hold() {
+    let lab_server = wiremock::MockServer::start().await;
+    lab_answers(&lab_server, true).await;
+    let a = app_with_credits(&lab_server);
+    let id = create(&a, &lab(TEAM), "s").await;
+    wait_for(async || status_of(&a, &id).await["phase"] == "streaming").await;
+    lab_answers(&lab_server, false).await;
+    a.state.manager.enforce_credits().await;
+    assert!(a.state.manager.is_credit_held(&id));
+    let (status, _) = call(
+        &a.router,
+        "POST",
+        &format!("/syncs/{id}/pause"),
+        &lab(TEAM),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    lab_answers(&lab_server, true).await;
+    a.state.manager.enforce_credits().await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(status_of(&a, &id).await["phase"], "paused");
+}
+
+#[tokio::test]
+async fn without_the_lab_credits_are_never_checked() {
+    let a = app(locked());
+    let id = create(&a, &lab(TEAM), "s").await;
+    a.state.manager.enforce_credits().await;
+    wait_for(async || status_of(&a, &id).await["phase"] == "streaming").await;
 }

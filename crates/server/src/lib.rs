@@ -6,6 +6,7 @@
 pub mod api;
 pub mod auth;
 pub mod config;
+pub mod credits;
 pub mod error;
 pub mod guard;
 pub mod lab;
@@ -32,6 +33,7 @@ use tracing::{error, info, warn};
 
 use crate::auth::AuthConfig;
 use crate::config::{Config, LogFormat};
+use crate::credits::CreditCache;
 use crate::limits::{Limits, ProbeSlots};
 use crate::manager::{ManagerDeps, SinkFactory, SyncManager, meili_sinks};
 use crate::registry::SourceRegistry;
@@ -79,6 +81,8 @@ pub struct Wiring {
     pub probe_timeout: std::time::Duration,
     pub lab_events: bool,
     pub limits: Limits,
+    /// Lab mode: hold the syncs of a team out of credits.
+    pub credits: Option<Arc<CreditCache>>,
 }
 
 /// Assemble the shared state around a backend. The engine gets the
@@ -108,6 +112,7 @@ pub fn build_state(
         usage,
         max_syncs_per_tenant: wiring.limits.max_syncs_per_tenant,
         stop_grace: wiring.limits.stop_grace,
+        credits: wiring.credits,
         cancel,
     }));
     AppState {
@@ -138,15 +143,21 @@ pub async fn boot_syncs(state: &AppState) -> Result<usize, meili_connect_store::
                 continue;
             }
         };
-        let phase = match state.state_store().load(&spec.id).await {
-            Ok(s) => s.map(|s| s.phase),
+        let saved = match state.state_store().load(&spec.id).await {
+            Ok(s) => s,
             Err(e) => {
                 warn!(sync_id = %spec.id, error = %e, "cannot read the sync state; starting it");
                 None
             }
         };
-        if phase == Some(SyncPhase::Paused) {
-            state.manager.register_idle(&spec);
+        let phase = saved.as_ref().map(|s| s.phase);
+        let credit_hold = saved.as_ref().is_some_and(|s| {
+            s.phase == SyncPhase::Held
+                && s.message.as_deref() == Some(crate::credits::OUT_OF_CREDITS)
+        });
+        if phase == Some(SyncPhase::Paused) || credit_hold {
+            // A sync held for credits resumes by itself with them.
+            state.manager.register_idle(&spec, saved.as_ref());
             continue;
         }
         let id = spec.id.clone();
@@ -249,6 +260,15 @@ pub async fn run() -> Result<(), String> {
     }
     info!(host_policy = policy.mode_name(), "host policy");
 
+    // Lab mode: a team out of credits has its syncs held.
+    let credits = match &config.lab_events {
+        Some(lab) => Some(Arc::new(
+            CreditCache::new(lab.clone())
+                .map_err(|e| format!("cannot build the Lab HTTP client: {e}"))?
+                .with_windows(config.credits_fresh, config.credits_stale),
+        )),
+        None => None,
+    };
     let cancel = CancellationToken::new();
     let state = build_state(
         Arc::clone(&backend),
@@ -261,6 +281,7 @@ pub async fn run() -> Result<(), String> {
             probe_timeout: config.source_probe_timeout,
             lab_events: config.lab_events.is_some(),
             limits: config.limits.clone(),
+            credits: credits.clone(),
         },
         cancel.child_token(),
     );
@@ -277,6 +298,12 @@ pub async fn run() -> Result<(), String> {
             Arc::clone(state.manager.usage()),
             Arc::clone(&backend) as Arc<dyn UsageLedger>,
             config.usage_flush_interval,
+            background.child_token(),
+        )));
+    }
+    if credits.is_some() {
+        tasks.push(tokio::spawn(Arc::clone(&state.manager).run_credit_checks(
+            config.credits_check_interval,
             background.child_token(),
         )));
     }

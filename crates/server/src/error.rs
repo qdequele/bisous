@@ -59,6 +59,16 @@ impl ApiError {
         )
     }
 
+    /// The sync's team has no credits left (Lab mode).
+    pub fn out_of_credits() -> Self {
+        Self::new(
+            StatusCode::PAYMENT_REQUIRED,
+            crate::credits::OUT_OF_CREDITS,
+            "this team has no credits left: its syncs are held and resume by themselves once \
+             credits are added in the Lab console",
+        )
+    }
+
     pub fn sync_not_found(id: &str) -> Self {
         Self::not_found(format!("sync {id} not found"))
     }
