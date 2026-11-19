@@ -31,6 +31,7 @@ use meili_connect_store::{DrainOutcome, Lane, PendingUsage, RepoError, UsageLedg
 use serde_json::{Value, json};
 
 use crate::limits::LogLimiter;
+use crate::metrics::Metrics;
 
 /// Lab product name of meili-connect.
 pub const PRODUCT: &str = "connect";
@@ -226,14 +227,16 @@ impl UsageEvents {
     }
 }
 
-/// The engine's store as the server gives it to the engine.
+/// The engine's store as the server gives it to the engine: what it
+/// records is also counted in the Prometheus metrics.
 pub struct MeteredStore {
     inner: Arc<dyn StateStore>,
+    metrics: Arc<Metrics>,
 }
 
 impl MeteredStore {
-    pub fn new(inner: Arc<dyn StateStore>) -> Self {
-        Self { inner }
+    pub fn new(inner: Arc<dyn StateStore>, metrics: Arc<Metrics>) -> Self {
+        Self { inner, metrics }
     }
 }
 
@@ -248,11 +251,18 @@ impl StateStore for MeteredStore {
     }
 
     async fn push_dead_letters(&self, letters: &[DeadLetter]) -> Result<(), StoreError> {
-        self.inner.push_dead_letters(letters).await
+        self.inner.push_dead_letters(letters).await?;
+        self.metrics.dead_letters(letters.len() as u64);
+        Ok(())
     }
 
     async fn record_progress(&self, sync_id: &str, progress: &Progress) -> Result<(), StoreError> {
-        self.inner.record_progress(sync_id, progress).await
+        self.inner.record_progress(sync_id, progress).await?;
+        self.metrics.record_usage(&progress.usage);
+        if let Some(age) = progress.batch_age {
+            self.metrics.batch(age);
+        }
+        Ok(())
     }
 }
 

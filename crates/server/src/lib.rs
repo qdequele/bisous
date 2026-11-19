@@ -12,6 +12,7 @@ pub mod guard;
 pub mod lab;
 pub mod limits;
 pub mod manager;
+pub mod metrics;
 pub mod redact;
 pub mod registry;
 pub mod routes;
@@ -25,7 +26,7 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::routing::{get, post};
-use meili_connect_core::{HostPolicy, SourceFactory, StateStore, SyncPhase};
+use meili_connect_core::{HostPolicy, Secret, SourceFactory, StateStore, SyncPhase};
 use meili_connect_engine::SupervisorConfig;
 use meili_connect_store::{DeadLetterLimits, Lane, MemStore, PgStore, SecretKey, UsageLedger};
 use tokio_util::sync::CancellationToken;
@@ -36,6 +37,7 @@ use crate::config::{Config, LogFormat};
 use crate::credits::CreditCache;
 use crate::limits::{Limits, ProbeSlots};
 use crate::manager::{ManagerDeps, SinkFactory, SyncManager, meili_sinks};
+use crate::metrics::Metrics;
 use crate::registry::SourceRegistry;
 use crate::state::{AppState, Backend};
 use crate::usage::{MeteredStore, UsageEvents};
@@ -44,6 +46,7 @@ use crate::usage::{MeteredStore, UsageEvents};
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(api::health))
+        .route("/metrics", get(metrics::metrics))
         .route("/sources/check", post(api::check_source))
         .route("/sources/discover", post(api::discover_source))
         .route("/syncs", post(api::create_sync).get(api::list_syncs))
@@ -83,6 +86,8 @@ pub struct Wiring {
     pub limits: Limits,
     /// Lab mode: hold the syncs of a team out of credits.
     pub credits: Option<Arc<CreditCache>>,
+    /// `GET /metrics` answers 404 without it.
+    pub metrics_token: Option<Secret>,
 }
 
 /// Assemble the shared state around a backend. The engine gets the
@@ -99,8 +104,10 @@ pub fn build_state(
     let usage =
         Arc::new(UsageEvents::new(lanes).with_backlog_cap(wiring.limits.outbox_max_pending));
     backend.set_usage_lanes(usage.lanes());
+    let metrics = Arc::new(Metrics::new());
     let engine_store: Arc<dyn StateStore> = Arc::new(MeteredStore::new(
-        Arc::clone(&backend) as Arc<dyn StateStore>
+        Arc::clone(&backend) as Arc<dyn StateStore>,
+        Arc::clone(&metrics),
     ));
     let manager = Arc::new(SyncManager::new(ManagerDeps {
         store: engine_store,
@@ -113,6 +120,7 @@ pub fn build_state(
         max_syncs_per_tenant: wiring.limits.max_syncs_per_tenant,
         stop_grace: wiring.limits.stop_grace,
         credits: wiring.credits,
+        metrics: Arc::clone(&metrics),
         cancel,
     }));
     AppState {
@@ -124,6 +132,8 @@ pub fn build_state(
         auth: wiring.auth,
         probe_timeout: wiring.probe_timeout,
         lab_events: wiring.lab_events,
+        metrics,
+        metrics_token: wiring.metrics_token,
         probes: Arc::new(ProbeSlots::new(
             wiring.limits.probe_concurrency,
             wiring.limits.probe_concurrency_per_tenant,
@@ -282,6 +292,7 @@ pub async fn run() -> Result<(), String> {
             lab_events: config.lab_events.is_some(),
             limits: config.limits.clone(),
             credits: credits.clone(),
+            metrics_token: config.metrics_token.clone(),
         },
         cancel.child_token(),
     );
@@ -310,7 +321,8 @@ pub async fn run() -> Result<(), String> {
     if let Some(lab) = &config.lab_events {
         info!(lab_url = %lab.url, "usage events go to the Lab");
         let sender = lab::LabSender::new(backend.outbox(Lane::Lab), lab.clone())
-            .map_err(|e| format!("cannot build the Lab HTTP client: {e}"))?;
+            .map_err(|e| format!("cannot build the Lab HTTP client: {e}"))?
+            .with_metrics(Arc::clone(&state.metrics));
         tasks.push(tokio::spawn(
             sender.run(config.lab_send_interval, background.child_token()),
         ));

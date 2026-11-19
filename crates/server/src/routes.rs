@@ -28,6 +28,8 @@ const fn auth(method: &'static str, path: &'static str) -> RouteSpec {
 
 pub const ROUTES: &[RouteSpec] = &[
     open("GET", "/health"),
+    // `Authorization: Bearer <METRICS_TOKEN>`, not the management tokens.
+    auth("GET", "/metrics"),
     auth("POST", "/sources/check"),
     auth("POST", "/sources/discover"),
     auth("POST", "/syncs"),

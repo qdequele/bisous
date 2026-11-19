@@ -3,13 +3,14 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use meili_connect_core::{HostPolicy, SourceFactory, StateStore};
-use meili_connect_store::{LabOutbox, SyncRepository, UsageLedger};
+use meili_connect_core::{HostPolicy, Secret, SourceFactory, StateStore};
+use meili_connect_store::{LabOutbox, Lane, SyncRepository, UsageLedger};
 
 use crate::auth::AuthConfig;
 use crate::guard::GuardedSources;
 use crate::limits::{Limits, ProbeSlots};
 use crate::manager::{SinkFactory, SyncManager};
+use crate::metrics::{Metrics, Scrape};
 
 /// Everything a store must be for the server: the engine's state, the
 /// tenant-scoped repository, the Lab outbox and the usage ledger.
@@ -31,6 +32,9 @@ pub struct AppState {
     pub probe_timeout: Duration,
     /// Usage events go to the Lab (all three `LAB_*` event variables set).
     pub lab_events: bool,
+    pub metrics: Arc<Metrics>,
+    /// The only credential `GET /metrics` accepts.
+    pub metrics_token: Option<Secret>,
     pub limits: Limits,
     /// Slots for `check` and `discover`.
     pub probes: Arc<ProbeSlots>,
@@ -52,5 +56,23 @@ impl AppState {
 
     pub fn outbox(&self) -> &dyn LabOutbox {
         &*self.backend
+    }
+
+    /// The live values `/metrics` computes when scraped.
+    pub async fn scrape(&self) -> Scrape {
+        let lanes = self.manager.usage().lanes();
+        let backlog = async |lane: Lane| {
+            if lanes.contains(&lane) {
+                self.backend.outbox(lane).count_unsent().await.ok()
+            } else {
+                None
+            }
+        };
+        Scrape {
+            phases: self.repo().phase_counts().await.unwrap_or_default(),
+            lab_backlog: backlog(Lane::Lab).await,
+            tinybird_backlog: backlog(Lane::Tinybird).await,
+            lags: self.manager.lag_seconds().await,
+        }
     }
 }

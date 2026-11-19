@@ -44,6 +44,38 @@ paths:
                 properties:
                   status: { type: string, const: ok }
 
+  /metrics:
+    get:
+      summary: Prometheus metrics (operators)
+      description: |
+        Prometheus text format 0.0.4. Authenticated with
+        `Authorization: Bearer <METRICS_TOKEN>` only: the Lab and admin
+        tokens are refused. `404` when `METRICS_TOKEN` is unset. No label
+        carries a tenant or a sync id.
+
+        Names (a contract with the deploy box's dashboards and alert
+        rules): `connect_syncs{phase}` (gauge), `connect_documents_total{kind}`
+        (`streamed`, `snapshot`, `resync`), `connect_bytes_total`,
+        `connect_batch_seconds` (histogram, one observation per batch),
+        `connect_sink_errors_total{class}`,
+        `connect_source_errors_total{kind,class}`, `connect_lag_seconds`
+        (gauge histogram rebuilt at each scrape from every running sync's
+        lag), `connect_dead_letters_total`, `connect_outbox_backlog` (gauge),
+        `connect_lab_events_sent_total{result}` (`accepted`, `rejected`,
+        `failed`); also `connect_sync_seconds_total`,
+        `connect_tinybird_backlog`, `connect_tinybird_events_sent_total{result}`
+        and, on Linux, `process_*`.
+      security:
+        - metricsToken: []
+      responses:
+        "200":
+          description: The metrics.
+          content:
+            text/plain:
+              schema: { type: string }
+        "401": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+
   /sources/check:
     post:
       summary: Pre-flight checks of a source
@@ -351,6 +383,10 @@ components:
       type: http
       scheme: bearer
       description: LAB_SERVICE_TOKEN (with X-Connect-Tenant-Id) or ADMIN_API_KEY.
+    metricsToken:
+      type: http
+      scheme: bearer
+      description: METRICS_TOKEN, for `GET /metrics` only.
 
   parameters:
     TenantId:

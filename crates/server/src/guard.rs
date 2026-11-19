@@ -23,6 +23,8 @@ use meili_connect_core::{
 };
 use tokio_util::sync::CancellationToken;
 
+use crate::metrics::Metrics;
+
 /// Why a source spec did not pass the policy.
 #[derive(Debug)]
 pub enum VetError {
@@ -121,6 +123,7 @@ pub struct GuardedSources {
     inner: Arc<dyn SourceFactory>,
     policy: Arc<HostPolicy>,
     coarse: bool,
+    metrics: Option<Arc<Metrics>>,
 }
 
 impl GuardedSources {
@@ -129,7 +132,14 @@ impl GuardedSources {
             inner,
             policy,
             coarse,
+            metrics: None,
         }
+    }
+
+    /// Count the errors of the sources it builds (`connect_source_errors_total`).
+    pub fn with_metrics(mut self, metrics: Arc<Metrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 
     fn wrap(&self, inner: Box<dyn Source>, spec: &SourceSpec, vetted: bool) -> Box<dyn Source> {
@@ -140,6 +150,7 @@ impl GuardedSources {
             spec: spec.clone(),
             coarse: self.coarse,
             vetted,
+            metrics: self.metrics.clone(),
         })
     }
 
@@ -181,10 +192,14 @@ struct GuardedSource {
     spec: SourceSpec,
     coarse: bool,
     vetted: bool,
+    metrics: Option<Arc<Metrics>>,
 }
 
 impl GuardedSource {
     fn surface(&self, e: SourceError) -> SourceError {
+        if let Some(m) = &self.metrics {
+            m.source_error(self.spec.kind.as_str(), &e);
+        }
         if self.coarse {
             coarse_source_error(e)
         } else {
@@ -201,7 +216,13 @@ impl GuardedSource {
                 self.vetted = true;
                 Ok(())
             }
-            Err(VetError::Policy(e)) => Err(SourceError::Config(e.to_string())),
+            Err(VetError::Policy(e)) => {
+                let e = SourceError::Config(e.to_string());
+                if let Some(m) = &self.metrics {
+                    m.source_error(self.spec.kind.as_str(), &e);
+                }
+                Err(e)
+            }
             Err(VetError::Source(e)) => Err(self.surface(e)),
         }
     }

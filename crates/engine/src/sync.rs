@@ -829,6 +829,7 @@ impl Runner<'_> {
             ops,
             skipped,
             checkpoint,
+            started,
             ..
         } = batch.take();
         let ops: Vec<Vec<DocOp>> = ops.into_iter().map(coalesce).collect();
@@ -885,6 +886,7 @@ impl Runner<'_> {
                 deleted,
                 rejected,
                 usage,
+                batch_age: started.map(|s| s.elapsed()),
             };
             guarded(
                 self.cancel,

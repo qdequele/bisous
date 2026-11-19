@@ -35,6 +35,7 @@ use tracing::{info, warn};
 use crate::credits::{CreditCache, OUT_OF_CREDITS};
 use crate::error::ApiError;
 use crate::guard::{CoarseSink, GuardedSources};
+use crate::metrics::{InstrumentedSink, Metrics};
 use crate::redact::same_origin;
 use crate::state::Backend;
 use crate::usage::UsageEvents;
@@ -89,6 +90,7 @@ pub struct ManagerDeps {
     pub stop_grace: Duration,
     /// Lab mode: whether a tenant may still spend.
     pub credits: Option<Arc<CreditCache>>,
+    pub metrics: Arc<Metrics>,
     pub cancel: CancellationToken,
 }
 
@@ -108,6 +110,7 @@ pub struct SyncManager {
     supervisors: Mutex<HashMap<String, Arc<Supervisor>>>,
     ops: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     credits: Option<Arc<CreditCache>>,
+    metrics: Arc<Metrics>,
     /// The tenant of every known tenant-owned sync (for the credit checks).
     tenants: Mutex<HashMap<String, String>>,
     /// Syncs held because their team is out of credits; they resume by
@@ -136,6 +139,7 @@ impl SyncManager {
             supervisors: Mutex::new(HashMap::new()),
             ops: Mutex::new(HashMap::new()),
             credits: deps.credits,
+            metrics: deps.metrics,
             tenants: Mutex::new(HashMap::new()),
             credit_held: Mutex::new(HashSet::new()),
         }
@@ -185,7 +189,10 @@ impl SyncManager {
 
     /// The sink of one sync; coarse errors for a tenant's sync.
     fn sink(&self, spec: &SyncSpec) -> Result<Arc<dyn Sink>, SinkError> {
-        let sink = (self.sinks)(&spec.destination)?;
+        let sink: Arc<dyn Sink> = Arc::new(InstrumentedSink::new(
+            (self.sinks)(&spec.destination)?,
+            Arc::clone(&self.metrics),
+        ));
         Ok(if spec.tenant.is_some() {
             Arc::new(CoarseSink(sink))
         } else {
@@ -196,7 +203,10 @@ impl SyncManager {
     fn new_supervisor(&self, spec: &SyncSpec) -> Result<Arc<Supervisor>, SupervisorError> {
         let sink = self.sink(spec).map_err(EngineError::from)?;
         let deps = SyncDeps {
-            sources: Arc::new(self.guarded_sources(spec)),
+            sources: Arc::new(
+                self.guarded_sources(spec)
+                    .with_metrics(Arc::clone(&self.metrics)),
+            ),
             sink,
             store: Arc::clone(&self.store),
         };
@@ -748,6 +758,11 @@ impl SyncManager {
                 "some syncs did not stop within the shutdown grace period"
             );
         }
+    }
+
+    /// The lag in seconds of every running sync whose source can tell.
+    pub async fn lag_seconds(&self) -> Vec<f64> {
+        Vec::new()
     }
 
     pub fn running_ids(&self) -> Vec<String> {

@@ -32,6 +32,7 @@ use crate::{Wiring, boot_syncs, build_state, router};
 
 const LAB: &str = "lab-token";
 const ADMIN: &str = "admin-key";
+const METRICS: &str = "metrics-token";
 const SECRET_MARK: &str = "hunter2";
 /// Bytes the fake sink reports per accepted document.
 const FAKE_BYTES_PER_DOC: u64 = 100;
@@ -301,6 +302,7 @@ fn app_tweaked(
         probe_timeout,
         lab_events: true,
         credits: None,
+        metrics_token: Some(METRICS.into()),
         limits,
     };
     tweak(&mut wiring);
@@ -1028,6 +1030,7 @@ async fn a_loopback_destination_is_host_not_allowed_with_the_real_sinks() {
             probe_timeout: Duration::from_millis(200),
             lab_events: false,
             credits: None,
+            metrics_token: Some(METRICS.into()),
             limits: Limits::default(),
         },
         CancellationToken::new(),
@@ -2322,4 +2325,96 @@ async fn without_the_lab_credits_are_never_checked() {
     let id = create(&a, &lab(TEAM), "s").await;
     a.state.manager.enforce_credits().await;
     wait_for(async || status_of(&a, &id).await["phase"] == "streaming").await;
+}
+
+// ------------------------------------------------------------- metrics
+
+#[tokio::test]
+async fn metrics_take_only_the_metrics_token() {
+    let a = app(locked());
+    let id = create(&a, &lab("team-a"), "s").await;
+    wait_for(async || {
+        call(
+            &a.router,
+            "GET",
+            &format!("/syncs/{id}/status"),
+            &lab("team-a"),
+            None,
+        )
+        .await
+        .1["phase"]
+            == "streaming"
+    })
+    .await;
+    let bearer = |t: &str| vec![("authorization", format!("Bearer {t}"))];
+    for headers in [vec![], bearer("wrong"), bearer(ADMIN), lab("team-a")] {
+        let (status, body) = call(&a.router, "GET", "/metrics", &headers, None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{headers:?}");
+        assert_eq!(body["code"], "unauthorized");
+    }
+    let req = Request::builder()
+        .uri("/metrics")
+        .header("authorization", format!("Bearer {METRICS}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = a.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(
+        resp.headers()["content-type"]
+            .to_str()
+            .unwrap()
+            .starts_with("text/plain")
+    );
+    let text = String::from_utf8(
+        resp.into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    for name in [
+        "connect_syncs",
+        "connect_documents_total",
+        "connect_bytes_total",
+        "connect_batch_seconds",
+        "connect_sink_errors_total",
+        "connect_source_errors_total",
+        "connect_lag_seconds",
+        "connect_dead_letters_total",
+        "connect_outbox_backlog",
+        "connect_lab_events_sent_total",
+    ] {
+        assert!(
+            text.contains(&format!("# TYPE {name} ")),
+            "{name} not declared in\n{text}"
+        );
+    }
+    assert!(
+        text.contains("connect_syncs{phase=\"streaming\"} 1"),
+        "{text}"
+    );
+    assert!(
+        text.contains("connect_documents_total{kind=\"snapshot\"} 3"),
+        "{text}"
+    );
+    assert!(text.contains(&format!("connect_bytes_total {}", 3 * FAKE_BYTES_PER_DOC)));
+    assert!(text.contains("connect_batch_seconds_count 1"), "{text}");
+    // Never a tenant or a sync id.
+    assert!(!text.contains("team-a") && !text.contains(&id));
+
+    // Without METRICS_TOKEN the route does not exist for anyone.
+    let off = app_tweaked(
+        locked(),
+        Arc::new(MemStore::new()),
+        HostPolicy::any(),
+        Limits::default(),
+        Duration::from_millis(200),
+        |w| w.metrics_token = None,
+    );
+    for headers in [vec![], bearer(METRICS), bearer(ADMIN)] {
+        let (status, _) = call(&off.router, "GET", "/metrics", &headers, None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
 }

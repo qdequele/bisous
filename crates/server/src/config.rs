@@ -18,7 +18,7 @@ use crate::limits::Limits;
 pub struct ConfigError(pub String);
 
 /// Variables whose blank value is an error rather than "unset".
-const AUTH_VARS: &[&str] = &["ADMIN_API_KEY", "LAB_SERVICE_TOKEN"];
+const AUTH_VARS: &[&str] = &["ADMIN_API_KEY", "LAB_SERVICE_TOKEN", "METRICS_TOKEN"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogFormat {
@@ -50,6 +50,9 @@ pub struct Config {
     pub secret_key: Option<Secret>,
     pub admin_api_key: Option<Secret>,
     pub lab_service_token: Option<Secret>,
+    /// The bearer token of `GET /metrics` (404 without it). Never one of
+    /// the management tokens.
+    pub metrics_token: Option<Secret>,
     /// No management auth: allowed only on a loopback address or with
     /// `ALLOW_OPEN_MODE=true`.
     pub open_mode: bool,
@@ -157,6 +160,19 @@ impl Config {
             Some("true") | Some("1") => true,
             Some(_) => return Err(ConfigError("ALLOW_OPEN_MODE must be true or false".into())),
         };
+        let metrics_token = get("METRICS_TOKEN").map(Secret::new);
+        if let Some(m) = &metrics_token
+            && [&lab_service_token, &admin_api_key]
+                .into_iter()
+                .flatten()
+                .any(|t| t.expose() == m.expose())
+        {
+            return Err(ConfigError(
+                "METRICS_TOKEN must differ from ADMIN_API_KEY and LAB_SERVICE_TOKEN: the scraper \
+                 must not hold a management token"
+                    .into(),
+            ));
+        }
         let open_mode = lab_service_token.is_none() && admin_api_key.is_none();
         if open_mode && !allow_open_mode && !listen_addr.ip().is_loopback() {
             return Err(ConfigError(format!(
@@ -197,6 +213,7 @@ impl Config {
             secret_key,
             admin_api_key,
             lab_service_token,
+            metrics_token,
             open_mode,
             host_policy,
             lab_events,
@@ -404,6 +421,24 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn the_metrics_token_is_its_own() {
+        assert!(
+            cfg(&[("ADMIN_API_KEY", "k")])
+                .unwrap()
+                .metrics_token
+                .is_none()
+        );
+        let c = cfg(&[("ADMIN_API_KEY", "k"), ("METRICS_TOKEN", "m")]).unwrap();
+        assert_eq!(c.metrics_token.unwrap().expose(), "m");
+        for clash in ["ADMIN_API_KEY", "LAB_SERVICE_TOKEN"] {
+            let err = cfg(&[(clash, "same"), ("METRICS_TOKEN", "same")]).unwrap_err();
+            assert!(err.0.contains("METRICS_TOKEN must differ"), "{err}");
+        }
+        let err = cfg(&[("ADMIN_API_KEY", "k"), ("METRICS_TOKEN", " ")]).unwrap_err();
+        assert!(err.0.contains("METRICS_TOKEN"), "{err}");
     }
 
     #[test]

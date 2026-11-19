@@ -25,7 +25,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{DateTime, NaiveDate, Utc};
-use meili_connect_core::{DeadLetter, SyncSpec, Usage};
+use meili_connect_core::{DeadLetter, SyncPhase, SyncSpec, Usage};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -409,6 +409,17 @@ pub trait SyncRepository: Send + Sync {
         from: NaiveDate,
         to: NaiveDate,
     ) -> Result<Vec<DailyProgress>, RepoError>;
+
+    /// Dead letters stored for one sync.
+    async fn count_dead_letters(
+        &self,
+        tenant: Option<&str>,
+        sync_id: &str,
+    ) -> Result<u64, RepoError>;
+
+    /// How many syncs of every scope are in each phase (a sync that never
+    /// ran is `Pending`). Phases without a sync are absent. For metrics.
+    async fn phase_counts(&self) -> Result<Vec<(SyncPhase, u64)>, RepoError>;
 }
 
 /// Transactional outbox of Lab events (`usage.recorded`).
@@ -679,13 +690,52 @@ pub(crate) mod test_support {
         );
     }
 
+    /// Phase counts span every scope; a sync that never ran is pending.
+    pub async fn phases_and_letters_contract<S>(store: &S)
+    where
+        S: meili_connect_core::StateStore + crate::SyncRepository,
+    {
+        store
+            .create_sync(None, &spec("a", None, "a"))
+            .await
+            .unwrap();
+        store
+            .create_sync(Some("t"), &spec("b", Some("t"), "b"))
+            .await
+            .unwrap();
+        store
+            .create_sync(Some("u"), &spec("c", Some("u"), "c"))
+            .await
+            .unwrap();
+        store.save(&state("b")).await.unwrap();
+        let mut held = state("c");
+        held.phase = SyncPhase::Held;
+        store.save(&held).await.unwrap();
+        let mut counts = store.phase_counts().await.unwrap();
+        counts.sort_by_key(|(p, _)| format!("{p:?}"));
+        assert_eq!(
+            counts,
+            vec![
+                (SyncPhase::Held, 1),
+                (SyncPhase::Pending, 1),
+                (SyncPhase::Streaming, 1)
+            ]
+        );
+        store
+            .push_dead_letters(&[letter("b", "1"), letter("b", "2"), letter("c", "3")])
+            .await
+            .unwrap();
+        assert_eq!(store.count_dead_letters(Some("t"), "b").await.unwrap(), 2);
+        assert!(store.count_dead_letters(None, "b").await.is_err(), "scoped");
+    }
+
     /// Progress of a batch: counters only, no units.
     pub fn pr(written: u64, deleted: u64, rejected: u64) -> Progress {
         Progress {
             written,
             deleted,
             rejected,
-            usage: Default::default(),
+            ..Progress::default()
         }
     }
 

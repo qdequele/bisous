@@ -15,7 +15,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use chrono::{DateTime, NaiveDate, Utc};
 use meili_connect_core::{
-    DeadLetter, Progress, StateStore, StoreError, SyncSpec, SyncState, Usage,
+    DeadLetter, Progress, StateStore, StoreError, SyncPhase, SyncSpec, SyncState, Usage,
 };
 use uuid::Uuid;
 
@@ -416,6 +416,33 @@ impl SyncRepository for MemStore {
         let before = inner.dead_letters.len();
         inner.dead_letters.retain(|_, d| d.sync_id != sync_id);
         Ok((before - inner.dead_letters.len()) as u64)
+    }
+
+    async fn count_dead_letters(
+        &self,
+        tenant: Option<&str>,
+        sync_id: &str,
+    ) -> Result<u64, RepoError> {
+        let inner = self.lock()?;
+        inner.owned(tenant, sync_id)?;
+        Ok(inner
+            .dead_letters
+            .values()
+            .filter(|d| d.sync_id == sync_id)
+            .count() as u64)
+    }
+
+    async fn phase_counts(&self) -> Result<Vec<(SyncPhase, u64)>, RepoError> {
+        let inner = self.lock()?;
+        let mut counts: Vec<(SyncPhase, u64)> = Vec::new();
+        for id in inner.syncs.keys() {
+            let phase = inner.states.get(id).map_or(SyncPhase::Pending, |s| s.phase);
+            match counts.iter_mut().find(|(p, _)| *p == phase) {
+                Some((_, n)) => *n += 1,
+                None => counts.push((phase, 1)),
+            }
+        }
+        Ok(counts)
     }
 
     async fn progress(
@@ -961,6 +988,11 @@ mod tests {
             store.progress(Some("x"), "s", today, today).await,
             Err(RepoError::NotFound(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn phases_and_dead_letters_are_counted() {
+        crate::test_support::phases_and_letters_contract(&MemStore::new()).await;
     }
 
     #[tokio::test]

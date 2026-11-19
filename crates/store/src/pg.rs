@@ -592,6 +592,38 @@ impl SyncRepository for PgStore {
         Ok(done.rows_affected())
     }
 
+    async fn count_dead_letters(
+        &self,
+        tenant: Option<&str>,
+        sync_id: &str,
+    ) -> Result<u64, RepoError> {
+        self.ensure_owned(tenant, sync_id).await?;
+        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM dead_letters WHERE sync_id = $1")
+            .bind(sync_id)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(from_sqlx)?;
+        Ok(to_u64(n))
+    }
+
+    async fn phase_counts(&self) -> Result<Vec<(SyncPhase, u64)>, RepoError> {
+        let rows = sqlx::query(
+            "SELECT coalesce(st.phase, 'pending') AS phase, count(*) AS n
+             FROM syncs s LEFT JOIN sync_state st ON st.sync_id = s.id
+             GROUP BY 1",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(from_sqlx)?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in &rows {
+            let phase: String = r.try_get("phase").map_err(from_sqlx)?;
+            let n: i64 = r.try_get("n").map_err(from_sqlx)?;
+            out.push((parse_phase(&phase).map_err(RepoError::from)?, to_u64(n)));
+        }
+        Ok(out)
+    }
+
     async fn progress(
         &self,
         tenant: Option<&str>,

@@ -26,6 +26,7 @@ use uuid::Uuid;
 
 use crate::config::LabEventsConfig;
 use crate::limits::LogLimiter;
+use crate::metrics::Metrics;
 use crate::usage::UsageEvents;
 
 pub const H_INSTANCE_ID: &str = "x-lab-instance-id";
@@ -103,6 +104,7 @@ pub struct LabSender {
     http: reqwest::Client,
     lease: Duration,
     retry: RetryBackoff,
+    metrics: Option<Arc<Metrics>>,
 }
 
 async fn read_capped(mut resp: reqwest::Response, cap: usize) -> Option<Vec<u8>> {
@@ -135,7 +137,29 @@ impl LabSender {
             http,
             lease: LEASE,
             retry: RETRY,
+            metrics: None,
         })
+    }
+
+    /// Count what it sends (`connect_lab_events_sent_total{result}`).
+    pub fn with_metrics(mut self, metrics: Arc<Metrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+
+    pub async fn deliver_once(&self) -> Delivery {
+        let delivery = self.deliver().await;
+        if let Some(m) = &self.metrics {
+            match &delivery {
+                Delivery::Idle => {}
+                Delivery::Sent { delivered, pending } => {
+                    m.lab_events("accepted", *delivered as u64);
+                    m.lab_events("rejected", *pending as u64);
+                }
+                Delivery::Failed { pending, .. } => m.lab_events("failed", *pending as u64),
+            }
+        }
+        delivery
     }
 
     /// How long a failed event waits (tests shorten it).
@@ -161,7 +185,7 @@ impl LabSender {
         self
     }
 
-    pub async fn deliver_once(&self) -> Delivery {
+    async fn deliver(&self) -> Delivery {
         let lease = match self.outbox.lease_events(BATCH_SIZE, self.lease).await {
             Ok(l) => l,
             Err(e) => {

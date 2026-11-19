@@ -92,6 +92,12 @@ async fn state_round_trip() {
 }
 
 #[tokio::test]
+async fn phases_and_dead_letters_are_counted() {
+    let Some(store) = store().await else { return };
+    crate::test_support::phases_and_letters_contract(&store).await;
+}
+
+#[tokio::test]
 async fn usage_is_durable_per_lane() {
     let Some(store) = store().await else { return };
     crate::test_support::ledger_contract(&store).await;

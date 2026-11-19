@@ -138,6 +138,9 @@ pub struct Progress {
     pub deleted: u64,
     pub rejected: u64,
     pub usage: Usage,
+    /// For metrics only, never stored: how long the batch took from its
+    /// first source event to Meilisearch's tasks succeeded.
+    pub batch_age: Option<std::time::Duration>,
 }
 
 impl Progress {
