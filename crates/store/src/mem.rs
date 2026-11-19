@@ -1,0 +1,585 @@
+//! In-memory store for tests and single-node trials. Nothing survives a
+//! restart.
+//!
+//! Unlike [`crate::PgStore`], the [`StateStore`] methods do not require the
+//! sync to exist in the repository, so engine tests can use it bare.
+
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Mutex, MutexGuard};
+use std::time::Duration;
+
+use async_trait::async_trait;
+use chrono::{DateTime, NaiveDate, Utc};
+use meili_connect_core::{DeadLetter, StateStore, StoreError, SyncSpec, SyncState};
+use uuid::Uuid;
+
+use crate::{
+    BootSync, DailyProgress, DeadLetterPage, LabOutbox, OutboxEvent, RepoError, StoredDeadLetter,
+    StoredSync, SyncRepository, validate_spec,
+};
+
+#[derive(Default)]
+struct Inner {
+    syncs: HashMap<String, StoredSync>,
+    states: HashMap<String, SyncState>,
+    dead_letters: BTreeMap<i64, DeadLetter>,
+    next_dead_letter: i64,
+    progress: BTreeMap<(String, NaiveDate), [u64; 3]>,
+    outbox: Vec<OutboxRow>,
+}
+
+struct OutboxRow {
+    event: OutboxEvent,
+    leased_until: Option<DateTime<Utc>>,
+    sent_at: Option<DateTime<Utc>>,
+}
+
+impl Inner {
+    fn owned(&self, tenant: Option<&str>, id: &str) -> Result<(), RepoError> {
+        match self.syncs.get(id) {
+            Some(s) if s.spec.tenant.as_deref() == tenant => Ok(()),
+            _ => Err(RepoError::NotFound(format!("sync {id}"))),
+        }
+    }
+
+    fn name_taken(&self, tenant: Option<&str>, name: &str, except_id: &str) -> bool {
+        self.syncs.values().any(|s| {
+            s.spec.id != except_id && s.spec.tenant.as_deref() == tenant && s.spec.name == name
+        })
+    }
+}
+
+#[derive(Default)]
+pub struct MemStore {
+    inner: Mutex<Inner>,
+}
+
+impl MemStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn lock(&self) -> Result<MutexGuard<'_, Inner>, StoreError> {
+        self.inner
+            .lock()
+            .map_err(|_| StoreError::Fatal("memory store lock poisoned".into()))
+    }
+}
+
+impl std::fmt::Debug for MemStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MemStore").finish_non_exhaustive()
+    }
+}
+
+#[async_trait]
+impl StateStore for MemStore {
+    async fn load(&self, sync_id: &str) -> Result<Option<SyncState>, StoreError> {
+        Ok(self.lock()?.states.get(sync_id).cloned())
+    }
+
+    async fn save(&self, state: &SyncState) -> Result<(), StoreError> {
+        self.lock()?
+            .states
+            .insert(state.sync_id.clone(), state.clone());
+        Ok(())
+    }
+
+    async fn push_dead_letters(&self, letters: &[DeadLetter]) -> Result<(), StoreError> {
+        let mut inner = self.lock()?;
+        for letter in letters {
+            inner.next_dead_letter += 1;
+            let id = inner.next_dead_letter;
+            inner.dead_letters.insert(id, letter.clone());
+        }
+        Ok(())
+    }
+
+    async fn record_progress(
+        &self,
+        sync_id: &str,
+        written: u64,
+        deleted: u64,
+        rejected: u64,
+    ) -> Result<(), StoreError> {
+        let day = Utc::now().date_naive();
+        let mut inner = self.lock()?;
+        let c = inner.progress.entry((sync_id.to_owned(), day)).or_default();
+        c[0] = c[0].saturating_add(written);
+        c[1] = c[1].saturating_add(deleted);
+        c[2] = c[2].saturating_add(rejected);
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl SyncRepository for MemStore {
+    async fn create_sync(
+        &self,
+        tenant: Option<&str>,
+        spec: &SyncSpec,
+    ) -> Result<StoredSync, RepoError> {
+        validate_spec(tenant, spec)?;
+        let mut inner = self.lock()?;
+        if inner.syncs.contains_key(&spec.id) {
+            return Err(RepoError::Conflict(format!("sync id {} exists", spec.id)));
+        }
+        if inner.name_taken(tenant, &spec.name, &spec.id) {
+            return Err(RepoError::Conflict(format!(
+                "a sync named {:?} exists",
+                spec.name
+            )));
+        }
+        let now = Utc::now();
+        let stored = StoredSync {
+            spec: spec.clone(),
+            created_at: now,
+            updated_at: now,
+        };
+        inner.syncs.insert(spec.id.clone(), stored.clone());
+        Ok(stored)
+    }
+
+    async fn get_sync(
+        &self,
+        tenant: Option<&str>,
+        id: &str,
+    ) -> Result<Option<StoredSync>, RepoError> {
+        let inner = self.lock()?;
+        Ok(inner
+            .syncs
+            .get(id)
+            .filter(|s| s.spec.tenant.as_deref() == tenant)
+            .cloned())
+    }
+
+    async fn list_syncs(&self, tenant: Option<&str>) -> Result<Vec<StoredSync>, RepoError> {
+        let inner = self.lock()?;
+        let mut out: Vec<StoredSync> = inner
+            .syncs
+            .values()
+            .filter(|s| s.spec.tenant.as_deref() == tenant)
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| a.spec.name.cmp(&b.spec.name));
+        Ok(out)
+    }
+
+    async fn update_sync(
+        &self,
+        tenant: Option<&str>,
+        spec: &SyncSpec,
+    ) -> Result<StoredSync, RepoError> {
+        validate_spec(tenant, spec)?;
+        let mut inner = self.lock()?;
+        inner.owned(tenant, &spec.id)?;
+        if inner.name_taken(tenant, &spec.name, &spec.id) {
+            return Err(RepoError::Conflict(format!(
+                "a sync named {:?} exists",
+                spec.name
+            )));
+        }
+        let entry = inner
+            .syncs
+            .get_mut(&spec.id)
+            .ok_or_else(|| RepoError::NotFound(format!("sync {}", spec.id)))?;
+        entry.spec = spec.clone();
+        entry.updated_at = Utc::now();
+        Ok(entry.clone())
+    }
+
+    async fn delete_sync(&self, tenant: Option<&str>, id: &str) -> Result<(), RepoError> {
+        let mut inner = self.lock()?;
+        inner.owned(tenant, id)?;
+        inner.syncs.remove(id);
+        inner.states.remove(id);
+        inner.dead_letters.retain(|_, d| d.sync_id != id);
+        inner.progress.retain(|(sync_id, _), _| sync_id != id);
+        Ok(())
+    }
+
+    async fn list_all_for_boot(&self) -> Result<Vec<BootSync>, RepoError> {
+        let inner = self.lock()?;
+        let mut out: Vec<BootSync> = inner
+            .syncs
+            .values()
+            .map(|s| BootSync {
+                id: s.spec.id.clone(),
+                tenant: s.spec.tenant.clone(),
+                spec: Ok(s.spec.clone()),
+            })
+            .collect();
+        out.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(out)
+    }
+
+    async fn list_dead_letters(
+        &self,
+        tenant: Option<&str>,
+        sync_id: &str,
+        page: DeadLetterPage,
+    ) -> Result<Vec<StoredDeadLetter>, RepoError> {
+        let inner = self.lock()?;
+        inner.owned(tenant, sync_id)?;
+        let start = page.after.unwrap_or(0).saturating_add(1);
+        Ok(inner
+            .dead_letters
+            .range(start..)
+            .filter(|(_, d)| d.sync_id == sync_id)
+            .take(page.clamped_limit() as usize)
+            .map(|(id, letter)| StoredDeadLetter {
+                id: *id,
+                letter: letter.clone(),
+            })
+            .collect())
+    }
+
+    async fn delete_dead_letters(
+        &self,
+        tenant: Option<&str>,
+        sync_id: &str,
+        ids: &[i64],
+    ) -> Result<u64, RepoError> {
+        let mut inner = self.lock()?;
+        inner.owned(tenant, sync_id)?;
+        let mut n = 0;
+        for id in ids {
+            if inner
+                .dead_letters
+                .get(id)
+                .is_some_and(|d| d.sync_id == sync_id)
+            {
+                inner.dead_letters.remove(id);
+                n += 1;
+            }
+        }
+        Ok(n)
+    }
+
+    async fn clear_dead_letters(
+        &self,
+        tenant: Option<&str>,
+        sync_id: &str,
+    ) -> Result<u64, RepoError> {
+        let mut inner = self.lock()?;
+        inner.owned(tenant, sync_id)?;
+        let before = inner.dead_letters.len();
+        inner.dead_letters.retain(|_, d| d.sync_id != sync_id);
+        Ok((before - inner.dead_letters.len()) as u64)
+    }
+
+    async fn progress(
+        &self,
+        tenant: Option<&str>,
+        sync_id: &str,
+        from: NaiveDate,
+        to: NaiveDate,
+    ) -> Result<Vec<DailyProgress>, RepoError> {
+        let inner = self.lock()?;
+        inner.owned(tenant, sync_id)?;
+        if from > to {
+            return Ok(Vec::new());
+        }
+        Ok(inner
+            .progress
+            .range((sync_id.to_owned(), from)..=(sync_id.to_owned(), to))
+            .map(|((_, day), c)| DailyProgress {
+                day: *day,
+                written: c[0],
+                deleted: c[1],
+                rejected: c[2],
+            })
+            .collect())
+    }
+}
+
+#[async_trait]
+impl LabOutbox for MemStore {
+    async fn enqueue_event(
+        &self,
+        tenant: Option<&str>,
+        payload: &serde_json::Value,
+    ) -> Result<Uuid, RepoError> {
+        let id = Uuid::now_v7();
+        self.lock()?.outbox.push(OutboxRow {
+            event: OutboxEvent {
+                id,
+                tenant: tenant.map(str::to_owned),
+                payload: payload.clone(),
+                created_at: Utc::now(),
+            },
+            leased_until: None,
+            sent_at: None,
+        });
+        Ok(id)
+    }
+
+    async fn lease_events(
+        &self,
+        limit: u32,
+        lease: Duration,
+    ) -> Result<Vec<OutboxEvent>, RepoError> {
+        let now = Utc::now();
+        let until = chrono::Duration::from_std(lease)
+            .ok()
+            .and_then(|d| now.checked_add_signed(d))
+            .unwrap_or(DateTime::<Utc>::MAX_UTC);
+        let mut inner = self.lock()?;
+        let mut out = Vec::new();
+        // Rows are kept in insertion (= creation) order.
+        for row in inner.outbox.iter_mut() {
+            if out.len() >= limit as usize {
+                break;
+            }
+            if row.sent_at.is_none() && row.leased_until.is_none_or(|t| t <= now) {
+                row.leased_until = Some(until);
+                out.push(row.event.clone());
+            }
+        }
+        Ok(out)
+    }
+
+    async fn mark_events_sent(&self, ids: &[Uuid]) -> Result<u64, RepoError> {
+        let now = Utc::now();
+        let mut inner = self.lock()?;
+        let mut n = 0;
+        for row in inner.outbox.iter_mut() {
+            if row.sent_at.is_none() && ids.contains(&row.event.id) {
+                row.sent_at = Some(now);
+                row.leased_until = None;
+                n += 1;
+            }
+        }
+        Ok(n)
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use crate::test_support::{letter, spec, state};
+
+    #[tokio::test]
+    async fn state_round_trip() {
+        let store = MemStore::new();
+        assert!(store.load("s1").await.unwrap().is_none());
+        let st = state("s1");
+        store.save(&st).await.unwrap();
+        assert_eq!(store.load("s1").await.unwrap(), Some(st.clone()));
+        let mut st2 = st;
+        st2.resyncing = true;
+        store.save(&st2).await.unwrap();
+        assert_eq!(store.load("s1").await.unwrap(), Some(st2));
+    }
+
+    #[tokio::test]
+    async fn crud_and_tenant_isolation() {
+        let store = MemStore::new();
+        let a = spec("a1", Some("ta"), "orders");
+        let b = spec("b1", Some("tb"), "orders");
+        let g = spec("g1", None, "orders");
+        store.create_sync(Some("ta"), &a).await.unwrap();
+        store.create_sync(Some("tb"), &b).await.unwrap();
+        store.create_sync(None, &g).await.unwrap();
+
+        // Same name in the same scope conflicts; id reuse conflicts.
+        let dup = spec("a2", Some("ta"), "orders");
+        assert!(matches!(
+            store.create_sync(Some("ta"), &dup).await,
+            Err(RepoError::Conflict(_))
+        ));
+        let id_reuse = spec("a1", Some("tb"), "other");
+        assert!(matches!(
+            store.create_sync(Some("tb"), &id_reuse).await,
+            Err(RepoError::Conflict(_))
+        ));
+        // Tenant mismatch is invalid.
+        assert!(matches!(
+            store.create_sync(Some("tb"), &a).await,
+            Err(RepoError::Invalid(_))
+        ));
+
+        assert!(store.get_sync(Some("tb"), "a1").await.unwrap().is_none());
+        assert!(store.get_sync(None, "a1").await.unwrap().is_none());
+        assert_eq!(
+            store
+                .get_sync(Some("ta"), "a1")
+                .await
+                .unwrap()
+                .unwrap()
+                .spec,
+            a
+        );
+        let ids = |v: Vec<StoredSync>| v.into_iter().map(|s| s.spec.id).collect::<Vec<_>>();
+        assert_eq!(ids(store.list_syncs(Some("ta")).await.unwrap()), ["a1"]);
+        assert_eq!(ids(store.list_syncs(None).await.unwrap()), ["g1"]);
+
+        // Updating another tenant's sync is not found.
+        let mut a_by_b = a.clone();
+        a_by_b.tenant = Some("tb".into());
+        assert!(matches!(
+            store.update_sync(Some("tb"), &a_by_b).await,
+            Err(RepoError::NotFound(_))
+        ));
+        let mut a2 = a.clone();
+        a2.name = "orders-v2".into();
+        assert_eq!(
+            store.update_sync(Some("ta"), &a2).await.unwrap().spec.name,
+            "orders-v2"
+        );
+        assert!(matches!(
+            store.delete_sync(Some("tb"), "a1").await,
+            Err(RepoError::NotFound(_))
+        ));
+        assert_eq!(store.list_all_for_boot().await.unwrap().len(), 3);
+        store.delete_sync(Some("ta"), "a1").await.unwrap();
+        assert!(store.get_sync(Some("ta"), "a1").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn delete_cascades_and_dead_letters_page() {
+        let store = MemStore::new();
+        store
+            .create_sync(Some("t"), &spec("s", Some("t"), "n"))
+            .await
+            .unwrap();
+        store
+            .create_sync(Some("u"), &spec("o", Some("u"), "n"))
+            .await
+            .unwrap();
+        store.save(&state("s")).await.unwrap();
+        let letters: Vec<_> = (0..5).map(|i| letter("s", &i.to_string())).collect();
+        store.push_dead_letters(&letters).await.unwrap();
+        store.push_dead_letters(&[letter("o", "x")]).await.unwrap();
+        store.record_progress("s", 3, 1, 0).await.unwrap();
+
+        let p1 = store
+            .list_dead_letters(
+                Some("t"),
+                "s",
+                DeadLetterPage {
+                    after: None,
+                    limit: 2,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(p1.len(), 2);
+        let p2 = store
+            .list_dead_letters(
+                Some("t"),
+                "s",
+                DeadLetterPage {
+                    after: Some(p1[1].id),
+                    limit: 10,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(p2.len(), 3);
+        assert!(matches!(
+            store
+                .list_dead_letters(Some("u"), "s", DeadLetterPage::default())
+                .await,
+            Err(RepoError::NotFound(_))
+        ));
+        // The other sync's letter id is ignored.
+        let other = store
+            .list_dead_letters(Some("u"), "o", DeadLetterPage::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .delete_dead_letters(Some("t"), "s", &[p1[0].id, other[0].id])
+                .await
+                .unwrap(),
+            1
+        );
+
+        store.delete_sync(Some("t"), "s").await.unwrap();
+        assert!(store.load("s").await.unwrap().is_none());
+        let inner = store.lock().unwrap();
+        assert!(inner.dead_letters.values().all(|d| d.sync_id == "o"));
+        assert!(inner.progress.keys().all(|(id, _)| id != "s"));
+    }
+
+    #[tokio::test]
+    async fn progress_adds_up() {
+        let store = MemStore::new();
+        store
+            .create_sync(None, &spec("s", None, "n"))
+            .await
+            .unwrap();
+        store.record_progress("s", 3, 1, 0).await.unwrap();
+        store.record_progress("s", 2, 0, 4).await.unwrap();
+        let today = Utc::now().date_naive();
+        let p = store.progress(None, "s", today, today).await.unwrap();
+        assert_eq!(
+            p,
+            [DailyProgress {
+                day: today,
+                written: 5,
+                deleted: 1,
+                rejected: 4
+            }]
+        );
+        assert!(matches!(
+            store.progress(Some("x"), "s", today, today).await,
+            Err(RepoError::NotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn outbox_leases() {
+        let store = MemStore::new();
+        let ids: Vec<Uuid> = enqueue_three(&store).await;
+        let first = store
+            .lease_events(2, Duration::from_secs(60))
+            .await
+            .unwrap();
+        assert_eq!(
+            first.iter().map(|e| e.id).collect::<Vec<_>>(),
+            ids[..2].to_vec()
+        );
+        let second = store
+            .lease_events(10, Duration::from_secs(60))
+            .await
+            .unwrap();
+        assert_eq!(second.len(), 1);
+        assert!(
+            store
+                .lease_events(10, Duration::from_secs(60))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(store.mark_events_sent(&ids).await.unwrap(), 3);
+        assert_eq!(store.mark_events_sent(&ids).await.unwrap(), 0);
+
+        // An expired lease frees the event.
+        let id = store
+            .enqueue_event(None, &serde_json::json!({}))
+            .await
+            .unwrap();
+        store.lease_events(1, Duration::ZERO).await.unwrap();
+        let again = store
+            .lease_events(1, Duration::from_secs(60))
+            .await
+            .unwrap();
+        assert_eq!(again[0].id, id);
+    }
+
+    async fn enqueue_three(store: &MemStore) -> Vec<Uuid> {
+        let mut ids = Vec::new();
+        for i in 0..3 {
+            ids.push(
+                store
+                    .enqueue_event(Some("t"), &serde_json::json!({ "n": i }))
+                    .await
+                    .unwrap(),
+            );
+        }
+        ids
+    }
+}
