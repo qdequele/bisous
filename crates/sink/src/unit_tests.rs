@@ -20,6 +20,8 @@ fn opts() -> SinkOptions {
         task_timeout: Duration::from_secs(5),
         request_timeout: Duration::from_secs(5),
         gzip: false,
+        suspect_backoff: Duration::from_millis(1),
+        request_backoff: Duration::from_millis(1),
         ..SinkOptions::default()
     }
 }
@@ -80,11 +82,16 @@ struct FakeState {
     processing_polls: usize,
     polls: usize,
     gzip_seen: bool,
+    /// Times each document id was sent.
+    attempts: std::collections::HashMap<String, usize>,
 }
 
-/// A small in-memory Meilisearch: documents with `"bad": true` make their
-/// task fail with `invalid_document_id`, with `"embed": "fail"` with
-/// `vector_embedding_error`.
+/// A small in-memory Meilisearch. A document makes its task fail with:
+/// `"bad": true` → `invalid_document_id`; `"embed": "fail"` →
+/// `vector_embedding_error`; `"flaky": n` → `vector_embedding_error` the
+/// first `n` times it is sent; `"internal": true` or a non-object
+/// `_vectors` → `internal`; `"needs_vectors": true` without `_vectors.up`
+/// → `vector_embedding_error`.
 #[derive(Clone, Default)]
 struct Fake(Arc<Mutex<FakeState>>);
 
@@ -166,20 +173,48 @@ impl Respond for Fake {
                 .collect();
             ("documents", docs)
         };
-        let failure = items.iter().find_map(|d| {
+        let mut failures = Vec::new();
+        for d in &items {
+            let id = d.get("id").map(Value::to_string).unwrap_or_default();
+            let attempt = {
+                let n = st.attempts.entry(id).or_default();
+                *n += 1;
+                *n
+            };
+            let flaky = d.get("flaky").and_then(Value::as_u64).unwrap_or(0);
+            let vectors = d.get("_vectors");
             if d.get("bad") == Some(&json!(true)) {
-                Some(("invalid_document_id", format!("bad document {}", d["id"])))
-            } else if d.get("embed") == Some(&json!("fail")) {
-                Some(("vector_embedding_error", "embedder down".to_owned()))
-            } else {
-                None
+                failures.push((
+                    "invalid_document_id",
+                    "invalid_request",
+                    format!("bad document {}", d["id"]),
+                ));
+            } else if d.get("embed") == Some(&json!("fail")) || attempt as u64 <= flaky {
+                failures.push((
+                    "vector_embedding_error",
+                    "invalid_request",
+                    "embedder down".to_owned(),
+                ));
+            } else if d.get("internal") == Some(&json!(true))
+                || vectors.is_some_and(|v| !v.is_object() && !v.is_null())
+            {
+                failures.push(("internal", "internal", "invalid type".to_owned()));
+            } else if d.get("needs_vectors") == Some(&json!(true))
+                && vectors.and_then(|v| v.get("up")).is_none()
+            {
+                failures.push((
+                    "vector_embedding_error",
+                    "invalid_request",
+                    "no vectors provided".to_owned(),
+                ));
             }
-        });
+        }
+        let failure = failures.into_iter().next();
         let uid = st.tasks.len();
         let task = match &failure {
             None => json!({"uid": uid, "status": "succeeded"}),
-            Some((code, msg)) => json!({"uid": uid, "status": "failed",
-                "error": {"message": msg, "code": code, "type": "invalid_request", "link": ""}}),
+            Some((code, kind, msg)) => json!({"uid": uid, "status": "failed",
+                "error": {"message": msg, "code": code, "type": kind, "link": ""}}),
         };
         st.tasks.push(task);
         st.calls.push(Call {
@@ -254,6 +289,20 @@ fn classification() {
         classify_doc_failure(&e("vector_embedding_error", "invalid_request")),
         DocFailure::Suspect(_)
     ));
+    for code in [
+        "malformed_payload",
+        "invalid_vectors_type",
+        "max_fields_limit_exceeded",
+        "missing_document_id",
+    ] {
+        assert!(
+            matches!(
+                classify_doc_failure(&e(code, "invalid_request")),
+                DocFailure::PerDocument(_)
+            ),
+            "{code}"
+        );
+    }
     assert!(matches!(
         classify_doc_failure(&e(
             "index_primary_key_multiple_candidates_found",
@@ -456,27 +505,225 @@ async fn payload_too_large_from_server_is_bisected() {
     assert!(report.rejected[0].reason.contains("payload_too_large"));
 }
 
+async fn mount_embedders(server: &MockServer, embedders: Value) {
+    Mock::given(method("GET"))
+        .and(path("/indexes/movies/settings/embedders"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(embedders))
+        .mount(server)
+        .await;
+}
+
 #[tokio::test]
-async fn embedder_outage_is_transient_but_one_bad_embedding_is_rejected() {
+async fn embedder_outage_is_transient() {
     let server = MockServer::start().await;
     let fake = Fake::default();
     fake.mount(&server).await;
+    mount_embedders(&server, json!({})).await;
     let s = sink(&server, opts());
     let all_fail: Vec<DocOp> = (0..4)
         .map(|i| replace(&i.to_string(), json!({"embed": "fail"})))
         .collect();
     let e = s.apply(&target(), all_fail).await.unwrap_err();
     assert!(matches!(e, SinkError::Transient(_)), "{e:?}");
+}
 
+#[tokio::test]
+async fn a_document_that_keeps_failing_with_an_embedder_error_is_never_rejected() {
+    // Others got through, but nothing proves this one is at fault: the
+    // embedder may be failing on it only. Rejecting it would dead-letter a
+    // good document and advance the checkpoint past it.
+    let server = MockServer::start().await;
+    let fake = Fake::default();
+    fake.mount(&server).await;
+    mount_embedders(&server, json!({"remote": {"source": "rest"}})).await;
+    let s = sink(&server, opts());
     let one_fails: Vec<DocOp> = (0..4)
         .map(|i| {
             let v = if i == 2 { "fail" } else { "ok" };
             replace(&i.to_string(), json!({"embed": v}))
         })
         .collect();
-    let report = s.apply(&target(), one_fails).await.unwrap();
-    assert_eq!(report.written, 3);
-    assert_eq!(report.rejected[0].op.id(), "2");
+    let e = s.apply(&target(), one_fails).await.unwrap_err();
+    assert!(
+        matches!(&e, SinkError::Transient(m) if m.contains("`2`")),
+        "{e:?}"
+    );
+    // Sent three times by bisection (4 → 2 → 1), then `suspect_retries`
+    // more times.
+    assert_eq!(fake.0.lock().unwrap().attempts["\"2\""], 3 + 3);
+}
+
+#[tokio::test]
+async fn intermittent_embedder_failures_are_retried_not_rejected() {
+    let server = MockServer::start().await;
+    let fake = Fake::default();
+    fake.mount(&server).await;
+    let s = sink(&server, opts());
+    // Doc 5 fails the first 4 times it is sent: in the full batch, its
+    // half, its quarter, then once isolated; it succeeds on a retry.
+    let ops: Vec<DocOp> = (0..8)
+        .map(|i| {
+            let flaky = if i == 5 { 4 } else { 0 };
+            replace(&i.to_string(), json!({"flaky": flaky}))
+        })
+        .collect();
+    let report = s.apply(&target(), ops).await.unwrap();
+    assert_eq!(report.written, 8);
+    assert!(report.rejected.is_empty(), "{report:?}");
+    let mut ids = fake.succeeded_ids();
+    ids.sort();
+    assert_eq!(ids, ["0", "1", "2", "3", "4", "5", "6", "7"]);
+}
+
+#[tokio::test]
+async fn internal_error_on_a_lone_document_is_transient() {
+    let server = MockServer::start().await;
+    let fake = Fake::default();
+    fake.mount(&server).await;
+    let s = sink(&server, opts());
+    let e = s
+        .apply(&target(), vec![replace("1", json!({"internal": true}))])
+        .await
+        .unwrap_err();
+    assert!(matches!(e, SinkError::Transient(_)), "{e:?}");
+    assert_eq!(fake.calls().len(), 4);
+}
+
+#[tokio::test]
+async fn malformed_vectors_are_rejected_even_alone() {
+    // Meilisearch reports a non-object `_vectors` as `internal`; the
+    // document itself shows it can never succeed.
+    let server = MockServer::start().await;
+    let fake = Fake::default();
+    fake.mount(&server).await;
+    let s = sink(&server, opts());
+    let report = s
+        .apply(
+            &target(),
+            vec![replace("v", json!({"_vectors": [1.0, 2.0]}))],
+        )
+        .await
+        .unwrap();
+    assert_eq!(report.written, 0);
+    assert_eq!(report.rejected.len(), 1);
+    assert!(
+        report.rejected[0]
+            .reason
+            .contains("`_vectors` must be an object")
+    );
+    // No pointless retries.
+    assert_eq!(fake.calls().len(), 1);
+
+    let ops = vec![
+        replace("a", json!({})),
+        replace("v", json!({"_vectors": "x"})),
+        replace("b", json!({})),
+    ];
+    let report = s.apply(&target(), ops).await.unwrap();
+    assert_eq!(report.written, 2);
+    assert_eq!(report.rejected[0].op.id(), "v");
+}
+
+#[tokio::test]
+async fn missing_user_provided_vectors_are_rejected() {
+    let server = MockServer::start().await;
+    let fake = Fake::default();
+    fake.mount(&server).await;
+    mount_embedders(
+        &server,
+        json!({"up": {"source": "userProvided", "dimensions": 3}}),
+    )
+    .await;
+    let s = sink(&server, opts());
+    let ops = vec![
+        replace(
+            "ok",
+            json!({"needs_vectors": true, "_vectors": {"up": [1, 2, 3]}}),
+        ),
+        replace("none", json!({"needs_vectors": true})),
+    ];
+    let report = s.apply(&target(), ops).await.unwrap();
+    assert_eq!(report.written, 1);
+    assert_eq!(report.rejected.len(), 1);
+    assert_eq!(report.rejected[0].op.id(), "none");
+    assert!(report.rejected[0].reason.contains("`_vectors.up`"));
+}
+
+#[test]
+fn shape_problems() {
+    assert_eq!(
+        shape_problem(&replace("1", json!({"_vectors": null}))),
+        None
+    );
+    assert_eq!(
+        shape_problem(&replace("1", json!({"_vectors": {"a": [1]}}))),
+        None
+    );
+    assert!(shape_problem(&replace("1", json!({"_vectors": 3}))).is_some());
+    assert_eq!(shape_problem(&delete("1")), None);
+    let nested = |levels: usize| {
+        let mut v = json!(1);
+        for _ in 0..levels {
+            v = json!([v]);
+        }
+        replace("1", json!({ "x": v }))
+    };
+    // The document object plus 126 arrays is the deepest Meilisearch takes.
+    assert_eq!(shape_problem(&nested(126)), None);
+    assert!(shape_problem(&nested(127)).is_some());
+}
+
+#[test]
+fn jitter_stays_in_range() {
+    for _ in 0..100 {
+        let d = client::jitter(Duration::from_millis(100));
+        assert!(d >= Duration::from_millis(50) && d <= Duration::from_millis(100));
+    }
+    assert_eq!(client::jitter(Duration::ZERO), Duration::ZERO);
+}
+
+#[tokio::test]
+async fn dropping_calls_at_any_point_leaves_the_sink_usable() {
+    let server = MockServer::start().await;
+    let fake = Fake::default();
+    fake.mount(&server).await;
+    mount_embedders(&server, json!({})).await;
+    let s = sink(
+        &server,
+        SinkOptions {
+            gzip: true,
+            suspect_backoff: Duration::from_millis(5),
+            ..opts()
+        },
+    );
+    // Big enough to gzip on the blocking pool, with a document that needs
+    // bisection and resends: the drops land in every await point.
+    let batch = || -> Vec<DocOp> {
+        let mut ops: Vec<DocOp> = (0..20)
+            .map(|i| replace(&i.to_string(), json!({"t": "x".repeat(8 * 1024)})))
+            .collect();
+        ops.push(replace("flaky", json!({"flaky": 6})));
+        ops.push(delete("3"));
+        ops
+    };
+    for micros in [0, 50, 200, 500, 1_000, 2_000, 5_000, 10_000] {
+        let _ =
+            tokio::time::timeout(Duration::from_micros(micros), s.apply(&target(), batch())).await;
+    }
+    // A call that never finishes (task stuck processing) is dropped too.
+    fake.0.lock().unwrap().processing_polls = usize::MAX;
+    let dropped =
+        tokio::time::timeout(Duration::from_millis(30), s.apply(&target(), batch())).await;
+    assert!(dropped.is_err());
+    {
+        let mut st = fake.0.lock().unwrap();
+        st.processing_polls = 0;
+        st.attempts.clear();
+    }
+    let report = s.apply(&target(), batch()).await.unwrap();
+    assert_eq!(report.written, 21);
+    assert_eq!(report.deleted, 1);
+    assert!(report.rejected.is_empty());
 }
 
 #[tokio::test]
@@ -585,6 +832,142 @@ async fn http_errors_map_to_reactions() {
         assert_eq!(got, want, "{e:?}");
         assert!(!e.to_string().contains(KEY));
     }
+}
+
+#[tokio::test]
+async fn write_blips_are_retried() {
+    for blip in [
+        err(503, "", ""),
+        err(500, "internal", "internal"),
+        err(408, "", ""),
+        ResponseTemplate::new(502).set_body_string("<html>bad gateway</html>"),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(blip)
+            .up_to_n_times(3)
+            .with_priority(1)
+            .expect(3)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(task_ok(0))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path("/tasks/0"))
+            .respond_with(task_state(0, "succeeded", None))
+            .mount(&server)
+            .await;
+        let report = sink(&server, opts())
+            .apply(&target(), vec![replace("1", json!({}))])
+            .await
+            .unwrap();
+        assert_eq!(report.written, 1);
+    }
+}
+
+#[tokio::test]
+async fn write_retries_are_bounded() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(err(503, "", ""))
+        .expect(1 + 2)
+        .mount(&server)
+        .await;
+    let s = sink(
+        &server,
+        SinkOptions {
+            request_retries: 2,
+            ..opts()
+        },
+    );
+    let e = s
+        .apply(&target(), vec![replace("1", json!({}))])
+        .await
+        .unwrap_err();
+    assert!(matches!(e, SinkError::Transient(_)), "{e:?}");
+}
+
+#[tokio::test]
+async fn retry_after_is_honoured_and_capped() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(err(429, "too_many_requests", "system").insert_header("Retry-After", "1"))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(task_ok(0))
+        .mount(&server)
+        .await;
+    Mock::given(path("/tasks/0"))
+        .respond_with(task_state(0, "succeeded", None))
+        .mount(&server)
+        .await;
+    let started = std::time::Instant::now();
+    sink(&server, opts())
+        .apply(&target(), vec![replace("1", json!({}))])
+        .await
+        .unwrap();
+    assert!(started.elapsed() >= Duration::from_millis(900));
+
+    // A huge Retry-After is capped by max_request_backoff.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(err(429, "too_many_requests", "system").insert_header("Retry-After", "3600"))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(task_ok(0))
+        .mount(&server)
+        .await;
+    Mock::given(path("/tasks/0"))
+        .respond_with(task_state(0, "succeeded", None))
+        .mount(&server)
+        .await;
+    let started = std::time::Instant::now();
+    sink(
+        &server,
+        SinkOptions {
+            max_request_backoff: Duration::from_millis(20),
+            ..opts()
+        },
+    )
+    .apply(&target(), vec![replace("1", json!({}))])
+    .await
+    .unwrap();
+    assert!(started.elapsed() < Duration::from_secs(2));
+}
+
+#[tokio::test]
+async fn client_errors_and_swaps_are_not_resent() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/indexes/movies/documents"))
+        .respond_with(err(400, "malformed_payload", "invalid_request"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    // The swap may have been enqueued before the 502: resending it could
+    // swap the indexes back.
+    Mock::given(method("POST"))
+        .and(path("/swap-indexes"))
+        .respond_with(err(502, "", ""))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let s = sink(&server, opts());
+    let e = s
+        .apply(&target(), vec![replace("1", json!({}))])
+        .await
+        .unwrap_err();
+    assert!(matches!(e, SinkError::Fatal(_)), "{e:?}");
+    let e = s.swap("a", "b").await.unwrap_err();
+    assert!(matches!(e, SinkError::Transient(_)), "{e:?}");
 }
 
 #[tokio::test]
@@ -792,6 +1175,48 @@ async fn delete_missing_index_is_ok() {
 }
 
 #[tokio::test]
+async fn delete_all_documents_cases() {
+    let server = MockServer::start().await;
+    Mock::given(method("DELETE"))
+        .and(path("/indexes/movies/documents"))
+        .respond_with(task_ok(7))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(path("/tasks/7"))
+        .respond_with(task_state(7, "succeeded", None))
+        .mount(&server)
+        .await;
+    // Missing index, reported on enqueue or by the task: nothing to delete.
+    Mock::given(method("DELETE"))
+        .and(path("/indexes/gone404/documents"))
+        .respond_with(err(404, "index_not_found", "invalid_request"))
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/indexes/gone/documents"))
+        .respond_with(task_ok(8))
+        .mount(&server)
+        .await;
+    Mock::given(path("/tasks/8"))
+        .respond_with(task_state(8, "failed", Some("index_not_found")))
+        .mount(&server)
+        .await;
+    // Any other failure is mapped.
+    Mock::given(method("DELETE"))
+        .and(path("/indexes/locked/documents"))
+        .respond_with(err(403, "invalid_api_key", "auth"))
+        .mount(&server)
+        .await;
+    let s = sink(&server, opts());
+    s.delete_all_documents("movies").await.unwrap();
+    s.delete_all_documents("gone404").await.unwrap();
+    s.delete_all_documents("gone").await.unwrap();
+    let e = s.delete_all_documents("locked").await.unwrap_err();
+    assert!(matches!(e, SinkError::Config(_)), "{e:?}");
+}
+
+#[tokio::test]
 async fn copy_settings_cases() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
@@ -819,6 +1244,69 @@ async fn copy_settings_cases() {
     let s = sink(&server, opts());
     s.copy_settings("missing", "shadow").await.unwrap();
     s.copy_settings("live", "shadow").await.unwrap();
+}
+
+#[tokio::test]
+async fn copy_settings_refuses_redacted_api_keys() {
+    let server = MockServer::start().await;
+    // What Meilisearch 1.57 returns for embedders configured with keys.
+    let cases = [
+        (
+            "oa",
+            json!({"oa": {"source": "openAi", "model": "m", "apiKey": "sk-XXXXX..."}}),
+        ),
+        (
+            "mix",
+            json!({"mix": {"source": "composite",
+                "searchEmbedder": {"source": "userProvided", "dimensions": 3},
+                "indexingEmbedder": {"source": "rest", "apiKey": "XXX..."}}}),
+        ),
+    ];
+    for (i, (name, embedders)) in cases.into_iter().enumerate() {
+        let from = format!("live{i}");
+        Mock::given(method("GET"))
+            .and(path(format!("/indexes/{from}/settings")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "searchableAttributes": ["*"],
+                "embedders": embedders,
+            })))
+            .mount(&server)
+            .await;
+        let e = sink(&server, opts())
+            .copy_settings(&from, "shadow")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&e, SinkError::Config(m) if m.contains(&format!("`{name}`"))),
+            "{e:?}"
+        );
+        assert!(!e.to_string().contains("XXX"));
+    }
+    // Embedders without a key are copied.
+    let settings = json!({"embedders": {
+        "up": {"source": "userProvided", "dimensions": 3},
+        "local": {"source": "ollama", "url": "http://x", "apiKey": null},
+    }});
+    Mock::given(method("GET"))
+        .and(path("/indexes/keyless/settings"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(settings.clone()))
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path("/indexes/shadow/settings"))
+        .and(wiremock::matchers::body_json(settings))
+        .respond_with(task_ok(9))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(path("/tasks/9"))
+        .respond_with(task_state(9, "succeeded", None))
+        .mount(&server)
+        .await;
+    sink(&server, opts())
+        .copy_settings("keyless", "shadow")
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
