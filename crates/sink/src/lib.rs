@@ -16,7 +16,7 @@ use serde::Deserialize;
 use serde::ser::{Serialize, SerializeMap, Serializer};
 use serde_json::json;
 
-use client::{Client, DocFailure, Payload, TaskStatus, classify_doc_failure, map_api_error};
+use client::{Client, DocFailure, Payload, Retry, TaskStatus, classify_doc_failure, map_api_error};
 
 /// Meilisearch's default `http_payload_size_limit` is 100 MiB; stay under.
 pub const DEFAULT_MAX_PAYLOAD_BYTES: usize = 90 * 1024 * 1024;
@@ -46,6 +46,14 @@ pub struct SinkOptions {
     /// First delay before resending such a document; doubled each time,
     /// jittered.
     pub suspect_backoff: Duration,
+    /// How many more times one HTTP request is sent after a 408, 429, 5xx
+    /// or transport error before the call fails with `Transient`. Document
+    /// writes are idempotent by id, so resending them is safe.
+    pub request_retries: u32,
+    /// First delay between two attempts; doubled each time, jittered.
+    pub request_backoff: Duration,
+    /// Cap of one delay, `Retry-After` included.
+    pub max_request_backoff: Duration,
 }
 
 impl Default for SinkOptions {
@@ -60,6 +68,9 @@ impl Default for SinkOptions {
             gzip: true,
             suspect_retries: 3,
             suspect_backoff: Duration::from_secs(1),
+            request_retries: 5,
+            request_backoff: Duration::from_millis(200),
+            max_request_backoff: Duration::from_secs(30),
         }
     }
 }
@@ -560,6 +571,7 @@ impl MeiliSink {
     async fn index_task(
         &self,
         context: &str,
+        retry: Retry,
         method: Method,
         segments: &[&str],
         payload: Option<Payload>,
@@ -567,7 +579,7 @@ impl MeiliSink {
     ) -> Result<(), SinkError> {
         let task = self
             .client
-            .run_task(context, method, segments, payload)
+            .run_task(context, retry, method, segments, payload)
             .await?;
         match task.status {
             TaskStatus::Succeeded => Ok(()),
@@ -660,6 +672,7 @@ impl Sink for MeiliSink {
                     return self
                         .index_task(
                             "setting index primary key",
+                            Retry::Idempotent,
                             Method::PATCH,
                             &["indexes", uid],
                             Some(Payload::Json(json!({ "primaryKey": pk }))),
@@ -672,6 +685,9 @@ impl Sink for MeiliSink {
                         .client
                         .run_task(
                             "creating index",
+                            // A duplicate fails with `index_already_exists`,
+                            // handled below.
+                            Retry::Idempotent,
                             Method::POST,
                             &["indexes"],
                             Some(Payload::Json(json!({ "uid": uid, "primaryKey": pk }))),
@@ -718,6 +734,8 @@ impl Sink for MeiliSink {
     async fn swap(&self, a: &str, b: &str) -> Result<(), SinkError> {
         self.index_task(
             "swapping indexes",
+            // A swap enqueued twice swaps back.
+            Retry::ConnectOnly,
             Method::POST,
             &["swap-indexes"],
             Some(Payload::Json(json!([{ "indexes": [a, b] }]))),
@@ -764,6 +782,7 @@ impl Sink for MeiliSink {
         // creates `to` when it does not exist yet.
         self.index_task(
             "copying settings",
+            Retry::Idempotent,
             Method::PATCH,
             &["indexes", to, "settings"],
             Some(Payload::Json(settings)),

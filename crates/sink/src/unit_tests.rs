@@ -21,6 +21,7 @@ fn opts() -> SinkOptions {
         request_timeout: Duration::from_secs(5),
         gzip: false,
         suspect_backoff: Duration::from_millis(1),
+        request_backoff: Duration::from_millis(1),
         ..SinkOptions::default()
     }
 }
@@ -787,6 +788,142 @@ async fn http_errors_map_to_reactions() {
         assert_eq!(got, want, "{e:?}");
         assert!(!e.to_string().contains(KEY));
     }
+}
+
+#[tokio::test]
+async fn write_blips_are_retried() {
+    for blip in [
+        err(503, "", ""),
+        err(500, "internal", "internal"),
+        err(408, "", ""),
+        ResponseTemplate::new(502).set_body_string("<html>bad gateway</html>"),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(blip)
+            .up_to_n_times(3)
+            .with_priority(1)
+            .expect(3)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(task_ok(0))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path("/tasks/0"))
+            .respond_with(task_state(0, "succeeded", None))
+            .mount(&server)
+            .await;
+        let report = sink(&server, opts())
+            .apply(&target(), vec![replace("1", json!({}))])
+            .await
+            .unwrap();
+        assert_eq!(report.written, 1);
+    }
+}
+
+#[tokio::test]
+async fn write_retries_are_bounded() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(err(503, "", ""))
+        .expect(1 + 2)
+        .mount(&server)
+        .await;
+    let s = sink(
+        &server,
+        SinkOptions {
+            request_retries: 2,
+            ..opts()
+        },
+    );
+    let e = s
+        .apply(&target(), vec![replace("1", json!({}))])
+        .await
+        .unwrap_err();
+    assert!(matches!(e, SinkError::Transient(_)), "{e:?}");
+}
+
+#[tokio::test]
+async fn retry_after_is_honoured_and_capped() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(err(429, "too_many_requests", "system").insert_header("Retry-After", "1"))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(task_ok(0))
+        .mount(&server)
+        .await;
+    Mock::given(path("/tasks/0"))
+        .respond_with(task_state(0, "succeeded", None))
+        .mount(&server)
+        .await;
+    let started = std::time::Instant::now();
+    sink(&server, opts())
+        .apply(&target(), vec![replace("1", json!({}))])
+        .await
+        .unwrap();
+    assert!(started.elapsed() >= Duration::from_millis(900));
+
+    // A huge Retry-After is capped by max_request_backoff.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(err(429, "too_many_requests", "system").insert_header("Retry-After", "3600"))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(task_ok(0))
+        .mount(&server)
+        .await;
+    Mock::given(path("/tasks/0"))
+        .respond_with(task_state(0, "succeeded", None))
+        .mount(&server)
+        .await;
+    let started = std::time::Instant::now();
+    sink(
+        &server,
+        SinkOptions {
+            max_request_backoff: Duration::from_millis(20),
+            ..opts()
+        },
+    )
+    .apply(&target(), vec![replace("1", json!({}))])
+    .await
+    .unwrap();
+    assert!(started.elapsed() < Duration::from_secs(2));
+}
+
+#[tokio::test]
+async fn client_errors_and_swaps_are_not_resent() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/indexes/movies/documents"))
+        .respond_with(err(400, "malformed_payload", "invalid_request"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    // The swap may have been enqueued before the 502: resending it could
+    // swap the indexes back.
+    Mock::given(method("POST"))
+        .and(path("/swap-indexes"))
+        .respond_with(err(502, "", ""))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let s = sink(&server, opts());
+    let e = s
+        .apply(&target(), vec![replace("1", json!({}))])
+        .await
+        .unwrap_err();
+    assert!(matches!(e, SinkError::Fatal(_)), "{e:?}");
+    let e = s.swap("a", "b").await.unwrap_err();
+    assert!(matches!(e, SinkError::Transient(_)), "{e:?}");
 }
 
 #[tokio::test]
