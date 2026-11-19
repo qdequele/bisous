@@ -1,0 +1,131 @@
+# Connect in the Meilisearch Lab: integration contract
+
+This is the cross-repo contract between meili-connect (repo `qdequele/bisous`),
+the Lab (`meilisearch-lab`) and the deploy box (`qdq-server`). Each repo
+implements its side of this page.
+
+## Names
+
+| Thing | Value |
+|---|---|
+| Product label, nav category | **Connect** |
+| Instance kind, product slug, event `product` | `connect` |
+| Console route prefix | `/connect` |
+| Engine repo | `qdequele/bisous` |
+| Binary, image | `meili-connect`, `ghcr.io/qdequele/bisous` |
+| Tenant header (Lab → engine) | `X-Connect-Tenant-Id: <account id>` |
+| Lab-managed Meilisearch key name | `lab-connect` |
+| Deploy folder in qdq-server | `connect/` |
+
+Connect is hosted by Meilisearch only, like Gateway and Pipelines: every team
+gets one built-in instance row served by a `hosted_engines` row.
+
+## Auth
+
+- Lab → engine: `Authorization: Bearer <hosted engine credential>` (the
+  engine's `LAB_SERVICE_TOKEN`) plus `X-Connect-Tenant-Id`. The engine refuses
+  the token without the header.
+- Engine → Lab: `X-Lab-Instance-Id` + `Authorization: Bearer
+  <LAB_INSTANCE_SECRET>` for `/internal/*`; event batches are HMAC-signed
+  (`X-Lab-Timestamp`, `X-Lab-Signature: sha256=HMAC(secret, "<ts>.<body>")`).
+
+## Destination
+
+A tenant never sends a Meilisearch URL or key to the hosted engine. The
+console sends `destination: {"instance": "<slug of a team Meilisearch
+instance>"}` on `POST /syncs` and `PUT /syncs/{id}`; the Lab's proxy replaces
+it with `{"url", "api_key"}`, where the key is a scoped `lab-connect` key the
+Lab mints on that instance (documents, indexes, settings, tasks, swap actions
+on all indexes; same lifecycle as `lab-pipelines`). On responses the Lab maps
+the URL back to the instance slug. Standalone meili-connect keeps the
+`{"url", "api_key"}` form.
+
+## Pricing
+
+Two meters, both reported by the engine and priced by the Lab
+(`saas/config/pricing.yml`, then `price_versions`):
+
+| Unit | Meaning | Launch price |
+|---|---|---|
+| `documents_streamed` | Document writes and deletes applied from the change stream | $1.00 per million |
+| `documents_snapshot` | Documents written by a first sync or a resync the user asked for | $0.20 per million |
+| `documents_resync` | Documents rewritten by a resync the system started (position lost on the origin) | Free, reported |
+| `bytes` | Uncompressed payload bytes sent to Meilisearch | The Lab's bandwidth price, $0.10 per GB |
+| `sync_seconds` | Seconds a sync spent in `snapshotting` or `streaming` | Free at launch, reported |
+
+Rules:
+
+- Only documents Meilisearch accepted are counted. Rejected documents, skipped
+  records and replays after a crash that the engine can identify as replays
+  of an already-counted batch are not billed. (A replay after a crash between
+  the write and the checkpoint is counted twice at most once per crash; this
+  is accepted and bounded by one batch.)
+- A paused or held sync costs nothing.
+- Prices are sub-credit per document (1 credit = $0.01), so the Lab prices
+  per unit in micro-USD and carries fractions per account, as it already does
+  for pass-through provider cost.
+- A team out of credits: the Lab answers `can_spend: false` on the account
+  lookup; the engine sets that team's syncs to `Held` with the message
+  `out_of_credits` and resumes them when credits are back. Nothing is torn
+  down, so the origin keeps the position (bounded by the lag guard).
+
+Worked examples: a first sync of 1 M rows of 1 KB costs $0.20 + $0.10 = $0.30.
+A table taking 100 k changes a day at 1 KB costs about $3.00 + $0.30 a month.
+
+## Usage event
+
+One `usage.recorded` event per sync per flush interval with non-zero units:
+
+```json
+{
+  "id": "<UUIDv7>",
+  "type": "usage.recorded",
+  "occurred_at": "2026-11-19T10:00:00Z",
+  "account_id": "<tenant>",
+  "api_key_id": null,
+  "product": "connect",
+  "data": {
+    "operation": "sync",
+    "units": {
+      "documents_streamed": 1200,
+      "documents_snapshot": 0,
+      "documents_resync": 0,
+      "bytes": 1482113,
+      "sync_seconds": 60
+    },
+    "job_id": "<sync id>",
+    "description": "postgres → products"
+  }
+}
+```
+
+The Lab owns `lab-events.schema.json`: it adds `connect` to `product` and the
+`sync` operation with those unit names first; the engine vendors the schema.
+
+## Engine API the Lab relies on
+
+Everything in `docs/openapi.yaml`, plus:
+
+- `GET /usage?from=&to=&group_by=day|sync`: the units above per day and per
+  sync for the calling tenant (from Tinybird when configured, else from the
+  state database). Drives the console's Usage page.
+- `GET /syncs/{id}/status` includes `lag` (`{"seconds", "bytes"}` when the
+  source can tell), `documents` totals per unit, `bytes`, and
+  `dead_letters`.
+- `GET /metrics`: Prometheus text, authenticated with `METRICS_TOKEN` (never
+  the tenant tokens), no tenant labels beyond counts.
+- `GET /health`.
+
+## Telemetry and analytics
+
+- **Monitoring** (operators): Prometheus `/metrics` scraped by the box, JSON
+  logs to Loki with alert rules (sync failed, held, lag above threshold,
+  outbox backlog, sink error rate, process restarts).
+- **Analytics and billing reconciliation**: every usage flush is also sent to
+  Tinybird (`tinybird/` in the engine repo: one append-only datasource with
+  stable column names, a daily materialised view, a per-tenant pipe),
+  deduplicated by event id, at-least-once. The Lab's credits ledger stays the
+  billing source of truth; Tinybird is for dashboards and for checking the
+  ledger against what the engine metered.
+- **Product analytics** (console): the Lab's existing analytics events for
+  the Connect pages (sync created, first sync completed, sync held, resync).
