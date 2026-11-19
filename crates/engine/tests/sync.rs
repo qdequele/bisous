@@ -587,8 +587,9 @@ async fn unmapped_collections_and_patches() {
     stop(cancel, handle).await;
     let docs = h.sink.docs(INDEX);
     assert_eq!(docs.len(), 1);
-    // Upsert + patch coalesced into one replace: `b` is gone, not null.
-    assert_eq!(docs["2"], doc(json!({"id": "2", "a": 5})));
+    // Upsert + patch coalesced into one replace: `b` is null, as when the
+    // two land in separate batches.
+    assert_eq!(docs["2"], doc(json!({"id": "2", "a": 5, "b": null})));
     assert_eq!(h.sink.state().batch_sizes.last(), Some(&1));
 }
 
