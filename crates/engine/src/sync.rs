@@ -349,11 +349,13 @@ impl Runner<'_> {
         let sink = Arc::clone(&self.deps.sink);
         let mut targets = Vec::with_capacity(self.live.len());
         let mut swaps: Vec<(IndexTarget, IndexTarget)> = Vec::new();
+        // Every live index first: one keyed differently fails with the
+        // sink's `Config` error before any shadow is built, since a swap
+        // would otherwise replace it.
+        for live in &self.live {
+            guarded(self.cancel, sink.ensure_index(live)).await?;
+        }
         for live in self.live.clone() {
-            if let Some((_, shadow)) = swaps.iter().find(|(l, _)| l.uid == live.uid) {
-                targets.push(shadow.clone());
-                continue;
-            }
             let populated = snapshot
                 && guarded(self.cancel, sink.document_count(&live.uid))
                     .await?
@@ -372,7 +374,6 @@ impl Runner<'_> {
                 targets.push(shadow.clone());
                 swaps.push((live, shadow));
             } else {
-                guarded(self.cancel, sink.ensure_index(&live)).await?;
                 targets.push(live);
             }
         }

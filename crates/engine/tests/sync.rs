@@ -653,3 +653,34 @@ async fn a_source_may_drop_its_ack_receiver() {
     assert!(!handle.is_finished());
     stop(cancel, handle).await;
 }
+
+#[tokio::test]
+async fn an_index_keyed_differently_is_refused_before_any_shadow() {
+    let h = Harness::new();
+    seed_rows(&h, 1..=3);
+    h.sink.create(
+        INDEX,
+        json!({}),
+        vec![("x".into(), doc(json!({"sku": "x"})))],
+    );
+    h.sink
+        .state()
+        .indexes
+        .get_mut(INDEX)
+        .expect("live")
+        .primary_key = "sku".into();
+
+    let result = finish(spawn(&h, spec(), options()).1).await;
+    assert!(
+        matches!(result, Err(EngineError::Sink(SinkError::Config(_)))),
+        "{result:?}"
+    );
+    let calls = h.sink.calls();
+    assert!(
+        !calls.iter().any(|c| c.contains("__connect_")),
+        "no shadow built: {calls:?}"
+    );
+    assert_eq!(h.sink.state().indexes[INDEX].primary_key, "sku");
+    assert_eq!(h.sink.docs(INDEX).len(), 1, "live index untouched");
+    assert_eq!(h.origin.state().snapshots, 0);
+}
