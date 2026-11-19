@@ -18,7 +18,6 @@ use serde_json::{Value, json};
 use crate::auth::{Principal, Scope};
 use crate::error::{ApiError, source_error};
 use crate::guard::{VetError, coarse_source_error, vet_destination, vet_source};
-use crate::manager::RemoveError;
 use crate::redact::{
     REDACTED, check_placeholders, contains_redacted, redact_spec, restore_redacted,
 };
@@ -259,8 +258,7 @@ pub async fn create_sync(
     let id = uuid::Uuid::now_v7().to_string();
     let spec = input.into_spec(id, scope.tenant.clone());
     validate(&state, &spec, coarse(&scope)).await?;
-    let stored = state.repo().create_sync(scope.tenant(), &spec).await?;
-    state.manager.run(spec).await?;
+    let stored = state.manager.create(spec).await?;
     tracing::info!(sync_id = %stored.spec.id, tenant = ?scope.tenant(), "sync created");
     Ok((StatusCode::CREATED, Json(view(&stored)?)).into_response())
 }
@@ -286,18 +284,21 @@ pub async fn update_sync(
     input: Result<Json<Value>, JsonRejection>,
 ) -> ApiResult<Json<SyncView>> {
     let mut value = body(input)?;
-    let current = owned(&state, &scope, &id).await?;
-    let stored_json = serde_json::to_value(&current.spec)
-        .map_err(|_| ApiError::internal("cannot serialize the sync"))?;
-    check_placeholders(&value, &stored_json).map_err(ApiError::secret_required)?;
-    restore_redacted(&mut value, &stored_json).map_err(ApiError::invalid)?;
-    let input: SyncInput =
-        serde_json::from_value(value).map_err(|e| ApiError::invalid(e.to_string()))?;
-    let spec = input.into_spec(current.spec.id.clone(), current.spec.tenant.clone());
-    validate(&state, &spec, coarse(&scope)).await?;
-    let stored = state.repo().update_sync(scope.tenant(), &spec).await?;
-    state.manager.run(spec).await?;
-    tracing::info!(sync_id = %id, "sync updated and restarted");
+    let coarse = coarse(&scope);
+    // Everything that depends on the stored spec runs inside the sync's
+    // lock, on the row read there.
+    let prepare = async |current: &StoredSync| -> ApiResult<SyncSpec> {
+        let stored_json = serde_json::to_value(&current.spec)
+            .map_err(|_| ApiError::internal("cannot serialize the sync"))?;
+        check_placeholders(&value, &stored_json).map_err(ApiError::secret_required)?;
+        restore_redacted(&mut value, &stored_json).map_err(ApiError::invalid)?;
+        let input: SyncInput = serde_json::from_value(std::mem::take(&mut value))
+            .map_err(|e| ApiError::invalid(e.to_string()))?;
+        let spec = input.into_spec(current.spec.id.clone(), current.spec.tenant.clone());
+        validate(&state, &spec, coarse).await?;
+        Ok(spec)
+    };
+    let stored = state.manager.update(scope.tenant(), &id, prepare).await?;
     Ok(Json(view(&stored)?))
 }
 
@@ -314,30 +315,10 @@ pub async fn delete_sync(
     query: Result<Query<DeleteQuery>, QueryRejection>,
 ) -> ApiResult<StatusCode> {
     let Query(query) = query?;
-    let current = owned(&state, &scope, &id).await?;
-    match state.manager.remove(&current.spec, query.force).await {
-        Ok(()) => {}
-        Err(RemoveError::Teardown(message)) => {
-            return Err(ApiError::new(
-                StatusCode::BAD_GATEWAY,
-                "teardown_failed",
-                format!(
-                    "{message}; the sync is kept (stopped). Retry, or delete with ?force=true \
-                     and clean up the origin by hand"
-                ),
-            ));
-        }
-        Err(RemoveError::Supervisor(e)) => return Err(e.into()),
-    }
-    if state.lab_events
-        && let Err(e) = state.manager.meter().flush_one(state.outbox(), &id).await
-    {
-        tracing::warn!(sync_id = %id, error = %e, "usage of a deleted sync could not be enqueued");
-    } else if !state.lab_events {
-        state.manager.meter().forget(&id);
-    }
-    state.repo().delete_sync(scope.tenant(), &id).await?;
-    tracing::info!(sync_id = %id, "sync deleted");
+    state
+        .manager
+        .delete(scope.tenant(), &id, query.force)
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -348,8 +329,7 @@ pub async fn pause_sync(
     scope: Scope,
     Path(id): Path<String>,
 ) -> ApiResult<Json<Value>> {
-    owned(&state, &scope, &id).await?;
-    state.manager.pause(&id).await?;
+    state.manager.pause(scope.tenant(), &id).await?;
     status_json(&state, &scope, &id).await.map(Json)
 }
 
@@ -358,11 +338,7 @@ pub async fn resume_sync(
     scope: Scope,
     Path(id): Path<String>,
 ) -> ApiResult<Json<Value>> {
-    let current = owned(&state, &scope, &id).await?;
-    let running = state.manager.status(&id).await?.is_some_and(|s| s.running);
-    if !running {
-        state.manager.run(current.spec).await?;
-    }
+    state.manager.resume(scope.tenant(), &id).await?;
     status_json(&state, &scope, &id).await.map(Json)
 }
 
@@ -371,8 +347,7 @@ pub async fn resync_sync(
     scope: Scope,
     Path(id): Path<String>,
 ) -> ApiResult<Json<Value>> {
-    let current = owned(&state, &scope, &id).await?;
-    state.manager.resync(current.spec).await?;
+    state.manager.resync(scope.tenant(), &id).await?;
     status_json(&state, &scope, &id).await.map(Json)
 }
 
@@ -381,14 +356,7 @@ pub async fn release_sync(
     scope: Scope,
     Path(id): Path<String>,
 ) -> ApiResult<Json<Value>> {
-    let current = owned(&state, &scope, &id).await?;
-    let phase = state.state_store().load(&id).await?.map(|s| s.phase);
-    if phase != Some(SyncPhase::Held) {
-        return Err(ApiError::conflict(format!(
-            "sync {id} is not held; only a held sync can be released"
-        )));
-    }
-    state.manager.release(current.spec).await?;
+    state.manager.release(scope.tenant(), &id).await?;
     status_json(&state, &scope, &id).await.map(Json)
 }
 

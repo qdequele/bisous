@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -38,6 +38,10 @@ const SECRET_MARK: &str = "hunter2";
 struct Probe {
     teardown_fails: AtomicBool,
     teardowns: AtomicUsize,
+    /// Each teardown takes this long.
+    teardown_delay_ms: AtomicU64,
+    /// The config of the last source the engine opened.
+    last_opened: std::sync::Mutex<Option<Value>>,
 }
 
 struct FakeSources(Arc<Probe>);
@@ -126,6 +130,7 @@ impl Source for FakeSource {
         if let Some(e) = self.config.get("open_error").and_then(Value::as_str) {
             return Err(SourceError::Config(e.to_owned()));
         }
+        *self.probe.last_opened.lock().unwrap() = Some(self.config.clone());
         Ok(match resume {
             Some(_) => Opened::Resumed,
             None => Opened::Fresh {
@@ -167,6 +172,10 @@ impl Source for FakeSource {
 
     async fn teardown(&mut self) -> Result<(), SourceError> {
         self.probe.teardowns.fetch_add(1, Ordering::SeqCst);
+        let delay = self.probe.teardown_delay_ms.load(Ordering::SeqCst);
+        if delay > 0 {
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+        }
         if self.probe.teardown_fails.load(Ordering::SeqCst) {
             Err(SourceError::Transient("origin unreachable".into()))
         } else {
@@ -1010,6 +1019,81 @@ async fn lab_callers_and_tenant_syncs_get_coarse_errors() {
         st["message"].as_str().unwrap().contains("DRIVER-DETAIL"),
         "{st}"
     );
+}
+
+// ------------------------------------------------------------- concurrency
+
+/// A `PUT` that read the sync before a `DELETE` removed it must not start a
+/// supervisor for the deleted sync.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn put_racing_delete_never_resurrects_the_sync() {
+    let a = app(AuthConfig::default());
+    let id = create(&a, &[], "s").await;
+    let (_, mut current) = call(&a.router, "GET", &format!("/syncs/{id}"), &[], None).await;
+    current["source"]["config"]["rows"] = json!(7);
+    // The DELETE holds the sync in its teardown while the PUT comes in.
+    a.probe.teardown_delay_ms.store(300, Ordering::SeqCst);
+    let router = a.router.clone();
+    let uri = format!("/syncs/{id}");
+    let delete = tokio::spawn(async move { call(&router, "DELETE", &uri, &[], None).await.0 });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let (put, body) = call(
+        &a.router,
+        "PUT",
+        &format!("/syncs/{id}"),
+        &[],
+        Some(current),
+    )
+    .await;
+    assert_eq!(delete.await.unwrap(), StatusCode::NO_CONTENT);
+    assert_eq!(put, StatusCode::NOT_FOUND, "{body}");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(a.state.manager.running_ids().is_empty());
+    assert!(a.store.get_sync(None, &id).await.unwrap().is_none());
+    assert!(
+        meili_connect_core::StateStore::load(&*a.store, &id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+/// Whatever the interleaving of a `resume` and a `PUT`, the sync ends up
+/// running the stored (new) spec.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn resume_racing_put_runs_the_stored_spec() {
+    let a = app(AuthConfig::default());
+    let id = create(&a, &[], "s").await;
+    for round in 0..15u64 {
+        let (status, _) = call(&a.router, "POST", &format!("/syncs/{id}/pause"), &[], None).await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, mut current) = call(&a.router, "GET", &format!("/syncs/{id}"), &[], None).await;
+        current["source"]["config"]["rows"] = json!(100 + round);
+        let (r1, r2) = (a.router.clone(), a.router.clone());
+        let resume_uri = format!("/syncs/{id}/resume");
+        let put_uri = format!("/syncs/{id}");
+        let resume = tokio::spawn(async move { call(&r1, "POST", &resume_uri, &[], None).await.0 });
+        let put =
+            tokio::spawn(async move { call(&r2, "PUT", &put_uri, &[], Some(current)).await.0 });
+        assert_eq!(resume.await.unwrap(), StatusCode::OK);
+        assert_eq!(put.await.unwrap(), StatusCode::OK);
+        // The running sync must be on the new spec: resume it if the PUT
+        // left it paused, then wait for its open.
+        call(&a.router, "POST", &format!("/syncs/{id}/resume"), &[], None).await;
+        let want = json!(100 + round);
+        wait_for(async || {
+            a.probe
+                .last_opened
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|c| c["rows"] == want)
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let opened = a.probe.last_opened.lock().unwrap().clone().unwrap();
+        assert_eq!(opened["rows"], want, "round {round}");
+    }
 }
 
 // ------------------------------------------------------------- lifecycle

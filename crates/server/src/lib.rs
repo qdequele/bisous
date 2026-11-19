@@ -31,7 +31,7 @@ use tracing::{error, info, warn};
 
 use crate::auth::AuthConfig;
 use crate::config::{Config, LogFormat};
-use crate::manager::{SinkFactory, SyncManager, meili_sinks};
+use crate::manager::{ManagerDeps, SinkFactory, SyncManager, meili_sinks};
 use crate::registry::SourceRegistry;
 use crate::state::{AppState, Backend};
 use crate::usage::{MeteredStore, UsageMeter};
@@ -86,15 +86,17 @@ pub fn build_state(
         Arc::clone(&backend) as Arc<dyn StateStore>,
         Arc::clone(&meter),
     ));
-    let manager = Arc::new(SyncManager::new(
-        engine_store,
-        Arc::clone(&wiring.sources),
-        Arc::clone(&wiring.sinks),
-        Arc::clone(&wiring.policy),
-        wiring.supervisor,
+    let manager = Arc::new(SyncManager::new(ManagerDeps {
+        store: engine_store,
+        backend: Arc::clone(&backend),
+        sources: Arc::clone(&wiring.sources),
+        sinks: Arc::clone(&wiring.sinks),
+        policy: Arc::clone(&wiring.policy),
+        config: wiring.supervisor,
         meter,
+        lab_events: wiring.lab_events,
         cancel,
-    ));
+    }));
     AppState {
         backend,
         manager,

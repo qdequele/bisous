@@ -46,3 +46,10 @@ All notable changes to meili-connect are listed here. The format follows
   next start, paused syncs stay paused.
 - Dockerfile, `compose.yaml` with a demo origin, CI, and `scripts/e2e.sh`
   (Postgres and MongoDB scenarios against real containers).
+
+### Fixed
+
+- Every change to a sync (create, update, delete, pause, resume, resync,
+  release) runs under the sync's lock on the row read inside it: a `PUT`
+  racing a `DELETE` no longer restarts a deleted sync, and a `resume` racing a
+  `PUT` no longer brings back the old spec.

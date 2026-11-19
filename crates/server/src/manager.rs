@@ -7,13 +7,18 @@
 //! each one only ever holds one sync. Their cancellation tokens are children
 //! of the process token, so a process shutdown stops them all.
 //!
-//! Operations on one sync are serialized by a per-sync lock, so a `PUT`
-//! racing a `resync` never leaves two supervisors running one sync.
+//! Every mutation of a sync (create, update, delete, pause, resume, resync,
+//! release) is one manager entry point that takes the sync's lock, reads
+//! the stored row again inside it, writes, then starts or stops the
+//! supervisor. Nothing acts on a spec read outside the lock: a `PUT` racing
+//! a `DELETE` finds the sync gone, a `resume` racing a `PUT` runs the new
+//! spec.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
+use axum::http::StatusCode;
 use chrono::Utc;
 use meili_connect_core::{
     HostPolicy, MeiliDestination, Sink, SinkError, SourceError, SourceFactory, StateStore,
@@ -23,11 +28,16 @@ use meili_connect_engine::{
     EngineError, Supervisor, SupervisorConfig, SupervisorError, SyncDeps, SyncStatus,
     shadow_index_uid,
 };
+use meili_connect_store::StoredSync;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
+use crate::error::ApiError;
 use crate::guard::{CoarseSink, GuardedSources};
+use crate::state::Backend;
 use crate::usage::UsageMeter;
+
+type ApiResult<T> = Result<T, ApiError>;
 
 /// Builds the sink of one sync from its destination.
 pub type SinkFactory =
@@ -57,14 +67,33 @@ pub enum RemoveError {
     Supervisor(#[from] SupervisorError),
 }
 
+/// What [`SyncManager::new`] needs.
+pub struct ManagerDeps {
+    /// The engine's store (metered).
+    pub store: Arc<dyn StateStore>,
+    /// The specs, the outbox.
+    pub backend: Arc<dyn Backend>,
+    /// The connector registry, unguarded.
+    pub sources: Arc<dyn SourceFactory>,
+    pub sinks: SinkFactory,
+    pub policy: Arc<HostPolicy>,
+    pub config: SupervisorConfig,
+    pub meter: Arc<UsageMeter>,
+    /// Usage events go to the Lab: a deleted sync's count is enqueued.
+    pub lab_events: bool,
+    pub cancel: CancellationToken,
+}
+
 pub struct SyncManager {
     store: Arc<dyn StateStore>,
+    backend: Arc<dyn Backend>,
     sources: Arc<dyn SourceFactory>,
     sinks: SinkFactory,
     policy: Arc<HostPolicy>,
     config: SupervisorConfig,
     cancel: CancellationToken,
     meter: Arc<UsageMeter>,
+    lab_events: bool,
     /// Time limit of a teardown run outside a supervisor.
     teardown_timeout: Duration,
     supervisors: Mutex<HashMap<String, Arc<Supervisor>>>,
@@ -76,23 +105,17 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 impl SyncManager {
-    pub fn new(
-        store: Arc<dyn StateStore>,
-        sources: Arc<dyn SourceFactory>,
-        sinks: SinkFactory,
-        policy: Arc<HostPolicy>,
-        config: SupervisorConfig,
-        meter: Arc<UsageMeter>,
-        cancel: CancellationToken,
-    ) -> Self {
+    pub fn new(deps: ManagerDeps) -> Self {
         Self {
-            store,
-            sources,
-            sinks,
-            policy,
-            config,
-            cancel,
-            meter,
+            store: deps.store,
+            backend: deps.backend,
+            sources: deps.sources,
+            sinks: deps.sinks,
+            policy: deps.policy,
+            config: deps.config,
+            cancel: deps.cancel,
+            meter: deps.meter,
+            lab_events: deps.lab_events,
             teardown_timeout: Duration::from_secs(60),
             supervisors: Mutex::new(HashMap::new()),
             ops: Mutex::new(HashMap::new()),
@@ -106,6 +129,23 @@ impl SyncManager {
     async fn serialize(&self, sync_id: &str) -> tokio::sync::OwnedMutexGuard<()> {
         let op = Arc::clone(lock(&self.ops).entry(sync_id.to_owned()).or_default());
         op.lock_owned().await
+    }
+
+    /// Drop the lock of a deleted sync, unless someone waits on it (they
+    /// will find the sync gone).
+    fn forget_lock(&self, sync_id: &str) {
+        let mut ops = lock(&self.ops);
+        if ops.get(sync_id).is_some_and(|m| Arc::strong_count(m) == 1) {
+            ops.remove(sync_id);
+        }
+    }
+
+    /// The stored row, read inside the lock.
+    async fn row(&self, tenant: Option<&str>, id: &str) -> ApiResult<StoredSync> {
+        self.backend
+            .get_sync(tenant, id)
+            .await?
+            .ok_or_else(|| ApiError::sync_not_found(id))
     }
 
     fn supervisor(&self, sync_id: &str) -> Option<Arc<Supervisor>> {
@@ -154,7 +194,7 @@ impl SyncManager {
         }
     }
 
-    /// (Re)start a sync with this spec, replacing whatever ran it before.
+    /// Start a stored sync at boot. The API goes through the entry points.
     pub async fn run(&self, spec: SyncSpec) -> Result<(), SupervisorError> {
         let _op = self.serialize(&spec.id).await;
         self.run_locked(spec).await.map(|_| ())
@@ -175,50 +215,140 @@ impl SyncManager {
         self.meter.register(&spec.id, spec.tenant.as_deref());
     }
 
+    // ------------------------------------------------------------ entry points
+
+    /// Store a new sync and start it.
+    pub async fn create(&self, spec: SyncSpec) -> ApiResult<StoredSync> {
+        let _op = self.serialize(&spec.id).await;
+        let stored = self
+            .backend
+            .create_sync(spec.tenant.as_deref(), &spec)
+            .await?;
+        self.run_locked(spec).await?;
+        Ok(stored)
+    }
+
+    /// Replace a sync's spec. `prepare` turns the row read inside the lock
+    /// into the new spec (placeholders restored, validated).
+    pub async fn update<F>(
+        &self,
+        tenant: Option<&str>,
+        id: &str,
+        prepare: F,
+    ) -> ApiResult<StoredSync>
+    where
+        F: AsyncFnOnce(&StoredSync) -> ApiResult<SyncSpec>,
+    {
+        let _op = self.serialize(id).await;
+        let current = self.row(tenant, id).await?;
+        let spec = prepare(&current).await?;
+        let stored = self.backend.update_sync(tenant, &spec).await?;
+        self.run_locked(spec).await?;
+        info!(sync_id = %id, "sync updated and restarted");
+        Ok(stored)
+    }
+
+    /// Tear the sync down on the origin and delete it with its state.
+    pub async fn delete(&self, tenant: Option<&str>, id: &str, force: bool) -> ApiResult<()> {
+        let op = self.serialize(id).await;
+        let current = self.row(tenant, id).await?;
+        match self.remove_locked(&current.spec, force).await {
+            Ok(()) => {}
+            Err(RemoveError::Teardown(message)) => {
+                return Err(ApiError::new(
+                    StatusCode::BAD_GATEWAY,
+                    "teardown_failed",
+                    format!(
+                        "{message}; the sync is kept (stopped). Retry, or delete with \
+                         ?force=true and clean up the origin by hand"
+                    ),
+                ));
+            }
+            Err(RemoveError::Supervisor(e)) => return Err(e.into()),
+        }
+        if self.lab_events {
+            if let Err(e) = self.meter.flush_one(&*self.backend, id).await {
+                warn!(sync_id = %id, error = %e, "usage of a deleted sync could not be enqueued");
+            }
+        } else {
+            self.meter.forget(id);
+        }
+        self.backend.delete_sync(tenant, id).await?;
+        drop(op);
+        self.forget_lock(id);
+        info!(sync_id = %id, "sync deleted");
+        Ok(())
+    }
+
     /// Stop the sync and mark it `Paused`.
-    pub async fn pause(&self, sync_id: &str) -> Result<(), SupervisorError> {
-        let _op = self.serialize(sync_id).await;
-        if let Some(sup) = self.supervisor(sync_id) {
-            match sup.stop(sync_id).await {
+    pub async fn pause(&self, tenant: Option<&str>, id: &str) -> ApiResult<()> {
+        let _op = self.serialize(id).await;
+        self.row(tenant, id).await?;
+        if let Some(sup) = self.supervisor(id) {
+            match sup.stop(id).await {
                 Ok(()) | Err(SupervisorError::NotFound(_)) => {}
-                Err(e) => return Err(e),
+                Err(e) => return Err(e.into()),
             }
         }
-        persist_phase(&*self.store, sync_id, SyncPhase::Paused).await?;
+        persist_phase(&*self.store, id, SyncPhase::Paused, None).await?;
+        Ok(())
+    }
+
+    /// Start the sync with its stored spec unless it runs.
+    pub async fn resume(&self, tenant: Option<&str>, id: &str) -> ApiResult<()> {
+        let _op = self.serialize(id).await;
+        let current = self.row(tenant, id).await?;
+        let running = match self.supervisor(id) {
+            Some(sup) => sup.status(id).await?.is_some_and(|s| s.running),
+            None => false,
+        };
+        if !running {
+            self.run_locked(current.spec).await?;
+        }
         Ok(())
     }
 
     /// Rebuild every index from a fresh snapshot (shadow indexes swapped in
     /// when complete). Starts the sync if it was not running.
-    pub async fn resync(&self, spec: SyncSpec) -> Result<(), SupervisorError> {
-        let _op = self.serialize(&spec.id).await;
-        let sup = match self.supervisor(&spec.id) {
+    pub async fn resync(&self, tenant: Option<&str>, id: &str) -> ApiResult<()> {
+        let _op = self.serialize(id).await;
+        let spec = self.row(tenant, id).await?.spec;
+        let sup = match self.supervisor(id) {
             Some(sup) => sup,
             None => self.run_locked(spec.clone()).await?,
         };
-        match sup.resync(&spec.id).await {
+        match sup.resync(id).await {
             Err(SupervisorError::NotFound(_)) => {
-                let sup = self.run_locked(spec.clone()).await?;
-                sup.resync(&spec.id).await
+                let sup = self.run_locked(spec).await?;
+                sup.resync(id).await?;
             }
-            other => other,
+            other => other?,
         }
+        Ok(())
     }
 
-    /// Let the action a guard held through, once.
-    pub async fn release(&self, spec: SyncSpec) -> Result<(), SupervisorError> {
-        let _op = self.serialize(&spec.id).await;
-        let sup = match self.supervisor(&spec.id) {
+    /// Let the action a guard held through, once. Only a held sync.
+    pub async fn release(&self, tenant: Option<&str>, id: &str) -> ApiResult<()> {
+        let _op = self.serialize(id).await;
+        let spec = self.row(tenant, id).await?.spec;
+        let phase = self.store.load(id).await?.map(|s| s.phase);
+        if phase != Some(SyncPhase::Held) {
+            return Err(ApiError::conflict(format!(
+                "sync {id} is not held; only a held sync can be released"
+            )));
+        }
+        let sup = match self.supervisor(id) {
             Some(sup) => sup,
             None => self.run_locked(spec.clone()).await?,
         };
-        match sup.release(&spec.id).await {
+        match sup.release(id).await {
             Err(SupervisorError::NotFound(_)) => {
-                let sup = self.run_locked(spec.clone()).await?;
-                sup.release(&spec.id).await
+                let sup = self.run_locked(spec).await?;
+                sup.release(id).await?;
             }
-            other => other,
+            other => other?,
         }
+        Ok(())
     }
 
     pub async fn status(&self, sync_id: &str) -> Result<Option<SyncStatus>, SupervisorError> {
@@ -229,10 +359,9 @@ impl SyncManager {
     }
 
     /// Stop the sync, delete leftover shadow indexes, tear the source down
-    /// on the origin (slot, publication…) and forget the sync. When the
-    /// teardown fails the sync is kept, stopped, unless `force`.
-    pub async fn remove(&self, spec: &SyncSpec, force: bool) -> Result<(), RemoveError> {
-        let _op = self.serialize(&spec.id).await;
+    /// on the origin (slot, publication…). When the teardown fails the sync
+    /// is kept, stopped, unless `force`.
+    async fn remove_locked(&self, spec: &SyncSpec, force: bool) -> Result<(), RemoveError> {
         let torn_down = match self.supervisor(&spec.id) {
             // Bounded: an origin that hangs fails the call instead of
             // holding it forever (the sync is already stopped by then).
@@ -262,7 +391,6 @@ impl SyncManager {
             }
         }
         self.retire(&spec.id).await;
-        lock(&self.ops).remove(&spec.id);
         info!(sync_id = %spec.id, "sync removed");
         Ok(())
     }
@@ -322,6 +450,7 @@ async fn persist_phase(
     store: &dyn StateStore,
     sync_id: &str,
     phase: SyncPhase,
+    message: Option<String>,
 ) -> Result<(), StoreError> {
     let mut state = store.load(sync_id).await?.unwrap_or_else(|| SyncState {
         sync_id: sync_id.to_owned(),
@@ -332,7 +461,7 @@ async fn persist_phase(
         updated_at: Utc::now(),
     });
     state.phase = phase;
-    state.message = None;
+    state.message = message;
     state.updated_at = Utc::now();
     store.save(&state).await
 }
