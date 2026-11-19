@@ -10,6 +10,7 @@ use axum::Router;
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use http_body_util::BodyExt;
+use meili_connect_core::StateStore;
 use meili_connect_core::{
     AckReceiver, ApplyReport, Capabilities, Change, CheckReport, CheckStatus, Checkpoint,
     CollectionInfo, DocOp, Endpoint, EventSender, HostPolicy, IndexTarget, MeiliDestination, Op,
@@ -17,7 +18,7 @@ use meili_connect_core::{
     StreamMapping, SyncPhase,
 };
 use meili_connect_engine::SupervisorConfig;
-use meili_connect_store::{LabOutbox, MemStore, SyncRepository};
+use meili_connect_store::{LabOutbox, Lane, MemStore, SyncRepository, UsageLedger};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 use tower::ServiceExt;
@@ -1914,10 +1915,37 @@ async fn engine_progress_becomes_usage_events_for_tenant_syncs() {
     let a = app(locked());
     let id = create(&a, &lab("team-a"), "s").await;
     let global = create(&a, &admin(), "g").await;
-    let meter = Arc::clone(a.state.manager.meter());
-    wait_for(async || meter.pending(&id) == 3 && meter.pending(&global) == 3).await;
+    let usage = Arc::clone(a.state.manager.usage());
+    let snapshot = async |id: &str| -> u64 {
+        a.store
+            .progress(None, id, chrono::NaiveDate::MIN, chrono::NaiveDate::MAX)
+            .await
+            .map_or(0, |d| d.iter().map(|d| d.usage.documents_snapshot).sum())
+    };
+    // Both ran their snapshot: the tenant's is pending for the Lab, the
+    // global one never is.
+    wait_for(async || {
+        a.store
+            .pending_usage(Lane::Lab)
+            .await
+            .unwrap()
+            .iter()
+            .any(|p| p.sync_id == id && p.usage.documents_snapshot == 3)
+            && a.store
+                .progress(
+                    Some("team-a"),
+                    &id,
+                    chrono::NaiveDate::MIN,
+                    chrono::NaiveDate::MAX,
+                )
+                .await
+                .is_ok()
+    })
+    .await;
+    wait_for(async || snapshot(&global).await == 3).await;
+    assert_eq!(a.store.pending_usage(Lane::Lab).await.unwrap().len(), 1);
     assert_eq!(
-        meter.flush(&*a.store).await.unwrap(),
+        usage.flush(&*a.store).await.unwrap(),
         1,
         "global syncs are not billed"
     );
@@ -1930,10 +1958,26 @@ async fn engine_progress_becomes_usage_events_for_tenant_syncs() {
     let e = &lease.events[0].payload;
     assert_eq!(e["account_id"], "team-a");
     assert_eq!(e["data"]["job_id"], id.as_str());
-    assert_eq!(e["data"]["units"]["documents"], 3);
+    assert_eq!(e["data"]["units"]["documents_snapshot"], 3);
+    assert_eq!(e["data"]["units"]["documents_streamed"], 0);
+    assert_eq!(e["data"]["units"]["bytes"], 3 * FAKE_BYTES_PER_DOC);
+    assert_eq!(e["data"]["description"], "postgres → items");
 
     // Deleting a sync enqueues what it had not reported yet.
-    meter.add(&id, 2);
+    a.store
+        .record_progress(
+            &id,
+            &meili_connect_core::Progress {
+                written: 2,
+                usage: meili_connect_core::Usage {
+                    documents_streamed: 2,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
     let (status, _) = call(
         &a.router,
         "DELETE",
@@ -1949,7 +1993,10 @@ async fn engine_progress_becomes_usage_events_for_tenant_syncs() {
         .await
         .unwrap();
     assert_eq!(lease.events.len(), 1);
-    assert_eq!(lease.events[0].payload["data"]["units"]["documents"], 2);
+    assert_eq!(
+        lease.events[0].payload["data"]["units"]["documents_streamed"],
+        2
+    );
 }
 
 // ------------------------------------------------------------- routes

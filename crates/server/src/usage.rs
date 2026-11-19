@@ -1,15 +1,24 @@
-//! Usage metering: documents written or deleted per sync, turned into Lab
-//! `usage.recorded` events.
+//! Usage metering: the units of `docs/LAB_INTEGRATION.md` ("Pricing"),
+//! turned into events, at least once and without loss.
 //!
-//! [`MeteredStore`] wraps the engine's [`StateStore`]: every successful
-//! `record_progress` also adds `written + deleted` to the sync's pending
-//! count in a [`UsageMeter`]. [`UsageMeter::flush`] (every
-//! `USAGE_FLUSH_INTERVAL_SECS`) enqueues one event per tenant-owned sync
-//! with a non-zero count into the outbox, from which the Lab sender
-//! delivers them at least once.
+//! The engine records every batch's units with its progress
+//! (`StateStore::record_progress`); the store adds them to a pending row per
+//! enabled lane ([`Lane::Lab`], [`Lane::Tinybird`]) and sync **in the same
+//! transaction** as the progress counters. Every `USAGE_FLUSH_INTERVAL_SECS`,
+//! [`UsageEvents::flush`] drains each lane: one transaction takes the
+//! pending rows and enqueues one event per sync with non-zero units into the
+//! lane's outbox, from which that lane's sender delivers them at least once
+//! (deduplicated downstream by event id). So what is sent is exactly what
+//! progress recorded, and a crash at any point loses nothing.
 //!
-//! Counts held in memory and not yet enqueued are lost on a crash; a
-//! graceful shutdown flushes them.
+//! Remaining double count, bounded: a crash after Meilisearch accepted a
+//! batch and before the engine recorded it and saved its checkpoint replays
+//! that one batch from the last checkpoint, and its units are recorded once
+//! more. At most one batch per index per crash (`docs/LAB_INTEGRATION.md`
+//! accepts it).
+//!
+//! Global-scope syncs are never sent to the Lab (the store does not even
+//! accumulate them on its lane); Tinybird gets them with `tenant_id ""`.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -17,119 +26,151 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{SecondsFormat, Utc};
-use meili_connect_core::{DeadLetter, Progress, StateStore, StoreError, SyncState};
-use meili_connect_store::{LabOutbox, RepoError};
+use meili_connect_core::{DeadLetter, Progress, StateStore, StoreError, SyncSpec, SyncState};
+use meili_connect_store::{DrainOutcome, Lane, PendingUsage, RepoError, UsageLedger};
 use serde_json::{Value, json};
 
 use crate::limits::LogLimiter;
 
 /// Lab product name of meili-connect.
 pub const PRODUCT: &str = "connect";
+/// The Lab operation of a sync's usage.
+pub const OPERATION: &str = "sync";
 
-#[derive(Debug, Default)]
-struct Entry {
-    tenant: Option<String>,
-    documents: u64,
+/// `"postgres → products"`: the source kind and the indexes it feeds.
+pub fn description(spec: &SyncSpec) -> String {
+    let indexes: Vec<&str> = spec.streams.iter().map(|s| s.index.as_str()).collect();
+    format!("{} → {}", spec.source.kind.as_str(), indexes.join(", "))
 }
 
-/// Pending document counts of the registered syncs. Bounded by the number
-/// of syncs: counts of an unregistered sync are ignored.
+/// The units map of an event: the five unit names of the contract.
+fn units(p: &PendingUsage) -> Value {
+    json!({
+        "documents_streamed": p.usage.documents_streamed,
+        "documents_snapshot": p.usage.documents_snapshot,
+        "documents_resync": p.usage.documents_resync,
+        "bytes": p.usage.bytes,
+        "sync_seconds": p.usage.sync_seconds,
+    })
+}
+
+fn now_rfc3339() -> String {
+    Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
+}
+
+/// The Lab `usage.recorded` event, without its `id`: the outbox row id (a
+/// UUIDv7, stable across retries) is set as the event id when it is sent.
+pub fn lab_event(p: &PendingUsage, description: &str) -> Value {
+    json!({
+        "type": "usage.recorded",
+        "occurred_at": now_rfc3339(),
+        "account_id": p.tenant,
+        "api_key_id": null,
+        "product": PRODUCT,
+        "data": {
+            "operation": OPERATION,
+            "units": units(p),
+            "job_id": p.sync_id,
+            "description": description,
+        },
+    })
+}
+
+/// A row of the Tinybird `connect_usage` data source, without its
+/// `event_id` (the outbox row id, set when it is sent). Column names never
+/// change: see `tinybird/README.md`.
+pub fn tinybird_row(p: &PendingUsage) -> Value {
+    json!({
+        "occurred_at": now_rfc3339(),
+        "tenant_id": p.tenant.as_deref().unwrap_or(""),
+        "sync_id": p.sync_id,
+        "source_kind": p.source_kind,
+        "operation": OPERATION,
+        "documents_streamed": p.usage.documents_streamed,
+        "documents_snapshot": p.usage.documents_snapshot,
+        "documents_resync": p.usage.documents_resync,
+        "bytes": p.usage.bytes,
+        "sync_seconds": p.usage.sync_seconds,
+    })
+}
+
+/// Turns pending usage into events, lane by lane. Knows the description of
+/// every registered sync (bounded by the syncs); a sync deleted meanwhile
+/// is described from what the store kept (`kind → name`).
 #[derive(Debug)]
-pub struct UsageMeter {
-    entries: Mutex<HashMap<String, Entry>>,
-    /// Unsent outbox events beyond which `flush` keeps the counts in
-    /// memory instead of enqueueing (0: no cap).
+pub struct UsageEvents {
+    lanes: Vec<Lane>,
+    descriptions: Mutex<HashMap<String, String>>,
+    /// Unsent events of a lane beyond which its usage stays pending
+    /// (`LAB_OUTBOX_MAX_PENDING`; 0: no cap).
     backlog_cap: u64,
     backlog_log: Mutex<LogLimiter>,
 }
 
-impl Default for UsageMeter {
-    fn default() -> Self {
+impl UsageEvents {
+    pub fn new(lanes: Vec<Lane>) -> Self {
         Self {
-            entries: Mutex::new(HashMap::new()),
+            lanes,
+            descriptions: Mutex::new(HashMap::new()),
             backlog_cap: 0,
             backlog_log: Mutex::new(LogLimiter::new(Duration::from_secs(300))),
         }
     }
-}
 
-impl UsageMeter {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Stop enqueueing while the outbox holds `cap` unsent events or more;
-    /// counts keep accumulating in memory (one number per sync) meanwhile.
+    /// Keep a lane's usage pending while it holds `cap` unsent events.
     pub fn with_backlog_cap(mut self, cap: u64) -> Self {
         self.backlog_cap = cap;
         self
     }
 
-    fn lock(&self) -> MutexGuard<'_, HashMap<String, Entry>> {
-        self.entries
+    /// Where usage goes (none: nothing is metered into events).
+    pub fn lanes(&self) -> &[Lane] {
+        &self.lanes
+    }
+
+    fn lock(&self) -> MutexGuard<'_, HashMap<String, String>> {
+        self.descriptions
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// Start metering a sync (idempotent; keeps a pending count).
-    pub fn register(&self, sync_id: &str, tenant: Option<&str>) {
-        let mut entries = self.lock();
-        let entry = entries.entry(sync_id.to_owned()).or_default();
-        entry.tenant = tenant.map(str::to_owned);
+    /// Remember how to describe a sync (idempotent; a new spec replaces).
+    pub fn register(&self, spec: &SyncSpec) {
+        self.lock().insert(spec.id.clone(), description(spec));
     }
 
-    /// Stop metering a deleted sync. Its pending count is returned so the
-    /// caller can still enqueue it.
-    pub fn forget(&self, sync_id: &str) -> Option<(Option<String>, u64)> {
-        self.lock().remove(sync_id).map(|e| (e.tenant, e.documents))
+    pub fn forget(&self, sync_id: &str) {
+        self.lock().remove(sync_id);
     }
 
-    pub fn add(&self, sync_id: &str, documents: u64) {
-        if documents == 0 {
-            return;
+    pub fn description(&self, p: &PendingUsage) -> String {
+        self.lock()
+            .get(&p.sync_id)
+            .cloned()
+            .unwrap_or_else(|| format!("{} → {}", p.source_kind, p.sync_name))
+    }
+
+    /// The event of `p` on `lane`.
+    pub fn event(&self, lane: Lane, p: &PendingUsage) -> Value {
+        match lane {
+            Lane::Lab => lab_event(p, &self.description(p)),
+            Lane::Tinybird => tinybird_row(p),
         }
-        if let Some(entry) = self.lock().get_mut(sync_id) {
-            entry.documents = entry.documents.saturating_add(documents);
-        }
     }
 
-    /// Pending count of one sync (tests, status).
-    pub fn pending(&self, sync_id: &str) -> u64 {
-        self.lock().get(sync_id).map_or(0, |e| e.documents)
-    }
-
-    /// Take every non-zero count of a tenant-owned sync. Global syncs are
-    /// not billed: their counts are dropped.
-    fn take(&self) -> Vec<(String, String, u64)> {
-        let mut out = Vec::new();
-        for (id, entry) in self.lock().iter_mut() {
-            let n = std::mem::take(&mut entry.documents);
-            if n > 0
-                && let Some(tenant) = &entry.tenant
-            {
-                out.push((id.clone(), tenant.clone(), n));
-            }
-        }
-        out.sort();
-        out
-    }
-
-    fn give_back(&self, sync_id: &str, tenant: &str, documents: u64) {
-        let mut entries = self.lock();
-        let entry = entries.entry(sync_id.to_owned()).or_insert_with(|| Entry {
-            tenant: Some(tenant.to_owned()),
-            documents: 0,
-        });
-        entry.documents = entry.documents.saturating_add(documents);
-    }
-
-    /// Enqueue one `usage.recorded` event per tenant-owned sync with a
-    /// non-zero count. On a store error the counts not yet enqueued are put
-    /// back for the next flush. Returns how many events were enqueued.
-    pub async fn flush(&self, outbox: &dyn LabOutbox) -> Result<usize, RepoError> {
-        if self.backlog_cap > 0 {
-            let backlog = outbox.count_unsent().await?;
-            if backlog >= self.backlog_cap {
+    async fn drain(
+        &self,
+        ledger: &dyn UsageLedger,
+        lane: Lane,
+        sync_id: Option<&str>,
+    ) -> Result<usize, RepoError> {
+        let build = |p: &PendingUsage| self.event(lane, p);
+        match ledger
+            .drain_usage(lane, sync_id, self.backlog_cap, &build)
+            .await?
+        {
+            DrainOutcome::Enqueued(n) => Ok(n),
+            DrainOutcome::Backlogged(backlog) => {
                 let allowed = self
                     .backlog_log
                     .lock()
@@ -137,75 +178,62 @@ impl UsageMeter {
                     .allow();
                 if let Some(suppressed) = allowed {
                     tracing::warn!(
+                        lane = lane.as_str(),
                         backlog,
                         cap = self.backlog_cap,
                         suppressed,
-                        "the Lab events outbox is full (LAB_OUTBOX_MAX_PENDING): usage keeps \
-                         being counted in memory and is enqueued once the Lab takes events again"
+                        "an events outbox lane is full (LAB_OUTBOX_MAX_PENDING): usage stays \
+                         pending in the state database and is enqueued once the lane drains"
                     );
                 }
-                return Ok(0);
+                Ok(0)
             }
         }
-        let pending = self.take();
-        let mut enqueued = 0;
-        let mut iter = pending.into_iter();
-        while let Some((sync_id, tenant, n)) = iter.next() {
-            if let Err(e) = outbox
-                .enqueue_event(Some(&tenant), &usage_event(&tenant, &sync_id, n))
-                .await
-            {
-                self.give_back(&sync_id, &tenant, n);
-                for (sync_id, tenant, n) in iter {
-                    self.give_back(&sync_id, &tenant, n);
+    }
+
+    /// Enqueue the pending usage of every lane. Lanes are independent: one
+    /// failing does not keep the others from being drained; the first
+    /// error is returned after trying all. Returns how many events were
+    /// enqueued.
+    pub async fn flush(&self, ledger: &dyn UsageLedger) -> Result<usize, RepoError> {
+        let mut total = 0;
+        let mut first_error = None;
+        for &lane in &self.lanes {
+            match self.drain(ledger, lane, None).await {
+                Ok(n) => total += n,
+                Err(e) => {
+                    tracing::warn!(lane = lane.as_str(), error = %e, "cannot enqueue usage events");
+                    first_error.get_or_insert(e);
                 }
-                return Err(e);
             }
-            enqueued += 1;
         }
-        Ok(enqueued)
+        match first_error {
+            Some(e) => Err(e),
+            None => Ok(total),
+        }
     }
 
-    /// Enqueue the remaining count of a sync being deleted.
-    pub async fn flush_one(&self, outbox: &dyn LabOutbox, sync_id: &str) -> Result<(), RepoError> {
-        if let Some((Some(tenant), n)) = self.forget(sync_id)
-            && n > 0
-        {
-            outbox
-                .enqueue_event(Some(&tenant), &usage_event(&tenant, sync_id, n))
-                .await?;
+    /// Enqueue the pending usage of one sync now (it is being deleted).
+    /// When this fails the usage stays pending and goes with the next
+    /// flush: nothing is lost.
+    pub async fn flush_sync(&self, ledger: &dyn UsageLedger, sync_id: &str) {
+        for &lane in &self.lanes {
+            if let Err(e) = self.drain(ledger, lane, Some(sync_id)).await {
+                tracing::warn!(sync_id, lane = lane.as_str(), error = %e,
+                    "usage of a deleted sync could not be enqueued yet; it stays pending");
+            }
         }
-        Ok(())
     }
 }
 
-/// The event body, without its `id`: the outbox row id (a UUIDv7, stable
-/// across retries) is set as the event id when the batch is sent.
-pub fn usage_event(tenant: &str, sync_id: &str, documents: u64) -> Value {
-    json!({
-        "type": "usage.recorded",
-        "occurred_at": Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
-        "account_id": tenant,
-        "api_key_id": null,
-        "product": PRODUCT,
-        "data": {
-            "operation": "sync",
-            "units": { "documents": documents },
-            "job_id": sync_id,
-            "description": format!("{documents} documents written or deleted by sync {sync_id}"),
-        },
-    })
-}
-
-/// The engine's store, with usage metering on `record_progress`.
+/// The engine's store as the server gives it to the engine.
 pub struct MeteredStore {
     inner: Arc<dyn StateStore>,
-    meter: Arc<UsageMeter>,
 }
 
 impl MeteredStore {
-    pub fn new(inner: Arc<dyn StateStore>, meter: Arc<UsageMeter>) -> Self {
-        Self { inner, meter }
+    pub fn new(inner: Arc<dyn StateStore>) -> Self {
+        Self { inner }
     }
 }
 
@@ -224,10 +252,7 @@ impl StateStore for MeteredStore {
     }
 
     async fn record_progress(&self, sync_id: &str, progress: &Progress) -> Result<(), StoreError> {
-        self.inner.record_progress(sync_id, progress).await?;
-        self.meter
-            .add(sync_id, progress.written.saturating_add(progress.deleted));
-        Ok(())
+        self.inner.record_progress(sync_id, progress).await
     }
 }
 
@@ -235,159 +260,197 @@ impl StateStore for MeteredStore {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
-    use meili_connect_store::{MemStore, SyncRepository};
-    use std::time::Duration;
+    use meili_connect_core::{
+        MeiliDestination, Secret, SourceKind, SourceSpec, StreamMapping, Usage,
+    };
+    use meili_connect_store::{LabOutbox, MemStore, SyncRepository};
 
-    #[tokio::test]
-    async fn record_progress_accumulates_written_and_deleted() {
-        let mem = Arc::new(MemStore::permissive());
-        let meter = Arc::new(UsageMeter::new());
-        meter.register("s1", Some("team-a"));
-        let store = MeteredStore::new(mem.clone(), meter.clone());
-        let pr = |written, deleted, rejected| Progress {
-            written,
-            deleted,
-            rejected,
+    fn spec(id: &str, tenant: Option<&str>) -> SyncSpec {
+        SyncSpec {
+            id: id.into(),
+            tenant: tenant.map(str::to_owned),
+            name: format!("sync {id}"),
+            source: SourceSpec {
+                kind: SourceKind::Postgres,
+                config: json!({}),
+            },
+            destination: MeiliDestination {
+                url: "http://meili:7700".into(),
+                api_key: Secret::new("k"),
+            },
+            streams: vec![
+                serde_json::from_value::<StreamMapping>(
+                    json!({"collection": "public.p", "index": "products"}),
+                )
+                .unwrap(),
+            ],
+            mass_delete_guard: None,
+        }
+    }
+
+    fn progress(streamed: u64, snapshot: u64, bytes: u64, seconds: u64) -> Progress {
+        Progress {
+            written: streamed + snapshot,
+            usage: Usage {
+                documents_streamed: streamed,
+                documents_snapshot: snapshot,
+                documents_resync: 0,
+                bytes,
+                sync_seconds: seconds,
+            },
             ..Progress::default()
-        };
-        store.record_progress("s1", &pr(10, 5, 3)).await.unwrap();
-        store.record_progress("s1", &pr(1, 0, 0)).await.unwrap();
-        // Unregistered syncs are ignored: bounded by the registered set.
+        }
+    }
+
+    #[tokio::test]
+    async fn the_lab_event_has_the_contract_shape() {
+        let store = MemStore::new();
+        let events = UsageEvents::new(vec![Lane::Lab]);
+        store.set_usage_lanes(events.lanes());
+        let s = spec("s1", Some("team-a"));
+        store.create_sync(Some("team-a"), &s).await.unwrap();
+        events.register(&s);
         store
-            .record_progress("other", &pr(100, 0, 0))
+            .record_progress("s1", &progress(1200, 0, 1_482_113, 60))
             .await
             .unwrap();
-        assert_eq!(meter.pending("s1"), 16);
-        assert_eq!(meter.pending("other"), 0);
-    }
+        assert_eq!(events.flush(&store).await.unwrap(), 1);
+        assert_eq!(events.flush(&store).await.unwrap(), 0, "nothing new");
 
-    #[tokio::test]
-    async fn flush_enqueues_one_event_per_tenant_sync() {
-        let outbox = MemStore::new();
-        let meter = UsageMeter::new();
-        meter.register("s1", Some("team-a"));
-        meter.register("s2", Some("team-b"));
-        meter.register("s3", Some("team-b"));
-        meter.register("global", None);
-        meter.add("s1", 7);
-        meter.add("s2", 3);
-        meter.add("global", 50);
-        assert_eq!(meter.flush(&outbox).await.unwrap(), 2);
-        assert_eq!(meter.pending("s1"), 0);
-        assert_eq!(meter.pending("global"), 0);
-        // Nothing new: nothing enqueued.
-        assert_eq!(meter.flush(&outbox).await.unwrap(), 0);
-
-        let lease = outbox
-            .lease_events(10, Duration::from_secs(30))
-            .await
-            .unwrap();
-        assert_eq!(lease.events.len(), 2);
-        let mut bodies: Vec<_> = lease.events.iter().map(|e| e.payload.clone()).collect();
-        bodies.sort_by_key(|b| b["data"]["job_id"].as_str().unwrap().to_owned());
-        let b = &bodies[0];
-        assert_eq!(b["type"], "usage.recorded");
-        assert_eq!(b["product"], "connect");
-        assert_eq!(b["account_id"], "team-a");
-        assert!(b["api_key_id"].is_null());
-        assert_eq!(b["data"]["operation"], "sync");
-        assert_eq!(b["data"]["units"]["documents"], 7);
-        assert_eq!(b["data"]["job_id"], "s1");
-        assert!(b["occurred_at"].as_str().unwrap().ends_with('Z'));
-        assert!(lease.events[0].tenant.is_some());
-    }
-
-    #[tokio::test]
-    async fn forget_flushes_the_remainder() {
-        let outbox = MemStore::new();
-        let meter = UsageMeter::new();
-        meter.register("s1", Some("team-a"));
-        meter.add("s1", 4);
-        meter.flush_one(&outbox, "s1").await.unwrap();
-        meter.add("s1", 4);
-        assert_eq!(meter.pending("s1"), 0, "forgotten syncs stop counting");
-        let lease = outbox
+        let lease = store
             .lease_events(10, Duration::from_secs(30))
             .await
             .unwrap();
         assert_eq!(lease.events.len(), 1);
-    }
-
-    struct FailingOutbox;
-
-    #[async_trait]
-    impl LabOutbox for FailingOutbox {
-        async fn enqueue_event(&self, _: Option<&str>, _: &Value) -> Result<uuid::Uuid, RepoError> {
-            Err(RepoError::Transient("down".into()))
-        }
-        async fn lease_events(
-            &self,
-            _: u32,
-            _: Duration,
-        ) -> Result<meili_connect_store::OutboxLease, RepoError> {
-            unreachable!()
-        }
-        async fn mark_events_sent(
-            &self,
-            _: uuid::Uuid,
-            _: &[uuid::Uuid],
-        ) -> Result<u64, RepoError> {
-            unreachable!()
-        }
-        async fn prune_sent_events(&self, _: Duration) -> Result<u64, RepoError> {
-            unreachable!()
-        }
-        async fn defer_events(
-            &self,
-            _: uuid::Uuid,
-            _: &[uuid::Uuid],
-            _: meili_connect_store::RetryBackoff,
-        ) -> Result<u64, RepoError> {
-            unreachable!()
-        }
-        async fn count_unsent(&self) -> Result<u64, RepoError> {
-            Ok(0)
-        }
-    }
-
-    #[tokio::test]
-    async fn a_failed_flush_keeps_the_counts() {
-        let meter = UsageMeter::new();
-        meter.register("s1", Some("t"));
-        meter.register("s2", Some("t"));
-        meter.add("s1", 2);
-        meter.add("s2", 3);
-        assert!(meter.flush(&FailingOutbox).await.is_err());
-        assert_eq!(meter.pending("s1"), 2);
-        assert_eq!(meter.pending("s2"), 3);
+        let e = &lease.events[0].payload;
+        assert_eq!(e["type"], "usage.recorded");
+        assert_eq!(e["product"], "connect");
+        assert_eq!(e["account_id"], "team-a");
+        assert!(e["api_key_id"].is_null());
+        assert!(e["occurred_at"].as_str().unwrap().ends_with('Z'));
+        assert_eq!(
+            e["data"],
+            json!({
+                "operation": "sync",
+                "units": {
+                    "documents_streamed": 1200,
+                    "documents_snapshot": 0,
+                    "documents_resync": 0,
+                    "bytes": 1_482_113,
+                    "sync_seconds": 60,
+                },
+                "job_id": "s1",
+                "description": "postgres → products",
+            })
+        );
+        // Exactly the fields of the contract (the id is added on send).
+        let mut keys: Vec<&str> = e.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "account_id",
+                "api_key_id",
+                "data",
+                "occurred_at",
+                "product",
+                "type"
+            ]
+        );
     }
 
     #[tokio::test]
-    async fn a_full_outbox_keeps_the_counts_in_memory() {
-        let outbox = MemStore::new();
-        for _ in 0..3 {
-            outbox.enqueue_event(Some("t"), &json!({})).await.unwrap();
+    async fn global_syncs_are_never_sent_to_the_lab_but_reach_tinybird() {
+        let store = MemStore::new();
+        let events = UsageEvents::new(vec![Lane::Lab, Lane::Tinybird]);
+        store.set_usage_lanes(events.lanes());
+        let g = spec("g", None);
+        store.create_sync(None, &g).await.unwrap();
+        events.register(&g);
+        store
+            .record_progress("g", &progress(5, 0, 50, 0))
+            .await
+            .unwrap();
+        assert_eq!(events.flush(&store).await.unwrap(), 1);
+        assert_eq!(
+            store.count_unsent().await.unwrap(),
+            0,
+            "nothing for the Lab"
+        );
+        let tb = store.outbox(Lane::Tinybird);
+        let lease = tb.lease_events(10, Duration::from_secs(30)).await.unwrap();
+        let row = &lease.events[0].payload;
+        assert_eq!(row["tenant_id"], "");
+        assert_eq!(row["sync_id"], "g");
+        assert_eq!(row["source_kind"], "postgres");
+        assert_eq!(row["operation"], "sync");
+        assert_eq!(row["documents_streamed"], 5);
+        assert_eq!(row["bytes"], 50);
+    }
+
+    #[tokio::test]
+    async fn a_deleted_sync_is_flushed_then_described_from_the_store() {
+        let store = MemStore::new();
+        let events = UsageEvents::new(vec![Lane::Lab]);
+        store.set_usage_lanes(events.lanes());
+        let s = spec("s1", Some("t"));
+        store.create_sync(Some("t"), &s).await.unwrap();
+        events.register(&s);
+        store
+            .record_progress("s1", &progress(2, 0, 0, 0))
+            .await
+            .unwrap();
+        events.flush_sync(&store, "s1").await;
+        events.forget("s1");
+        store.delete_sync(Some("t"), "s1").await.unwrap();
+        let lease = store
+            .lease_events(10, Duration::from_secs(30))
+            .await
+            .unwrap();
+        assert_eq!(lease.events.len(), 1);
+        assert_eq!(
+            lease.events[0].payload["data"]["description"],
+            "postgres → products"
+        );
+        // Unknown to the registry: described from what the store kept.
+        let p = PendingUsage {
+            sync_id: "gone".into(),
+            tenant: Some("t".into()),
+            source_kind: "mongodb".into(),
+            sync_name: "orders".into(),
+            usage: Usage::default(),
+        };
+        assert_eq!(events.description(&p), "mongodb → orders");
+    }
+
+    #[tokio::test]
+    async fn a_full_lane_keeps_the_usage_pending() {
+        let store = MemStore::new();
+        let events = UsageEvents::new(vec![Lane::Lab]).with_backlog_cap(2);
+        store.set_usage_lanes(events.lanes());
+        let s = spec("s1", Some("t"));
+        store.create_sync(Some("t"), &s).await.unwrap();
+        for _ in 0..2 {
+            store.enqueue_event(Some("t"), &json!({})).await.unwrap();
         }
-        let meter = UsageMeter::new().with_backlog_cap(3);
-        meter.register("s1", Some("t"));
-        meter.add("s1", 5);
-        assert_eq!(meter.flush(&outbox).await.unwrap(), 0);
-        assert_eq!(meter.pending("s1"), 5, "still counted");
-        meter.add("s1", 1);
-        assert_eq!(outbox.count_unsent().await.unwrap(), 3, "nothing enqueued");
+        store
+            .record_progress("s1", &progress(5, 0, 0, 0))
+            .await
+            .unwrap();
+        assert_eq!(events.flush(&store).await.unwrap(), 0);
+        assert_eq!(store.pending_usage(Lane::Lab).await.unwrap().len(), 1);
+        store
+            .record_progress("s1", &progress(1, 0, 0, 0))
+            .await
+            .unwrap();
         // Room again: the whole count goes out at once.
-        let roomy = UsageMeter::new().with_backlog_cap(10);
-        roomy.register("s1", Some("t"));
-        roomy.add("s1", 6);
-        assert_eq!(roomy.flush(&outbox).await.unwrap(), 1);
-        assert_eq!(outbox.count_unsent().await.unwrap(), 4);
-    }
-
-    #[test]
-    fn unused_trait_import_guard() {
-        // `SyncRepository` is imported to make sure MemStore satisfies both
-        // traits the server needs from one value.
-        fn both<T: SyncRepository + LabOutbox>(_: &T) {}
-        both(&MemStore::new());
+        let roomy = UsageEvents::new(vec![Lane::Lab]).with_backlog_cap(10);
+        assert_eq!(roomy.flush(&store).await.unwrap(), 1);
+        let lease = store
+            .lease_events(10, Duration::from_secs(30))
+            .await
+            .unwrap();
+        let sent = lease.events.last().unwrap();
+        assert_eq!(sent.payload["data"]["units"]["documents_streamed"], 6);
     }
 }

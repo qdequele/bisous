@@ -125,10 +125,17 @@ Standalone works with none of the `LAB_*` variables set. With them:
 - **Every sync belongs to a tenant** (or the global scope standalone). All
   store queries are tenant-scoped.
 - **Usage events** go to the Lab through an outbox: `usage.recorded` with
-  `product: "connect"`, `operation: "sync"`, `units: {documents}`, signed
+  `product: "connect"`, `operation: "sync"`, the five units of
+  `docs/LAB_INTEGRATION.md`, `job_id` (the sync) and a description, signed
   `X-Lab-Signature: sha256=HMAC(LAB_INSTANCE_SECRET, "<ts>.<body>")`, batches
   of at most 500. The Lab must add `connect` to `lab-events.schema.json`
-  first (Lab-owned contract).
+  first (Lab-owned contract). Usage is durable end to end
+  (`store::UsageLedger`): `record_progress` adds a batch's units to a
+  `usage_pending` row per lane (Lab, Tinybird) in the same transaction as
+  the progress counters, and the flush moves pending rows into the lane's
+  outbox in one transaction. The one double count left: a crash after
+  Meilisearch accepted a batch and before its progress and checkpoint were
+  saved replays (and records) that batch once more.
 - **Secrets at rest** are sealed with ChaCha20-Poly1305
   (`version(1)‖nonce(12)‖ciphertext`, key from `CONNECT_SECRET_KEY`), same
   layout as glutony's connections.

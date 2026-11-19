@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use meili_connect_core::{HostPolicy, SourceFactory, StateStore};
-use meili_connect_store::{LabOutbox, SyncRepository};
+use meili_connect_store::{LabOutbox, SyncRepository, UsageLedger};
 
 use crate::auth::AuthConfig;
 use crate::guard::GuardedSources;
@@ -12,11 +12,11 @@ use crate::limits::{Limits, ProbeSlots};
 use crate::manager::{SinkFactory, SyncManager};
 
 /// Everything a store must be for the server: the engine's state, the
-/// tenant-scoped repository and the Lab outbox. `PgStore` and `MemStore`
-/// both are.
-pub trait Backend: StateStore + SyncRepository + LabOutbox {}
+/// tenant-scoped repository, the Lab outbox and the usage ledger.
+/// `PgStore` and `MemStore` both are.
+pub trait Backend: StateStore + SyncRepository + LabOutbox + UsageLedger {}
 
-impl<T: StateStore + SyncRepository + LabOutbox> Backend for T {}
+impl<T: StateStore + SyncRepository + LabOutbox + UsageLedger> Backend for T {}
 
 #[derive(Clone)]
 pub struct AppState {

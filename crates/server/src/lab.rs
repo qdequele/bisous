@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use hmac::{Hmac, Mac};
-use meili_connect_store::{LabOutbox, RetryBackoff};
+use meili_connect_store::{LabOutbox, RetryBackoff, UsageLedger};
 use serde_json::Value;
 use sha2::Sha256;
 use tokio_util::sync::CancellationToken;
@@ -26,7 +26,7 @@ use uuid::Uuid;
 
 use crate::config::LabEventsConfig;
 use crate::limits::LogLimiter;
-use crate::usage::UsageMeter;
+use crate::usage::UsageEvents;
 
 pub const H_INSTANCE_ID: &str = "x-lab-instance-id";
 pub const H_TIMESTAMP: &str = "x-lab-timestamp";
@@ -348,10 +348,10 @@ impl LabSender {
     }
 }
 
-/// Every `interval`, turn pending document counts into outbox events.
+/// Every `interval`, turn pending usage into outbox events, lane by lane.
 pub async fn run_usage_flush(
-    meter: Arc<UsageMeter>,
-    outbox: Arc<dyn LabOutbox>,
+    usage: Arc<UsageEvents>,
+    ledger: Arc<dyn UsageLedger>,
     interval: Duration,
     cancel: CancellationToken,
 ) {
@@ -360,7 +360,7 @@ pub async fn run_usage_flush(
             _ = cancel.cancelled() => return,
             _ = tokio::time::sleep(interval) => {}
         }
-        match meter.flush(&*outbox).await {
+        match usage.flush(&*ledger).await {
             Ok(n) if n > 0 => tracing::debug!(events = n, "usage enqueued"),
             Ok(_) => {}
             Err(e) => tracing::warn!(error = %e, "cannot enqueue usage events; retrying later"),
@@ -388,7 +388,7 @@ mod tests {
     }
 
     /// Verifies the signature by recomputing it, then accepts the events
-    /// whose `data.units.documents` is even (a partial acceptance).
+    /// whose `data.units.documents_streamed` is even (a partial acceptance).
     struct VerifyAndAcceptEven;
 
     impl Respond for VerifyAndAcceptEven {
@@ -402,22 +402,39 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .iter()
-                .filter(|e| e["data"]["units"]["documents"].as_u64().unwrap() % 2 == 0)
+                .filter(|e| {
+                    e["data"]["units"]["documents_streamed"]
+                        .as_u64()
+                        .unwrap()
+                        .is_multiple_of(2)
+                })
                 .map(|e| e["id"].clone())
                 .collect();
             ResponseTemplate::new(200).set_body_json(serde_json::json!({ "accepted": accepted }))
         }
     }
 
+    /// A Lab usage event with `n` streamed documents.
+    fn event(n: u64) -> Value {
+        crate::usage::lab_event(
+            &meili_connect_store::PendingUsage {
+                sync_id: "s".into(),
+                tenant: Some("t".into()),
+                source_kind: "postgres".into(),
+                sync_name: "s".into(),
+                usage: meili_connect_core::Usage {
+                    documents_streamed: n,
+                    ..Default::default()
+                },
+            },
+            "postgres → s",
+        )
+    }
+
     async fn seed(outbox: &MemStore, counts: &[u64]) -> Vec<Uuid> {
         let mut ids = Vec::new();
         for n in counts {
-            ids.push(
-                outbox
-                    .enqueue_event(Some("t"), &crate::usage::usage_event("t", "s", *n))
-                    .await
-                    .unwrap(),
-            );
+            ids.push(outbox.enqueue_event(Some("t"), &event(*n)).await.unwrap());
         }
         ids
     }

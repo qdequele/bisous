@@ -36,7 +36,7 @@ use crate::error::ApiError;
 use crate::guard::{CoarseSink, GuardedSources};
 use crate::redact::same_origin;
 use crate::state::Backend;
-use crate::usage::UsageMeter;
+use crate::usage::UsageEvents;
 
 type ApiResult<T> = Result<T, ApiError>;
 
@@ -79,9 +79,9 @@ pub struct ManagerDeps {
     pub sinks: SinkFactory,
     pub policy: Arc<HostPolicy>,
     pub config: SupervisorConfig,
-    pub meter: Arc<UsageMeter>,
-    /// Usage events go to the Lab: a deleted sync's count is enqueued.
-    pub lab_events: bool,
+    /// Describes and drains the syncs' usage (a deleted sync's usage is
+    /// enqueued before it goes).
+    pub usage: Arc<UsageEvents>,
     /// Syncs one tenant may own.
     pub max_syncs_per_tenant: u64,
     /// Longest wait for one sync to stop.
@@ -97,8 +97,7 @@ pub struct SyncManager {
     policy: Arc<HostPolicy>,
     config: SupervisorConfig,
     cancel: CancellationToken,
-    meter: Arc<UsageMeter>,
-    lab_events: bool,
+    usage: Arc<UsageEvents>,
     max_syncs_per_tenant: u64,
     stop_grace: Duration,
     /// Time limit of a teardown run outside a supervisor.
@@ -121,8 +120,7 @@ impl SyncManager {
             policy: deps.policy,
             config: deps.config,
             cancel: deps.cancel,
-            meter: deps.meter,
-            lab_events: deps.lab_events,
+            usage: deps.usage,
             max_syncs_per_tenant: deps.max_syncs_per_tenant,
             stop_grace: deps.stop_grace,
             teardown_timeout: Duration::from_secs(60),
@@ -131,8 +129,8 @@ impl SyncManager {
         }
     }
 
-    pub fn meter(&self) -> &Arc<UsageMeter> {
-        &self.meter
+    pub fn usage(&self) -> &Arc<UsageEvents> {
+        &self.usage
     }
 
     async fn serialize(&self, sync_id: &str) -> tokio::sync::OwnedMutexGuard<()> {
@@ -229,7 +227,7 @@ impl SyncManager {
     async fn run_locked(&self, spec: SyncSpec) -> Result<Arc<Supervisor>, SupervisorError> {
         spec.validate().map_err(EngineError::Spec)?;
         self.retire(&spec.id).await;
-        self.meter.register(&spec.id, spec.tenant.as_deref());
+        self.usage.register(&spec);
         let sup = self.new_supervisor(&spec)?;
         sup.start(spec.clone()).await?;
         lock(&self.supervisors).insert(spec.id.clone(), Arc::clone(&sup));
@@ -238,7 +236,7 @@ impl SyncManager {
 
     /// Register a sync without running it (a paused sync at boot).
     pub fn register_idle(&self, spec: &SyncSpec) {
-        self.meter.register(&spec.id, spec.tenant.as_deref());
+        self.usage.register(spec);
     }
 
     // ------------------------------------------------------------ entry points
@@ -275,7 +273,7 @@ impl SyncManager {
         if let Err(e) = self.run_locked(spec).await {
             warn!(sync_id = %id, error = %e, "the new sync could not start; it is not kept");
             self.retire(&id).await;
-            self.meter.forget(&id);
+            self.usage.forget(&id);
             if let Err(e) = self.backend.delete_sync(tenant.as_deref(), &id).await {
                 warn!(sync_id = %id, error = %e, "could not roll the new sync back");
             }
@@ -363,7 +361,7 @@ impl SyncManager {
         }
         if paused {
             self.retire(id).await;
-            self.meter.register(id, spec.tenant.as_deref());
+            self.usage.register(&spec);
             info!(sync_id = %id, ?change, "paused sync updated; it stays paused");
         } else {
             self.run_locked(spec).await?;
@@ -383,7 +381,8 @@ impl SyncManager {
             Some(SyncRow::Unreadable(_)) => {
                 warn!(sync_id = %id, "deleting an unreadable sync; its origin is not cleaned up");
                 self.retire(id).await;
-                self.meter.forget(id);
+                self.usage.flush_sync(&*self.backend, id).await;
+                self.usage.forget(id);
                 self.backend.delete_sync(tenant, id).await?;
                 drop(op);
                 self.forget_lock(id);
@@ -412,13 +411,10 @@ impl SyncManager {
             }
             Err(RemoveError::Supervisor(e)) => return Err(e.into()),
         }
-        if self.lab_events {
-            if let Err(e) = self.meter.flush_one(&*self.backend, id).await {
-                warn!(sync_id = %id, error = %e, "usage of a deleted sync could not be enqueued");
-            }
-        } else {
-            self.meter.forget(id);
-        }
+        // Its pending usage goes now (or with the next flush: it is not
+        // deleted with the sync).
+        self.usage.flush_sync(&*self.backend, id).await;
+        self.usage.forget(id);
         self.backend.delete_sync(tenant, id).await?;
         drop(op);
         self.forget_lock(id);

@@ -26,7 +26,7 @@ use axum::Router;
 use axum::routing::{get, post};
 use meili_connect_core::{HostPolicy, SourceFactory, StateStore, SyncPhase};
 use meili_connect_engine::SupervisorConfig;
-use meili_connect_store::{DeadLetterLimits, MemStore, PgStore, SecretKey};
+use meili_connect_store::{DeadLetterLimits, Lane, MemStore, PgStore, SecretKey, UsageLedger};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
@@ -36,7 +36,7 @@ use crate::limits::{Limits, ProbeSlots};
 use crate::manager::{ManagerDeps, SinkFactory, SyncManager, meili_sinks};
 use crate::registry::SourceRegistry;
 use crate::state::{AppState, Backend};
-use crate::usage::{MeteredStore, UsageMeter};
+use crate::usage::{MeteredStore, UsageEvents};
 
 /// The API. Every path is listed in [`routes::ROUTES`].
 pub fn router(state: AppState) -> Router {
@@ -88,10 +88,15 @@ pub fn build_state(
     wiring: Wiring,
     cancel: CancellationToken,
 ) -> AppState {
-    let meter = Arc::new(UsageMeter::new().with_backlog_cap(wiring.limits.outbox_max_pending));
+    let mut lanes = Vec::new();
+    if wiring.lab_events {
+        lanes.push(Lane::Lab);
+    }
+    let usage =
+        Arc::new(UsageEvents::new(lanes).with_backlog_cap(wiring.limits.outbox_max_pending));
+    backend.set_usage_lanes(usage.lanes());
     let engine_store: Arc<dyn StateStore> = Arc::new(MeteredStore::new(
-        Arc::clone(&backend) as Arc<dyn StateStore>,
-        Arc::clone(&meter),
+        Arc::clone(&backend) as Arc<dyn StateStore>
     ));
     let manager = Arc::new(SyncManager::new(ManagerDeps {
         store: engine_store,
@@ -100,8 +105,7 @@ pub fn build_state(
         sinks: Arc::clone(&wiring.sinks),
         policy: Arc::clone(&wiring.policy),
         config: wiring.supervisor,
-        meter,
-        lab_events: wiring.lab_events,
+        usage,
         max_syncs_per_tenant: wiring.limits.max_syncs_per_tenant,
         stop_grace: wiring.limits.stop_grace,
         cancel,
@@ -268,16 +272,17 @@ pub async fn run() -> Result<(), String> {
 
     let background = CancellationToken::new();
     let mut tasks = Vec::new();
-    if let Some(lab) = &config.lab_events {
-        info!(lab_url = %lab.url, "usage events go to the Lab");
-        let outbox: Arc<dyn meili_connect_store::LabOutbox> = Arc::clone(&backend) as _;
+    if !state.manager.usage().lanes().is_empty() {
         tasks.push(tokio::spawn(lab::run_usage_flush(
-            Arc::clone(state.manager.meter()),
-            Arc::clone(&outbox),
+            Arc::clone(state.manager.usage()),
+            Arc::clone(&backend) as Arc<dyn UsageLedger>,
             config.usage_flush_interval,
             background.child_token(),
         )));
-        let sender = lab::LabSender::new(outbox, lab.clone())
+    }
+    if let Some(lab) = &config.lab_events {
+        info!(lab_url = %lab.url, "usage events go to the Lab");
+        let sender = lab::LabSender::new(backend.outbox(Lane::Lab), lab.clone())
             .map_err(|e| format!("cannot build the Lab HTTP client: {e}"))?;
         tasks.push(tokio::spawn(
             sender.run(config.lab_send_interval, background.child_token()),
@@ -297,11 +302,9 @@ pub async fn run() -> Result<(), String> {
 
     info!("stopping the syncs");
     state.manager.shutdown(config.shutdown_grace).await;
-    if config.lab_events.is_some() {
-        // Counts not enqueued yet would be lost: enqueue them now.
-        if let Err(e) = state.manager.meter().flush(state.outbox()).await {
-            warn!(error = %e, "cannot enqueue the last usage counts");
-        }
+    // Pending usage is durable; enqueue it now so it goes out sooner.
+    if let Err(e) = state.manager.usage().flush(&*backend).await {
+        warn!(error = %e, "cannot enqueue the last usage; it stays pending");
     }
     background.cancel();
     for t in tasks {

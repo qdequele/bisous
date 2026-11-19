@@ -92,6 +92,68 @@ async fn state_round_trip() {
 }
 
 #[tokio::test]
+async fn usage_is_durable_per_lane() {
+    let Some(store) = store().await else { return };
+    crate::test_support::ledger_contract(&store).await;
+}
+
+/// Progress recorded while drains run: every unit ends up in exactly one
+/// event.
+#[tokio::test]
+async fn concurrent_progress_and_drains_lose_and_double_nothing() {
+    let Some(store) = store().await else { return };
+    let store = Arc::new(store);
+    store.set_usage_lanes(&[Lane::Lab]);
+    store
+        .create_sync(Some("t"), &spec("s", Some("t"), "a"))
+        .await
+        .unwrap();
+    let writers: Vec<_> = (0..8)
+        .map(|_| {
+            let store = Arc::clone(&store);
+            tokio::spawn(async move {
+                for _ in 0..25 {
+                    store
+                        .record_progress("s", &crate::test_support::units(1, 0, 0, 3, 0))
+                        .await
+                        .unwrap();
+                }
+            })
+        })
+        .collect();
+    let build = |p: &PendingUsage| serde_json::json!({ "n": p.usage.documents_streamed, "b": p.usage.bytes });
+    let drainer = {
+        let store = Arc::clone(&store);
+        tokio::spawn(async move {
+            for _ in 0..40 {
+                store.drain_usage(Lane::Lab, None, 0, &build).await.unwrap();
+                tokio::task::yield_now().await;
+            }
+        })
+    };
+    for w in writers {
+        w.await.unwrap();
+    }
+    drainer.await.unwrap();
+    store.drain_usage(Lane::Lab, None, 0, &build).await.unwrap();
+    let lease = store
+        .lease_events(10_000, Duration::from_secs(30))
+        .await
+        .unwrap();
+    let docs: u64 = lease
+        .events
+        .iter()
+        .map(|e| e.payload["n"].as_u64().unwrap())
+        .sum();
+    let bytes: u64 = lease
+        .events
+        .iter()
+        .map(|e| e.payload["b"].as_u64().unwrap())
+        .sum();
+    assert_eq!((docs, bytes), (200, 600));
+}
+
+#[tokio::test]
 async fn units_add_up_per_day() {
     let Some(store) = store().await else { return };
     store
@@ -145,6 +207,7 @@ async fn specs_are_sealed_at_rest() {
         pool: store.pool().clone(),
         key: SecretKey::generate(),
         limits: DeadLetterLimits::default(),
+        lanes: AtomicU8::new(0),
     };
     let row = other.get_sync(Some("t"), "s1").await.unwrap().unwrap();
     assert!(
@@ -718,6 +781,7 @@ async fn outbox_lease_picks_once() {
     .bind(5_i64)
     .bind(60.0_f64)
     .bind(Uuid::new_v4())
+    .bind("lab")
     .fetch_one(store.pool())
     .await
     .unwrap();

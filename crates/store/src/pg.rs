@@ -3,6 +3,8 @@
 //! applied at startup; they are forward-only and additive.
 
 use std::str::FromStr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -18,9 +20,10 @@ use uuid::Uuid;
 
 use crate::error::from_sqlx;
 use crate::{
-    BootSync, DailyProgress, DeadLetterLimits, DeadLetterPage, LabOutbox, OutboxEvent, OutboxLease,
-    RepoError, RetryBackoff, SecretKey, StoredDeadLetter, StoredSync, SyncRepository, SyncRow,
-    UnreadableSync, bound_letter, to_i64, to_u64, validate_spec,
+    BootSync, DailyProgress, DeadLetterLimits, DeadLetterPage, DrainOutcome, EventBuilder,
+    LabOutbox, Lane, OutboxEvent, OutboxLease, PendingUsage, RepoError, RetryBackoff, SecretKey,
+    StoredDeadLetter, StoredSync, SyncRepository, SyncRow, UnreadableSync, UsageLedger, UsageRow,
+    bound_letter, lane_mask, lanes_of, to_i64, to_u64, validate_spec,
 };
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
@@ -33,7 +36,8 @@ const PRUNE_BATCH: i64 = 1_000;
 /// under a nested-loop plan and lease more than `n` rows.
 const LEASE_SQL: &str = "WITH picked AS MATERIALIZED (
         SELECT id FROM lab_events_outbox
-        WHERE sent_at IS NULL AND (leased_until IS NULL OR leased_until <= now())
+        WHERE sent_at IS NULL AND lane = $4
+          AND (leased_until IS NULL OR leased_until <= now())
           AND (next_attempt_at IS NULL OR next_attempt_at <= now())
         ORDER BY created_at, id
         LIMIT $1
@@ -48,6 +52,8 @@ pub struct PgStore {
     pool: PgPool,
     key: SecretKey,
     limits: DeadLetterLimits,
+    /// [`UsageLedger::set_usage_lanes`], as a bit mask.
+    lanes: AtomicU8,
 }
 
 impl std::fmt::Debug for PgStore {
@@ -88,6 +94,7 @@ impl PgStore {
             pool,
             key,
             limits: DeadLetterLimits::default(),
+            lanes: AtomicU8::new(0),
         })
     }
 
@@ -336,6 +343,9 @@ impl StateStore for PgStore {
 
     async fn record_progress(&self, sync_id: &str, p: &Progress) -> Result<(), StoreError> {
         let u = &p.usage;
+        // Counters and pending usage in one transaction: what is billed is
+        // exactly what progress recorded.
+        let mut tx = self.pool.begin().await.map_err(store_err)?;
         sqlx::query(
             "INSERT INTO sync_progress (sync_id, day, written, deleted, rejected,
                 documents_streamed, documents_snapshot, documents_resync, bytes, sync_seconds)
@@ -360,9 +370,42 @@ impl StateStore for PgStore {
         .bind(to_i64(u.documents_resync))
         .bind(to_i64(u.bytes))
         .bind(to_i64(u.sync_seconds))
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(store_err)?;
+        let lanes: Vec<&str> = lanes_of(self.lanes.load(Ordering::Relaxed))
+            .into_iter()
+            .map(Lane::as_str)
+            .collect();
+        if !u.is_zero() && !lanes.is_empty() {
+            // The Lab bills tenants only: global syncs are never sent.
+            sqlx::query(
+                "INSERT INTO usage_pending (lane, sync_id, tenant_id, source_kind, sync_name,
+                    documents_streamed, documents_snapshot, documents_resync, bytes, sync_seconds)
+                 SELECT l.lane, s.id, s.tenant_id, s.kind, s.name, $3, $4, $5, $6, $7
+                 FROM UNNEST($2::text[]) AS l(lane) CROSS JOIN syncs s
+                 WHERE s.id = $1 AND (l.lane <> 'lab' OR s.tenant_id IS NOT NULL)
+                 ON CONFLICT (lane, sync_id) DO UPDATE SET
+                    documents_streamed =
+                        usage_pending.documents_streamed + EXCLUDED.documents_streamed,
+                    documents_snapshot =
+                        usage_pending.documents_snapshot + EXCLUDED.documents_snapshot,
+                    documents_resync = usage_pending.documents_resync + EXCLUDED.documents_resync,
+                    bytes = usage_pending.bytes + EXCLUDED.bytes,
+                    sync_seconds = usage_pending.sync_seconds + EXCLUDED.sync_seconds",
+            )
+            .bind(sync_id)
+            .bind(&lanes)
+            .bind(to_i64(u.documents_streamed))
+            .bind(to_i64(u.documents_snapshot))
+            .bind(to_i64(u.documents_resync))
+            .bind(to_i64(u.bytes))
+            .bind(to_i64(u.sync_seconds))
+            .execute(&mut *tx)
+            .await
+            .map_err(store_err)?;
+        }
+        tx.commit().await.map_err(store_err)?;
         Ok(())
     }
 }
@@ -585,6 +628,147 @@ impl SyncRepository for PgStore {
     }
 }
 
+impl PgStore {
+    /// The outbox of one lane.
+    pub fn lane(&self, lane: Lane) -> PgLane {
+        PgLane {
+            pool: self.pool.clone(),
+            lane,
+        }
+    }
+}
+
+/// One lane of the Postgres outbox (`lab_events_outbox.lane`).
+#[derive(Debug, Clone)]
+pub struct PgLane {
+    pool: PgPool,
+    lane: Lane,
+}
+
+const USAGE_COLUMNS: &str =
+    "documents_streamed, documents_snapshot, documents_resync, bytes, sync_seconds";
+
+#[async_trait]
+impl UsageLedger for PgStore {
+    fn set_usage_lanes(&self, lanes: &[Lane]) {
+        self.lanes.store(lane_mask(lanes), Ordering::Relaxed);
+    }
+
+    fn outbox(&self, lane: Lane) -> Arc<dyn LabOutbox> {
+        Arc::new(self.lane(lane))
+    }
+
+    async fn pending_usage(&self, lane: Lane) -> Result<Vec<PendingUsage>, RepoError> {
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT sync_id, tenant_id, source_kind, sync_name, {USAGE_COLUMNS}
+             FROM usage_pending WHERE lane = $1 ORDER BY sync_id"
+        )))
+        .bind(lane.as_str())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(from_sqlx)?;
+        rows.iter().map(pending_of).collect()
+    }
+
+    async fn drain_usage(
+        &self,
+        lane: Lane,
+        sync_id: Option<&str>,
+        backlog_cap: u64,
+        event: &EventBuilder<'_>,
+    ) -> Result<DrainOutcome, RepoError> {
+        if backlog_cap > 0 {
+            let backlog = self.lane(lane).count_unsent().await?;
+            if backlog >= backlog_cap {
+                return Ok(DrainOutcome::Backlogged(backlog));
+            }
+        }
+        let mut tx = self.pool.begin().await.map_err(from_sqlx)?;
+        // Taken and enqueued in one transaction: a crash leaves the usage
+        // either pending or enqueued, never both, never neither. A
+        // `record_progress` racing on a taken row waits for the commit,
+        // then starts a new one.
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DELETE FROM usage_pending
+             WHERE lane = $1 AND ($2::text IS NULL OR sync_id = $2)
+             RETURNING sync_id, tenant_id, source_kind, sync_name, {USAGE_COLUMNS}"
+        )))
+        .bind(lane.as_str())
+        .bind(sync_id)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(from_sqlx)?;
+        let mut pending: Vec<PendingUsage> =
+            rows.iter().map(pending_of).collect::<Result<_, _>>()?;
+        pending.retain(|p| !p.usage.is_zero());
+        pending.sort_by(|a, b| a.sync_id.cmp(&b.sync_id));
+        if !pending.is_empty() {
+            let ids: Vec<Uuid> = pending.iter().map(|_| Uuid::now_v7()).collect();
+            let tenants: Vec<Option<String>> = pending.iter().map(|p| p.tenant.clone()).collect();
+            let payloads: Vec<serde_json::Value> = pending.iter().map(event).collect();
+            sqlx::query(
+                "INSERT INTO lab_events_outbox (id, tenant_id, payload, lane)
+                 SELECT u.id, u.tenant_id, u.payload, $4
+                 FROM UNNEST($1::uuid[], $2::text[], $3::jsonb[]) AS u(id, tenant_id, payload)",
+            )
+            .bind(&ids)
+            .bind(&tenants)
+            .bind(&payloads)
+            .bind(lane.as_str())
+            .execute(&mut *tx)
+            .await
+            .map_err(from_sqlx)?;
+        }
+        tx.commit().await.map_err(from_sqlx)?;
+        Ok(DrainOutcome::Enqueued(pending.len()))
+    }
+
+    async fn usage(
+        &self,
+        tenant: Option<&str>,
+        from: NaiveDate,
+        to: NaiveDate,
+    ) -> Result<Vec<UsageRow>, RepoError> {
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT p.sync_id, p.day, {cols}
+             FROM sync_progress p JOIN syncs s ON s.id = p.sync_id
+             WHERE s.tenant_id IS NOT DISTINCT FROM $1 AND p.day BETWEEN $2 AND $3
+             ORDER BY p.day, p.sync_id",
+            cols = USAGE_COLUMNS
+                .split(", ")
+                .map(|c| format!("p.{c}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )))
+        .bind(tenant)
+        .bind(from)
+        .bind(to)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(from_sqlx)?;
+        rows.iter()
+            .map(|r| {
+                Ok(UsageRow {
+                    sync_id: r.try_get("sync_id").map_err(from_sqlx)?,
+                    day: r.try_get("day").map_err(from_sqlx)?,
+                    usage: usage_of(r)?,
+                })
+            })
+            .collect()
+    }
+}
+
+fn pending_of(r: &PgRow) -> Result<PendingUsage, RepoError> {
+    Ok(PendingUsage {
+        sync_id: r.try_get("sync_id").map_err(from_sqlx)?,
+        tenant: r.try_get("tenant_id").map_err(from_sqlx)?,
+        source_kind: r.try_get("source_kind").map_err(from_sqlx)?,
+        sync_name: r.try_get("sync_name").map_err(from_sqlx)?,
+        usage: usage_of(r)?,
+    })
+}
+
+/// The Lab lane, for the server and the tests written before lanes.
 #[async_trait]
 impl LabOutbox for PgStore {
     async fn enqueue_event(
@@ -592,14 +776,53 @@ impl LabOutbox for PgStore {
         tenant: Option<&str>,
         payload: &serde_json::Value,
     ) -> Result<Uuid, RepoError> {
+        self.lane(Lane::Lab).enqueue_event(tenant, payload).await
+    }
+
+    async fn lease_events(&self, limit: u32, lease: Duration) -> Result<OutboxLease, RepoError> {
+        self.lane(Lane::Lab).lease_events(limit, lease).await
+    }
+
+    async fn mark_events_sent(&self, lease: Uuid, ids: &[Uuid]) -> Result<u64, RepoError> {
+        self.lane(Lane::Lab).mark_events_sent(lease, ids).await
+    }
+
+    async fn prune_sent_events(&self, older_than: Duration) -> Result<u64, RepoError> {
+        self.lane(Lane::Lab).prune_sent_events(older_than).await
+    }
+
+    async fn defer_events(
+        &self,
+        lease: Uuid,
+        ids: &[Uuid],
+        backoff: RetryBackoff,
+    ) -> Result<u64, RepoError> {
+        self.lane(Lane::Lab).defer_events(lease, ids, backoff).await
+    }
+
+    async fn count_unsent(&self) -> Result<u64, RepoError> {
+        self.lane(Lane::Lab).count_unsent().await
+    }
+}
+
+#[async_trait]
+impl LabOutbox for PgLane {
+    async fn enqueue_event(
+        &self,
+        tenant: Option<&str>,
+        payload: &serde_json::Value,
+    ) -> Result<Uuid, RepoError> {
         let id = Uuid::now_v7();
-        sqlx::query("INSERT INTO lab_events_outbox (id, tenant_id, payload) VALUES ($1, $2, $3)")
-            .bind(id)
-            .bind(tenant)
-            .bind(Json(payload))
-            .execute(&self.pool)
-            .await
-            .map_err(from_sqlx)?;
+        sqlx::query(
+            "INSERT INTO lab_events_outbox (id, tenant_id, payload, lane) VALUES ($1, $2, $3, $4)",
+        )
+        .bind(id)
+        .bind(tenant)
+        .bind(Json(payload))
+        .bind(self.lane.as_str())
+        .execute(&self.pool)
+        .await
+        .map_err(from_sqlx)?;
         Ok(id)
     }
 
@@ -615,6 +838,7 @@ impl LabOutbox for PgStore {
             .bind(i64::from(limit))
             .bind(lease.as_secs_f64())
             .bind(token)
+            .bind(self.lane.as_str())
             .fetch_all(&self.pool)
             .await
             .map_err(from_sqlx)?;
@@ -642,10 +866,11 @@ impl LabOutbox for PgStore {
         }
         let done = sqlx::query(
             "UPDATE lab_events_outbox SET sent_at = now(), leased_until = NULL
-             WHERE id = ANY($2) AND lease_token = $1 AND sent_at IS NULL",
+             WHERE id = ANY($2) AND lease_token = $1 AND sent_at IS NULL AND lane = $3",
         )
         .bind(lease)
         .bind(ids)
+        .bind(self.lane.as_str())
         .execute(&self.pool)
         .await
         .map_err(from_sqlx)?;
@@ -665,13 +890,14 @@ impl LabOutbox for PgStore {
             let done = sqlx::query(
                 "WITH old AS MATERIALIZED (
                     SELECT id FROM lab_events_outbox
-                    WHERE sent_at IS NOT NULL AND sent_at < $1
+                    WHERE sent_at IS NOT NULL AND sent_at < $1 AND lane = $3
                     LIMIT $2
                  )
                  DELETE FROM lab_events_outbox o USING old WHERE o.id = old.id",
             )
             .bind(cutoff)
             .bind(PRUNE_BATCH)
+            .bind(self.lane.as_str())
             .execute(&self.pool)
             .await
             .map_err(from_sqlx)?;
@@ -697,12 +923,13 @@ impl LabOutbox for PgStore {
                  leased_until = NULL,
                  next_attempt_at = now() + make_interval(secs =>
                     LEAST($4::float8, $3::float8 * power(2, LEAST(attempts, 20))))
-             WHERE id = ANY($2) AND lease_token = $1 AND sent_at IS NULL",
+             WHERE id = ANY($2) AND lease_token = $1 AND sent_at IS NULL AND lane = $5",
         )
         .bind(lease)
         .bind(ids)
         .bind(backoff.base.as_secs_f64())
         .bind(backoff.max.as_secs_f64())
+        .bind(self.lane.as_str())
         .execute(&self.pool)
         .await
         .map_err(from_sqlx)?;
@@ -710,11 +937,13 @@ impl LabOutbox for PgStore {
     }
 
     async fn count_unsent(&self) -> Result<u64, RepoError> {
-        let n: i64 =
-            sqlx::query_scalar("SELECT count(*) FROM lab_events_outbox WHERE sent_at IS NULL")
-                .fetch_one(&self.pool)
-                .await
-                .map_err(from_sqlx)?;
+        let n: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM lab_events_outbox WHERE sent_at IS NULL AND lane = $1",
+        )
+        .bind(self.lane.as_str())
+        .fetch_one(&self.pool)
+        .await
+        .map_err(from_sqlx)?;
         Ok(to_u64(n))
     }
 }

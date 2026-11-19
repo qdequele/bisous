@@ -8,7 +8,8 @@
 //! engine tests that never create a spec.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -19,9 +20,10 @@ use meili_connect_core::{
 use uuid::Uuid;
 
 use crate::{
-    BootSync, DailyProgress, DeadLetterLimits, DeadLetterPage, LabOutbox, OutboxEvent, OutboxLease,
-    RepoError, RetryBackoff, StoredDeadLetter, StoredSync, SyncRepository, SyncRow, UnreadableSync,
-    bound_letter, validate_spec,
+    BootSync, DailyProgress, DeadLetterLimits, DeadLetterPage, DrainOutcome, EventBuilder,
+    LabOutbox, Lane, OutboxEvent, OutboxLease, PendingUsage, RepoError, RetryBackoff,
+    StoredDeadLetter, StoredSync, SyncRepository, SyncRow, UnreadableSync, UsageLedger, UsageRow,
+    bound_letter, lane_mask, lanes_of, validate_spec,
 };
 
 #[derive(Default)]
@@ -33,12 +35,15 @@ struct Inner {
     /// written, deleted, rejected, dead letters dropped; the units.
     progress: BTreeMap<(String, NaiveDate), ([u64; 4], Usage)>,
     outbox: Vec<OutboxRow>,
+    /// Usage recorded and not yet enqueued, per lane and sync.
+    pending: BTreeMap<(Lane, String), PendingUsage>,
     /// Test hook: rows reported as unreadable, like a Postgres row sealed
     /// with another key.
     unreadable: std::collections::HashSet<String>,
 }
 
 struct OutboxRow {
+    lane: Lane,
     event: OutboxEvent,
     leased_until: Option<DateTime<Utc>>,
     lease_token: Option<Uuid>,
@@ -80,9 +85,47 @@ impl Inner {
 
 #[derive(Default)]
 pub struct MemStore {
-    inner: Mutex<Inner>,
+    inner: Arc<Mutex<Inner>>,
     permissive: bool,
     limits: DeadLetterLimits,
+    /// [`UsageLedger::set_usage_lanes`], as a bit mask.
+    lanes: AtomicU8,
+}
+
+/// One lane of the outbox of a [`MemStore`].
+pub struct MemLane {
+    inner: Arc<Mutex<Inner>>,
+    lane: Lane,
+}
+
+fn lock_inner(inner: &Mutex<Inner>) -> Result<MutexGuard<'_, Inner>, RepoError> {
+    inner
+        .lock()
+        .map_err(|_| RepoError::Fatal("memory store lock poisoned".into()))
+}
+
+fn enqueue(
+    inner: &mut Inner,
+    lane: Lane,
+    tenant: Option<&str>,
+    payload: &serde_json::Value,
+) -> Uuid {
+    let id = Uuid::now_v7();
+    inner.outbox.push(OutboxRow {
+        lane,
+        event: OutboxEvent {
+            id,
+            tenant: tenant.map(str::to_owned),
+            payload: payload.clone(),
+            created_at: Utc::now(),
+        },
+        leased_until: None,
+        lease_token: None,
+        sent_at: None,
+        attempts: 0,
+        next_attempt_at: None,
+    });
+    id
 }
 
 impl MemStore {
@@ -187,6 +230,36 @@ impl StateStore for MemStore {
         c[1] = c[1].saturating_add(p.deleted);
         c[2] = c[2].saturating_add(p.rejected);
         usage.add(&p.usage);
+        if p.usage.is_zero() {
+            return Ok(());
+        }
+        // Under the same lock as the counters: the pending usage is exactly
+        // what progress recorded.
+        let (tenant, kind, name) = match inner.syncs.get(sync_id) {
+            Some(s) => (
+                s.spec.tenant.clone(),
+                s.spec.source.kind.as_str().to_owned(),
+                s.spec.name.clone(),
+            ),
+            None => (None, String::new(), String::new()),
+        };
+        for lane in lanes_of(self.lanes.load(Ordering::Relaxed)) {
+            // The Lab bills tenants only: global syncs are never sent.
+            if lane == Lane::Lab && tenant.is_none() {
+                continue;
+            }
+            let entry = inner
+                .pending
+                .entry((lane, sync_id.to_owned()))
+                .or_insert_with(|| PendingUsage {
+                    sync_id: sync_id.to_owned(),
+                    tenant: tenant.clone(),
+                    source_kind: kind.clone(),
+                    sync_name: name.clone(),
+                    usage: Default::default(),
+                });
+            entry.usage.add(&p.usage);
+        }
         Ok(())
     }
 }
@@ -372,6 +445,103 @@ impl SyncRepository for MemStore {
     }
 }
 
+impl MemStore {
+    /// The outbox of one lane.
+    pub fn lane(&self, lane: Lane) -> MemLane {
+        MemLane {
+            inner: Arc::clone(&self.inner),
+            lane,
+        }
+    }
+}
+
+#[async_trait]
+impl UsageLedger for MemStore {
+    fn set_usage_lanes(&self, lanes: &[Lane]) {
+        self.lanes.store(lane_mask(lanes), Ordering::Relaxed);
+    }
+
+    fn outbox(&self, lane: Lane) -> Arc<dyn LabOutbox> {
+        Arc::new(self.lane(lane))
+    }
+
+    async fn pending_usage(&self, lane: Lane) -> Result<Vec<PendingUsage>, RepoError> {
+        Ok(lock_inner(&self.inner)?
+            .pending
+            .iter()
+            .filter(|((l, _), _)| *l == lane)
+            .map(|(_, p)| p.clone())
+            .collect())
+    }
+
+    async fn drain_usage(
+        &self,
+        lane: Lane,
+        sync_id: Option<&str>,
+        backlog_cap: u64,
+        event: &EventBuilder<'_>,
+    ) -> Result<DrainOutcome, RepoError> {
+        let mut inner = lock_inner(&self.inner)?;
+        if backlog_cap > 0 {
+            let backlog = inner
+                .outbox
+                .iter()
+                .filter(|r| r.lane == lane && r.sent_at.is_none())
+                .count() as u64;
+            if backlog >= backlog_cap {
+                return Ok(DrainOutcome::Backlogged(backlog));
+            }
+        }
+        let keys: Vec<(Lane, String)> = inner
+            .pending
+            .keys()
+            .filter(|(l, id)| *l == lane && sync_id.is_none_or(|s| s == id))
+            .cloned()
+            .collect();
+        let mut enqueued = 0;
+        for key in keys {
+            let Some(p) = inner.pending.remove(&key) else {
+                continue;
+            };
+            if p.usage.is_zero() {
+                continue;
+            }
+            enqueue(&mut inner, lane, p.tenant.as_deref(), &event(&p));
+            enqueued += 1;
+        }
+        Ok(DrainOutcome::Enqueued(enqueued))
+    }
+
+    async fn usage(
+        &self,
+        tenant: Option<&str>,
+        from: NaiveDate,
+        to: NaiveDate,
+    ) -> Result<Vec<UsageRow>, RepoError> {
+        let inner = lock_inner(&self.inner)?;
+        if from > to {
+            return Ok(Vec::new());
+        }
+        Ok(inner
+            .progress
+            .iter()
+            .filter(|((id, day), _)| {
+                *day >= from
+                    && *day <= to
+                    && inner
+                        .syncs
+                        .get(id)
+                        .is_some_and(|s| s.spec.tenant.as_deref() == tenant)
+            })
+            .map(|((id, day), (_, usage))| UsageRow {
+                sync_id: id.clone(),
+                day: *day,
+                usage: *usage,
+            })
+            .collect())
+    }
+}
+
 #[async_trait]
 impl LabOutbox for MemStore {
     async fn enqueue_event(
@@ -379,21 +549,48 @@ impl LabOutbox for MemStore {
         tenant: Option<&str>,
         payload: &serde_json::Value,
     ) -> Result<Uuid, RepoError> {
-        let id = Uuid::now_v7();
-        self.lock()?.outbox.push(OutboxRow {
-            event: OutboxEvent {
-                id,
-                tenant: tenant.map(str::to_owned),
-                payload: payload.clone(),
-                created_at: Utc::now(),
-            },
-            leased_until: None,
-            lease_token: None,
-            sent_at: None,
-            attempts: 0,
-            next_attempt_at: None,
-        });
-        Ok(id)
+        self.lane(Lane::Lab).enqueue_event(tenant, payload).await
+    }
+
+    async fn lease_events(&self, limit: u32, lease: Duration) -> Result<OutboxLease, RepoError> {
+        self.lane(Lane::Lab).lease_events(limit, lease).await
+    }
+
+    async fn mark_events_sent(&self, lease: Uuid, ids: &[Uuid]) -> Result<u64, RepoError> {
+        self.lane(Lane::Lab).mark_events_sent(lease, ids).await
+    }
+
+    async fn prune_sent_events(&self, older_than: Duration) -> Result<u64, RepoError> {
+        self.lane(Lane::Lab).prune_sent_events(older_than).await
+    }
+
+    async fn defer_events(
+        &self,
+        lease: Uuid,
+        ids: &[Uuid],
+        backoff: RetryBackoff,
+    ) -> Result<u64, RepoError> {
+        self.lane(Lane::Lab).defer_events(lease, ids, backoff).await
+    }
+
+    async fn count_unsent(&self) -> Result<u64, RepoError> {
+        self.lane(Lane::Lab).count_unsent().await
+    }
+}
+
+#[async_trait]
+impl LabOutbox for MemLane {
+    async fn enqueue_event(
+        &self,
+        tenant: Option<&str>,
+        payload: &serde_json::Value,
+    ) -> Result<Uuid, RepoError> {
+        Ok(enqueue(
+            &mut *lock_inner(&self.inner)?,
+            self.lane,
+            tenant,
+            payload,
+        ))
     }
 
     async fn lease_events(&self, limit: u32, lease: Duration) -> Result<OutboxLease, RepoError> {
@@ -403,14 +600,15 @@ impl LabOutbox for MemStore {
             .ok()
             .and_then(|d| now.checked_add_signed(d))
             .unwrap_or(DateTime::<Utc>::MAX_UTC);
-        let mut inner = self.lock()?;
+        let mut inner = lock_inner(&self.inner)?;
         let mut events = Vec::new();
         // Rows are kept in insertion (= creation) order.
         for row in inner.outbox.iter_mut() {
             if events.len() >= limit as usize {
                 break;
             }
-            if row.sent_at.is_none()
+            if row.lane == self.lane
+                && row.sent_at.is_none()
                 && row.leased_until.is_none_or(|t| t <= now)
                 && row.next_attempt_at.is_none_or(|t| t <= now)
             {
@@ -424,10 +622,11 @@ impl LabOutbox for MemStore {
 
     async fn mark_events_sent(&self, lease: Uuid, ids: &[Uuid]) -> Result<u64, RepoError> {
         let now = Utc::now();
-        let mut inner = self.lock()?;
+        let mut inner = lock_inner(&self.inner)?;
         let mut n = 0;
         for row in inner.outbox.iter_mut() {
-            if row.sent_at.is_none()
+            if row.lane == self.lane
+                && row.sent_at.is_none()
                 && row.lease_token == Some(lease)
                 && ids.contains(&row.event.id)
             {
@@ -444,11 +643,12 @@ impl LabOutbox for MemStore {
             .ok()
             .and_then(|d| Utc::now().checked_sub_signed(d))
             .unwrap_or(DateTime::<Utc>::MIN_UTC);
-        let mut inner = self.lock()?;
+        let mut inner = lock_inner(&self.inner)?;
         let before = inner.outbox.len();
+        let lane = self.lane;
         inner
             .outbox
-            .retain(|row| row.sent_at.is_none_or(|t| t >= cutoff));
+            .retain(|row| row.lane != lane || row.sent_at.is_none_or(|t| t >= cutoff));
         Ok((before - inner.outbox.len()) as u64)
     }
 
@@ -459,10 +659,11 @@ impl LabOutbox for MemStore {
         backoff: RetryBackoff,
     ) -> Result<u64, RepoError> {
         let now = Utc::now();
-        let mut inner = self.lock()?;
+        let mut inner = lock_inner(&self.inner)?;
         let mut n = 0;
         for row in inner.outbox.iter_mut() {
-            if row.sent_at.is_none()
+            if row.lane == self.lane
+                && row.sent_at.is_none()
                 && row.lease_token == Some(lease)
                 && ids.contains(&row.event.id)
             {
@@ -481,11 +682,10 @@ impl LabOutbox for MemStore {
     }
 
     async fn count_unsent(&self) -> Result<u64, RepoError> {
-        Ok(self
-            .lock()?
+        Ok(lock_inner(&self.inner)?
             .outbox
             .iter()
-            .filter(|r| r.sent_at.is_none())
+            .filter(|r| r.lane == self.lane && r.sent_at.is_none())
             .count() as u64)
     }
 }
@@ -761,6 +961,11 @@ mod tests {
             store.progress(Some("x"), "s", today, today).await,
             Err(RepoError::NotFound(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn usage_is_durable_per_lane() {
+        crate::test_support::ledger_contract(&MemStore::new()).await;
     }
 
     #[tokio::test]
