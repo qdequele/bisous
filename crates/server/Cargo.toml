@@ -14,6 +14,7 @@ meili-connect-sink.workspace = true
 meili-connect-store.workspace = true
 meili-connect-source-postgres.workspace = true
 meili-connect-source-mysql.workspace = true
+meili-connect-source-planetscale.workspace = true
 meili-connect-source-mongodb.workspace = true
 meili-connect-source-kafka.workspace = true
 meili-connect-source-dynamodb.workspace = true

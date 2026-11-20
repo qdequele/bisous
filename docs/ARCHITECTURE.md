@@ -117,6 +117,7 @@ automatically.
 | `mongodb` | Change streams, `fullDocument: updateLookup` | Resume token | `find` per collection after capturing the cluster time |
 | `kafka` | Consumer, manual offset commit | `{topic: {partition: offset}}` | None |
 | `dynamodb` | DynamoDB Streams, shards read in lineage order | `{shard_id: sequence_number}` | `Scan` |
+| `planetscale` | Vitess `VStream` over gRPC (PlanetScale MySQL has no external binlog) | `{shards: [{keyspace, shard, gtid}]}` | Keyset reads over the MySQL protocol, after capturing every shard's current position |
 
 Supabase is the Postgres connector plus setup rules: direct connection (not
 the transaction pooler), IPv6, a paused project maps to `SourceError::Paused`,

@@ -18,7 +18,7 @@ pub const REDACTED: &str = "<redacted>";
 fn known_secret_paths(kind: SourceKind) -> &'static [&'static [&'static str]] {
     match kind {
         SourceKind::Postgres | SourceKind::Supabase => &[&["url"], &["password"]],
-        SourceKind::Mysql => &[&["password"]],
+        SourceKind::Mysql | SourceKind::Planetscale => &[&["password"]],
         SourceKind::Mongodb => &[&["uri"]],
         SourceKind::Kafka => &[
             &["security", "tls", "key_pem"],
@@ -165,6 +165,14 @@ fn identity_paths(kind: SourceKind) -> &'static [&'static [&'static str]] {
             &["database"],
             &["tls", "mode"],
             &["tls", "ca_pem"],
+        ],
+        SourceKind::Planetscale => &[
+            &["host"],
+            &["grpc_port"],
+            &["mysql_port"],
+            &["user"],
+            &["database"],
+            &["tls"],
         ],
         SourceKind::Mongodb => &[&["uri"], &["database"]],
         SourceKind::Kafka => &[
@@ -411,6 +419,13 @@ mod tests {
             json!({"region": "r", "credentials": {"type": "assume_role", "role_arn": "arn",
                 "external_id": "hunter2"}}),
         );
+        let c = redacted(
+            "planetscale",
+            json!({"host": "aws.connect.psdb.cloud", "database": "shop", "user": "u",
+                "password": "hunter2"}),
+        );
+        assert_eq!(c["host"], "aws.connect.psdb.cloud");
+        assert_eq!(c["user"], "u");
     }
 
     #[test]

@@ -51,6 +51,14 @@ All notable changes to meili-connect are listed here. The format follows
 
 ### Added
 
+- `planetscale` source: PlanetScale's MySQL (Vitess), which has no binlog
+  for outside readers, through Vitess's VStream API (gRPC over TLS, the
+  database's user and password). The first copy reads keyset pages over the
+  MySQL protocol after capturing every shard's position; the stream emits
+  inserts, updates (a key change deletes the old document), deletes and
+  `TRUNCATE`, with every shard's GTID set as the checkpoint. Documents are
+  the `mysql` source's JSON. New `SourceKind::Planetscale` in `core`.
+
 - Hosted-database hints: `postgres` and `mysql` configs take an optional
   `provider` (`neon`, `rds`, `aurora`, `cloud_sql`, `azure`; MySQL without
   `neon`), also detected from RDS, Aurora, Neon and Azure host names. A

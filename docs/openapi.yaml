@@ -678,7 +678,7 @@ components:
       type: object
       required: [kind, config]
       properties:
-        kind: { type: string, enum: [postgres, supabase, mysql, mongodb, kafka, dynamodb] }
+        kind: { type: string, enum: [postgres, supabase, mysql, mongodb, kafka, dynamodb, planetscale] }
         config:
           type: object
           description: |
@@ -692,6 +692,14 @@ components:
             error), and deleting the sync drops only its replication slot.
             Changing `manage_publication` is a new origin, like the
             publication name.
+
+            `planetscale` (PlanetScale's MySQL, Vitess) reads changes from
+            VStream (gRPC) instead of a binlog: `host`
+            (`aws.connect.psdb.cloud`), `database`, `user`, `password`, and
+            optionally `grpc_port` (443), `mysql_port` (3306, discovery and
+            the first copy), `tls` (true), `tablet_type` (`primary`,
+            `replica`, `rdonly`), `cells`, `snapshot_batch_size`.
+            Collections are `database.table`, in the one database.
 
             `postgres` and `mysql` take `provider` (optional): the hosted
             service the database runs on, `neon`, `rds`, `aurora`,
