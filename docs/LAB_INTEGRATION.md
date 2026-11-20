@@ -163,6 +163,12 @@ Everything in `docs/openapi.yaml`, plus:
   null)}`. The console shows it in the DynamoDB `assume_role` form and never
   sends `external_id` (the engine sets it; another value is
   `422 external_id_not_allowed`).
+- `GET /network`: `{"egress_ips": [...]}`, the addresses the database
+  allow-lists must admit (`CONNECT_EGRESS_IPS`; empty when unset). The
+  console shows them in the hosted-database setup guides.
+- `provider` in a `postgres` or `mysql` config: the console's hosted-database
+  tiles (Neon, RDS, Aurora, Cloud SQL, Azure) set it so failed checks name
+  the provider's fix. Engine first: an engine without it refuses the field.
 - Firestore (`"kind": "firestore"`): the console sends the service account
   key file as text in `config.service_account` (the engine redacts it on
   every answer; a `PUT` may send `"<redacted>"` back while `project_id`,

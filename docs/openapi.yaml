@@ -227,6 +227,32 @@ paths:
         "401": { $ref: "#/components/responses/Error" }
         "422": { $ref: "#/components/responses/Error" }
 
+  /network:
+    get:
+      summary: Where this server's connections come from
+      description: |
+        The public addresses this server connects to sources and
+        destinations from (`CONNECT_EGRESS_IPS`): what a database's network
+        allow-list (an RDS security group, Cloud SQL authorized networks,
+        Azure firewall rules, Neon IP Allow) must admit. Empty when the
+        operator has not published them. The same for every tenant.
+      parameters: [{ $ref: "#/components/parameters/TenantId" }]
+      responses:
+        "200":
+          description: The egress addresses.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [egress_ips]
+                properties:
+                  egress_ips:
+                    type: array
+                    items: { type: string }
+                    description: IP addresses and CIDR blocks.
+                    example: ["203.0.113.7", "198.51.100.0/28"]
+        "401": { $ref: "#/components/responses/Error" }
+
   /syncs:
     post:
       summary: Create a sync and start it
@@ -666,6 +692,17 @@ components:
             error), and deleting the sync drops only its replication slot.
             Changing `manage_publication` is a new origin, like the
             publication name.
+
+            `postgres` and `mysql` take `provider` (optional): the hosted
+            service the database runs on, `neon`, `rds`, `aurora`,
+            `cloud_sql` or `azure` (`mysql`: `rds`, `aurora`, `cloud_sql`,
+            `azure`). Without it the provider is detected from the host
+            (`*.neon.tech`, `*.rds.amazonaws.com`, `*.cluster-*.rds.amazonaws.com`,
+            `*.postgres.database.azure.com`, `*.mysql.database.azure.com`).
+            It changes nothing about how the sync runs: failed checks then
+            name that provider's fix (parameter group, database flag,
+            server parameter, grant, network allow-list). An unknown value
+            is a config error. A Neon pooled host (`-pooler`) is refused.
 
             `firestore` takes `service_account` (the JSON key file of a
             service account, as a string; write-only like every secret),

@@ -5,6 +5,7 @@ use meili_connect_core::{Secret, SourceError, SourceKind};
 use serde::{Deserialize, Serialize};
 
 use crate::ident;
+use crate::provider::{self, Provider};
 
 /// TLS mode, libpq names. `prefer` and `allow` are accepted from URLs and
 /// treated as `require`: a replication client cannot silently fall back to
@@ -70,6 +71,11 @@ pub struct PostgresConfig {
     /// sync only reads it: never creates, alters or drops it.
     #[serde(default = "default_true")]
     pub manage_publication: bool,
+    /// The hosted service the database runs on (`neon`, `rds`, `aurora`,
+    /// `cloud_sql`, `azure`). Optional, detected from the host when absent;
+    /// it only makes failed checks name that provider's fix.
+    #[serde(default)]
+    pub provider: Option<Provider>,
 }
 
 impl Default for PostgresConfig {
@@ -86,6 +92,7 @@ impl Default for PostgresConfig {
             slot_name: None,
             publication_name: None,
             manage_publication: true,
+            provider: None,
         }
     }
 }
@@ -105,6 +112,8 @@ pub struct ConnParams {
     pub sslmode: SslMode,
     pub ca_cert: Option<String>,
     pub supabase: bool,
+    /// The hosted provider, named in the config or detected from the host.
+    pub provider: Option<Provider>,
 }
 
 /// The full, validated settings of one source.
@@ -180,6 +189,13 @@ impl PostgresConfig {
                     .into(),
             ));
         }
+        if provider::is_neon_pooler(&host) {
+            return Err(SourceError::Config(
+                "this is a Neon pooled connection (-pooler in the host), which cannot carry \
+                 logical replication: use the direct host, without -pooler"
+                    .into(),
+            ));
+        }
         if (supabase || supabase_host) && sslmode == SslMode::Disable {
             return Err(SourceError::Config(
                 "Supabase requires TLS: set sslmode to require or verify-full".into(),
@@ -221,6 +237,7 @@ impl PostgresConfig {
             None => ident::default_name(sync_id),
         };
 
+        let provider = self.provider.or_else(|| Provider::detect(&host));
         Ok(Settings {
             conn: ConnParams {
                 host,
@@ -231,6 +248,7 @@ impl PostgresConfig {
                 sslmode,
                 ca_cert: self.ca_cert.clone(),
                 supabase: supabase || supabase_host,
+                provider,
             },
             slot,
             publication,
@@ -342,6 +360,59 @@ mod tests {
 
     fn resolve(v: serde_json::Value, kind: SourceKind) -> Result<Settings, SourceError> {
         PostgresConfig::from_value(&v)?.resolve(kind, "sync-1")
+    }
+
+    #[test]
+    fn provider_named_or_detected() {
+        // Named: wins over the host.
+        let s = resolve(
+            json!({"host": "10.1.2.3", "user": "u", "provider": "cloud_sql"}),
+            SourceKind::Postgres,
+        )
+        .unwrap();
+        assert_eq!(s.conn.provider, Some(Provider::CloudSql));
+        // Detected from the URL's host.
+        let s = resolve(
+            json!({"url": "postgres://u:p@app.cluster-abc.eu-west-1.rds.amazonaws.com/app"}),
+            SourceKind::Postgres,
+        )
+        .unwrap();
+        assert_eq!(s.conn.provider, Some(Provider::Aurora));
+        // Neither: none, as before.
+        let s = resolve(
+            json!({"host": "db.local", "user": "u"}),
+            SourceKind::Postgres,
+        )
+        .unwrap();
+        assert_eq!(s.conn.provider, None);
+        // An unknown provider is a config error, not silently ignored.
+        assert!(matches!(
+            resolve(
+                json!({"host": "h", "user": "u", "provider": "heroku"}),
+                SourceKind::Postgres
+            ),
+            Err(SourceError::Config(_))
+        ));
+    }
+
+    #[test]
+    fn neon_pooler_rejected() {
+        let err = resolve(
+            json!({"url": "postgres://u:p@ep-cool-123-pooler.us-east-2.aws.neon.tech/neondb"}),
+            SourceKind::Postgres,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, SourceError::Config(m) if m.contains("-pooler")),
+            "{err:?}"
+        );
+        assert!(
+            resolve(
+                json!({"url": "postgres://u:p@ep-cool-123.us-east-2.aws.neon.tech/neondb"}),
+                SourceKind::Postgres
+            )
+            .is_ok()
+        );
     }
 
     #[test]

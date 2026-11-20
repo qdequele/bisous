@@ -4,6 +4,7 @@ use meili_connect_core::{CheckReport, CheckStatus, SourceError};
 
 use crate::catalog;
 use crate::conn::Sql;
+use crate::provider::Provider;
 use crate::source::{MIN_VERSION, PostgresSource, too_old};
 
 pub async fn run(src: &mut PostgresSource) -> Result<CheckReport, SourceError> {
@@ -16,6 +17,9 @@ pub async fn run(src: &mut PostgresSource) -> Result<CheckReport, SourceError> {
                  enable the project's IPv4 add-on.",
             );
         }
+        if let (Some(p), SourceError::Transient(_)) = (src.provider(), &e) {
+            message.push_str(&connection_hint(p));
+        }
         let status = match e {
             SourceError::Paused(_) => CheckStatus::Warning,
             _ => CheckStatus::Failed,
@@ -25,6 +29,7 @@ pub async fn run(src: &mut PostgresSource) -> Result<CheckReport, SourceError> {
     }
     report.push("connection", CheckStatus::Ok, "connected");
 
+    let provider = src.provider();
     let version = src.version;
     let slot_name = src.settings.slot.clone();
     let publication = src.settings.publication.clone();
@@ -49,11 +54,7 @@ pub async fn run(src: &mut PostgresSource) -> Result<CheckReport, SourceError> {
         report.push(
             "wal_level",
             CheckStatus::Failed,
-            format!(
-                "wal_level is '{wal_level}': set it to 'logical' and restart Postgres \
-                 (on RDS/Aurora: rds.logical_replication = 1; on Cloud SQL: \
-                 cloudsql.logical_decoding = on)"
-            ),
+            wal_level_message(&wal_level, provider),
         );
     }
 
@@ -86,8 +87,7 @@ pub async fn run(src: &mut PostgresSource) -> Result<CheckReport, SourceError> {
         report.push(
             "replication_privilege",
             CheckStatus::Failed,
-            "the role lacks REPLICATION: ALTER ROLE <user> WITH REPLICATION \
-             (on RDS: GRANT rds_replication TO <user>)",
+            replication_message(provider),
         );
     }
 
@@ -127,10 +127,7 @@ pub async fn run(src: &mut PostgresSource) -> Result<CheckReport, SourceError> {
             report.push(
                 "replication_slots",
                 CheckStatus::Failed,
-                format!(
-                    "all {max_slots} replication slots are in use: raise max_replication_slots \
-                     or drop an unused slot"
-                ),
+                slots_full_message(max_slots, provider),
             );
         }
         // The first sync briefly holds two WAL senders (slot creation and
@@ -148,7 +145,7 @@ pub async fn run(src: &mut PostgresSource) -> Result<CheckReport, SourceError> {
             report.push(
                 "wal_senders",
                 CheckStatus::Failed,
-                format!("all {max_senders} WAL senders are busy: raise max_wal_senders"),
+                senders_full_message(max_senders, provider),
             );
         }
     }
@@ -312,6 +309,71 @@ pub async fn run(src: &mut PostgresSource) -> Result<CheckReport, SourceError> {
     Ok(report)
 }
 
+/// Appended to a connection failure: what lets Connect in on that provider.
+fn connection_hint(provider: Provider) -> String {
+    format!(". On {}: {}", provider.name(), provider.network_fix())
+}
+
+fn wal_level_message(wal_level: &str, provider: Option<Provider>) -> String {
+    match provider {
+        Some(p) => format!(
+            "wal_level is '{wal_level}', logical replication needs 'logical'. On {}: {}",
+            p.name(),
+            p.wal_level_fix()
+        ),
+        None => format!(
+            "wal_level is '{wal_level}': set it to 'logical' and restart Postgres \
+             (on RDS/Aurora: rds.logical_replication = 1; on Cloud SQL: \
+             cloudsql.logical_decoding = on)"
+        ),
+    }
+}
+
+fn replication_message(provider: Option<Provider>) -> String {
+    match provider {
+        Some(p) => format!(
+            "the role lacks REPLICATION. On {}: {}",
+            p.name(),
+            p.replication_fix()
+        ),
+        None => "the role lacks REPLICATION: ALTER ROLE <user> WITH REPLICATION \
+                 (on RDS: GRANT rds_replication TO <user>)"
+            .to_owned(),
+    }
+}
+
+fn slots_full_message(max_slots: i64, provider: Option<Provider>) -> String {
+    match provider {
+        Some(Provider::Neon) => format!(
+            "all {max_slots} replication slots are in use: drop an unused slot (Neon sets \
+             max_replication_slots itself)"
+        ),
+        Some(p) => format!(
+            "all {max_slots} replication slots are in use: raise max_replication_slots {} or \
+             drop an unused slot",
+            p.parameter_place()
+        ),
+        None => format!(
+            "all {max_slots} replication slots are in use: raise max_replication_slots \
+             or drop an unused slot"
+        ),
+    }
+}
+
+fn senders_full_message(max_senders: i64, provider: Option<Provider>) -> String {
+    match provider {
+        Some(Provider::Neon) => format!(
+            "all {max_senders} WAL senders are busy: stop an unused replication connection \
+             (Neon sets max_wal_senders itself)"
+        ),
+        Some(p) => format!(
+            "all {max_senders} WAL senders are busy: raise max_wal_senders {}",
+            p.parameter_place()
+        ),
+        None => format!("all {max_senders} WAL senders are busy: raise max_wal_senders"),
+    }
+}
+
 /// A mapped table whose row-level security policies apply to the role.
 const RLS: &str = "row-level security is on and the role does not bypass it: the snapshot would \
      only copy the rows its policies allow; grant BYPASSRLS to the role or use the table owner";
@@ -343,5 +405,33 @@ mod tests {
     fn version_text() {
         assert_eq!(super::version_text(170_002), "Postgres 17.2");
         assert_eq!(super::version_text(90_624), "Postgres 9.6.24");
+    }
+
+    /// With a provider the failed check names that provider's fix; without
+    /// one the message is the generic one it always was.
+    #[test]
+    fn messages_name_the_provider_fix() {
+        use super::*;
+        let generic = wal_level_message("replica", None);
+        assert!(generic.contains("restart Postgres"), "{generic}");
+        for (p, needle) in [
+            (Provider::Rds, "DB parameter group"),
+            (Provider::Aurora, "DB cluster parameter group"),
+            (Provider::CloudSql, "cloudsql.logical_decoding = on"),
+            (Provider::Azure, "wal_level = logical"),
+            (Provider::Neon, "Logical replication"),
+        ] {
+            let m = wal_level_message("replica", Some(p));
+            assert!(m.contains(needle) && m.contains(p.name()), "{m}");
+            assert!(m.contains("'replica'"), "{m}");
+        }
+        assert!(replication_message(Some(Provider::Aurora)).contains("rds_replication"));
+        assert!(replication_message(Some(Provider::CloudSql)).contains("cloudsqlsuperuser"));
+        assert!(replication_message(None).contains("ALTER ROLE"));
+        assert!(slots_full_message(10, Some(Provider::Rds)).contains("DB parameter group"));
+        assert!(slots_full_message(10, Some(Provider::Neon)).contains("drop an unused slot"));
+        assert!(senders_full_message(10, Some(Provider::Azure)).contains("server parameters"));
+        assert!(connection_hint(Provider::CloudSql).contains("authorized networks"));
+        assert!(connection_hint(Provider::Rds).contains("security group"));
     }
 }
