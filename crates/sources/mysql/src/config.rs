@@ -7,6 +7,8 @@ use mysql_async::{Opts, OptsBuilder, SslOpts};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::provider::Provider;
+
 /// How the connection is encrypted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -55,6 +57,11 @@ pub struct MysqlConfig {
     /// Rows per keyset page during the snapshot.
     #[serde(default = "default_batch")]
     pub snapshot_batch_size: u32,
+    /// The hosted service the server runs on (`rds`, `aurora`, `cloud_sql`,
+    /// `azure`). Optional, detected from the host when absent; it only
+    /// makes failed checks name that provider's fix.
+    #[serde(default)]
+    pub provider: Option<Provider>,
 }
 
 fn default_port() -> u16 {
@@ -119,6 +126,11 @@ impl MysqlConfig {
             ));
         }
         Ok(())
+    }
+
+    /// The hosted provider, named in the config or detected from the host.
+    pub fn provider(&self) -> Option<Provider> {
+        self.provider.or_else(|| Provider::detect(&self.host))
     }
 
     pub fn server_id_for(&self, sync_id: &str) -> u32 {
@@ -199,6 +211,27 @@ mod tests {
         assert!(cfg.database.is_none());
         assert!(!format!("{cfg:?}").contains("pw\""));
         assert!(format!("{cfg:?}").contains("<redacted>"));
+    }
+
+    #[test]
+    fn provider_named_or_detected() {
+        let cfg = MysqlConfig::from_json(&json!({
+            "host": "10.0.0.5", "user": "repl", "provider": "cloud_sql"
+        }))
+        .unwrap();
+        assert_eq!(cfg.provider(), Some(Provider::CloudSql));
+        let cfg = MysqlConfig::from_json(&json!({
+            "host": "shop.abc.eu-west-1.rds.amazonaws.com", "user": "repl"
+        }))
+        .unwrap();
+        assert_eq!(cfg.provider, None);
+        assert_eq!(cfg.provider(), Some(Provider::Rds));
+        let cfg = MysqlConfig::from_json(&json!({"host": "db", "user": "repl"})).unwrap();
+        assert_eq!(cfg.provider(), None);
+        assert!(
+            MysqlConfig::from_json(&json!({"host": "db", "user": "repl", "provider": "neon"}))
+                .is_err()
+        );
     }
 
     #[test]

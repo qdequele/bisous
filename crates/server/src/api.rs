@@ -209,6 +209,13 @@ pub async fn dynamodb_trust(State(state): State<AppState>, scope: Scope) -> ApiR
     })))
 }
 
+/// Where this server's connections come from: the addresses a database's
+/// network allow-list (security group, authorized networks, firewall
+/// rules) must admit. Empty when the operator has not published them.
+pub async fn network(State(state): State<AppState>, _scope: Scope) -> Json<Value> {
+    Json(json!({ "egress_ips": &*state.egress_ips }))
+}
+
 // ---------------------------------------------------------------- syncs
 
 /// The writable part of a sync. `id`, `tenant`, `created_at` and

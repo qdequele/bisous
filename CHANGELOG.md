@@ -51,6 +51,32 @@ All notable changes to meili-connect are listed here. The format follows
 
 ### Added
 
+- Hosted-database hints: `postgres` and `mysql` configs take an optional
+  `provider` (`neon`, `rds`, `aurora`, `cloud_sql`, `azure`; MySQL without
+  `neon`), also detected from RDS, Aurora, Neon and Azure host names. A
+  failed check then names that provider's fix: the parameter group, database
+  flag or server parameter for `wal_level` / the binlog settings, the grant
+  (`rds_replication`, `WITH REPLICATION`), binlog retention
+  (`mysql.rds_set_configuration`, Azure's `binlog_expire_logs_seconds = 0`
+  now warns), and the network allow-list on a connection failure. A Neon
+  pooled host (`-pooler`) is refused with the direct host to use instead.
+- `GET /network` lists the server's egress addresses (`CONNECT_EGRESS_IPS`)
+  for database allow-lists.
+- Firestore source (`"kind": "firestore"`): a service account JSON key
+  (redacted like every secret; sent only to Google's token endpoint),
+  `project_id` (the key's by default) and `database_id`. A mapping names a
+  top-level collection, a subcollection path or a `**/<id>` collection
+  group. The snapshot reads every document in pages, then realtime
+  listeners (`Listen`) stream inserts, updates and deletes; the resume
+  token is the checkpoint. A server reset is applied from the document set
+  the source tracks, or resyncs when it cannot be (after a restart, or past
+  `stream.max_tracked_documents`). Document id: the Firestore document id
+  (the path for a collection group); every document carries `_path`.
+  Timestamps, geopoints (`{"lat", "lng"}`), references (paths), bytes,
+  maps and arrays map to JSON. `check` reports a missing role
+  (`roles/datastore.viewer`) or database, `discover` lists collections with
+  counts and collection groups found under sampled documents. Live tests
+  run against the Firestore emulator (`FIRESTORE_TEST_EMULATOR_HOST`).
 - Lab mode: a `sync.state_changed` event tells the Lab when a tenant's sync
   changes phase (`pending`, `snapshotting`, `streaming`, `paused`,
   `source_paused`, `held`, `failed`, `deleted`), including the end of a
@@ -65,7 +91,6 @@ All notable changes to meili-connect are listed here. The format follows
 - The coarse errors a Lab tenant sees name their cause more precisely
   (credentials refused, host not found, configuration, API key refused,
   index refused) without adding any detail from the driver or the server.
-
 - Postgres and Supabase: `manage_publication: false` (default `true`) uses a
   publication managed elsewhere, named by the then required
   `publication_name`. The sync never creates, alters or drops it and needs

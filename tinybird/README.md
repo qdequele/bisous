@@ -31,7 +31,7 @@ names of the Lab event:
 | `occurred_at` | DateTime64(3) | when the usage was enqueued (RFC 3339, `Z`) |
 | `tenant_id` | String | the Lab account id; `""` for the global scope |
 | `sync_id` | String | |
-| `source_kind` | LowCardinality(String) | `postgres`, `supabase`, `mysql`, `mongodb`, `kafka`, `dynamodb` |
+| `source_kind` | LowCardinality(String) | `postgres`, `supabase`, `mysql`, `mongodb`, `kafka`, `dynamodb`, `firestore` |
 | `operation` | LowCardinality(String) | `sync` |
 | `documents_streamed` | UInt64 | writes and deletes applied from the change stream |
 | `documents_snapshot` | UInt64 | written by a first sync or a resync the user asked for |

@@ -211,7 +211,13 @@ impl Metrics {
             sink_errors.with_label_values(&[class]);
         }
         for kind in [
-            "postgres", "supabase", "mysql", "mongodb", "kafka", "dynamodb",
+            "postgres",
+            "supabase",
+            "mysql",
+            "mongodb",
+            "kafka",
+            "dynamodb",
+            "firestore",
         ] {
             for class in ["transient", "position_lost", "config", "paused", "fatal"] {
                 source_errors.with_label_values(&[kind, class]);

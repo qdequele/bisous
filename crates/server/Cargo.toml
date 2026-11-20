@@ -17,6 +17,7 @@ meili-connect-source-mysql.workspace = true
 meili-connect-source-mongodb.workspace = true
 meili-connect-source-kafka.workspace = true
 meili-connect-source-dynamodb.workspace = true
+meili-connect-source-firestore.workspace = true
 async-trait.workspace = true
 axum.workspace = true
 chrono.workspace = true

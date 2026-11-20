@@ -58,6 +58,7 @@ pub fn router(state: AppState) -> Router {
         .route("/sources/check", post(api::check_source))
         .route("/sources/discover", post(api::discover_source))
         .route("/sources/dynamodb/trust", get(api::dynamodb_trust))
+        .route("/network", get(api::network))
         .route("/usage", get(api::usage))
         .route("/syncs", post(api::create_sync).get(api::list_syncs))
         .route(
@@ -109,6 +110,8 @@ pub struct Wiring {
     pub external_ids: Option<Arc<ExternalIds>>,
     /// The server's own AWS principal, for `GET /sources/dynamodb/trust`.
     pub aws_principal: Arc<AwsPrincipal>,
+    /// `CONNECT_EGRESS_IPS`, for `GET /network`.
+    pub egress_ips: Vec<String>,
     /// `USAGE_IDLE_FLUSH_SECS`: how long a running sync's `sync_seconds`
     /// alone stay pending before they are sent.
     pub usage_idle_flush: std::time::Duration,
@@ -184,6 +187,7 @@ pub fn build_state(
         hosted: wiring.hosted,
         external_ids: wiring.external_ids,
         aws_principal: wiring.aws_principal,
+        egress_ips: wiring.egress_ips.into(),
         usage_reader: match &wiring.tinybird {
             Some(tb) => match TinybirdReader::new(tb.clone()) {
                 Ok(reader) => Some(Arc::new(reader)),
@@ -360,6 +364,7 @@ pub async fn run() -> Result<(), String> {
             hosted: config.hosted(),
             external_ids,
             aws_principal: Arc::new(AwsPrincipal::from_host()),
+            egress_ips: config.egress_ips.clone(),
             usage_idle_flush: config.usage_idle_flush,
             sync_events_settle: config.sync_events_settle,
         },

@@ -17,6 +17,7 @@ use tokio_util::sync::CancellationToken;
 use crate::ddl::{DdlKind, QueryKind, classify};
 use crate::error::map_err;
 use crate::position::Position;
+use crate::provider::Provider;
 use crate::rows::{BinlogTable, RowKind};
 use crate::schema::{TableSchema, load_table};
 use crate::source::{MysqlSource, current_file_position, global_var, or_cancel, send, server_info};
@@ -37,12 +38,26 @@ const MARIADB_GTID_EVENT: u8 = 0xa2;
 
 pub(crate) async fn check(src: &mut MysqlSource) -> Result<CheckReport, SourceError> {
     let mut report = CheckReport::default();
+    let provider = src.config.provider();
     let mut conn = match src.connect().await {
         Ok(c) => c,
         Err(SourceError::Config(msg)) => {
             report.push("connection", CheckStatus::Failed, msg);
             return Ok(report);
         }
+        // On a known provider an unreachable server is most often its
+        // network allow-list: say which one rather than failing the call.
+        Err(SourceError::Transient(msg)) => match provider {
+            Some(p) => {
+                report.push(
+                    "connection",
+                    CheckStatus::Failed,
+                    format!("{msg}. On {}: {}", p.name(), p.network_fix()),
+                );
+                return Ok(report);
+            }
+            None => return Err(SourceError::Transient(msg)),
+        },
         Err(e) => return Err(e),
     };
     report.push(
@@ -76,17 +91,13 @@ pub(crate) async fn check(src: &mut MysqlSource) -> Result<CheckReport, SourceEr
     if log_bin.eq_ignore_ascii_case("ON") || log_bin == "1" {
         report.push("log_bin", CheckStatus::Ok, "the binary log is enabled");
     } else {
-        report.push(
-            "log_bin",
-            CheckStatus::Failed,
-            "the binary log is disabled; start the server with log_bin",
-        );
+        report.push("log_bin", CheckStatus::Failed, log_bin_message(provider));
     }
 
     let format = var(global_var(&mut conn, "binlog_format").await?);
-    push_expect(&mut report, "binlog_format", &format, "ROW");
+    push_expect(&mut report, "binlog_format", &format, "ROW", provider);
     let image = var(global_var(&mut conn, "binlog_row_image").await?);
-    push_expect(&mut report, "binlog_row_image", &image, "FULL");
+    push_expect(&mut report, "binlog_row_image", &image, "FULL", provider);
 
     match global_var(&mut conn, "binlog_row_metadata").await? {
         Some(m) if m.eq_ignore_ascii_case("FULL") => {
@@ -129,7 +140,7 @@ pub(crate) async fn check(src: &mut MysqlSource) -> Result<CheckReport, SourceEr
         );
     }
 
-    check_retention(&mut conn, &mut report).await?;
+    check_retention(&mut conn, &mut report, provider).await?;
     check_privileges(&mut conn, &mut report).await?;
 
     let own_id: Option<String> = global_var(&mut conn, "server_id").await?;
@@ -194,19 +205,111 @@ fn version_at_least(version: &str, major: u32) -> bool {
         .is_some_and(|m| m >= major)
 }
 
-fn push_expect(report: &mut CheckReport, name: &str, actual: &str, want: &str) {
+fn push_expect(
+    report: &mut CheckReport,
+    name: &str,
+    actual: &str,
+    want: &str,
+    provider: Option<Provider>,
+) {
     if actual.eq_ignore_ascii_case(want) {
         report.push(name, CheckStatus::Ok, want);
     } else {
         report.push(
             name,
             CheckStatus::Failed,
-            format!("is '{actual}', set it to {want}"),
+            expect_message(actual, want, provider),
         );
     }
 }
 
-async fn check_retention(conn: &mut Conn, report: &mut CheckReport) -> Result<(), SourceError> {
+fn expect_message(actual: &str, want: &str, provider: Option<Provider>) -> String {
+    match provider {
+        Some(p) => format!(
+            "is '{actual}', set it to {want}. On {}: {}",
+            p.name(),
+            p.parameter_place()
+        ),
+        None => format!("is '{actual}', set it to {want}"),
+    }
+}
+
+fn log_bin_message(provider: Option<Provider>) -> String {
+    match provider {
+        Some(p) => format!(
+            "the binary log is disabled. On {}: {}",
+            p.name(),
+            p.log_bin_fix()
+        ),
+        None => "the binary log is disabled; start the server with log_bin".to_owned(),
+    }
+}
+
+fn short_retention_message(secs: u64, provider: Option<Provider>) -> String {
+    let base = format!(
+        "binlogs expire after {:.1} h: a sync stopped longer than that must resync",
+        secs as f64 / 3600.0
+    );
+    match provider {
+        Some(p) => format!("{base}. On {}: {}", p.name(), p.retention_fix()),
+        None => format!("{base}; consider binlog_expire_logs_seconds >= {SHORT_RETENTION_SECS}"),
+    }
+}
+
+/// RDS and Aurora purge binlogs on their own schedule, set by
+/// `mysql.rds_set_configuration('binlog retention hours', N)`: NULL (the
+/// default) purges them as soon as possible, whatever
+/// `binlog_expire_logs_seconds` says. `None` when it cannot be read.
+async fn rds_retention_hours(conn: &mut Conn) -> Option<Option<u64>> {
+    let rows: Vec<Option<String>> = conn
+        .query("SELECT value FROM mysql.rds_configuration WHERE name = 'binlog retention hours'")
+        .await
+        .ok()?;
+    Some(
+        rows.into_iter()
+            .next()
+            .flatten()
+            .and_then(|v| v.trim().parse().ok()),
+    )
+}
+
+async fn check_retention(
+    conn: &mut Conn,
+    report: &mut CheckReport,
+    provider: Option<Provider>,
+) -> Result<(), SourceError> {
+    if matches!(provider, Some(Provider::Rds | Provider::Aurora))
+        && let Some(hours) = rds_retention_hours(conn).await
+    {
+        match hours {
+            Some(h) if h * 3600 >= SHORT_RETENTION_SECS => report.push(
+                "binlog_retention",
+                CheckStatus::Ok,
+                format!("binlog retention hours is {h}"),
+            ),
+            Some(h) => report.push(
+                "binlog_retention",
+                CheckStatus::Warning,
+                short_retention_message(h * 3600, provider),
+            ),
+            // Aurora keeps 24 hours when unset; RDS for MySQL keeps none.
+            None if provider == Some(Provider::Aurora) => report.push(
+                "binlog_retention",
+                CheckStatus::Warning,
+                short_retention_message(24 * 3600, provider),
+            ),
+            None => report.push(
+                "binlog_retention",
+                CheckStatus::Warning,
+                format!(
+                    "binlog retention hours is not set, so binlogs are purged as soon as \
+                     possible: a sync stopped even briefly must resync. On RDS: {}",
+                    Provider::Rds.retention_fix()
+                ),
+            ),
+        }
+        return Ok(());
+    }
     let secs = global_var(conn, "binlog_expire_logs_seconds")
         .await?
         .and_then(|s| s.parse::<u64>().ok());
@@ -220,6 +323,17 @@ async fn check_retention(conn: &mut Conn, report: &mut CheckReport) -> Result<()
         _ => None,
     };
     match effective {
+        // Azure's 0 means "purge as soon as no replica holds them", not
+        // "never": an external reader must ask for a retention.
+        None if provider == Some(Provider::Azure) => report.push(
+            "binlog_retention",
+            CheckStatus::Warning,
+            format!(
+                "binlog_expire_logs_seconds is 0, so Azure purges binlogs as soon as no \
+                 replica holds them: a sync stopped even briefly must resync. On Azure: {}",
+                Provider::Azure.retention_fix()
+            ),
+        ),
         None => report.push(
             "binlog_retention",
             CheckStatus::Ok,
@@ -228,11 +342,7 @@ async fn check_retention(conn: &mut Conn, report: &mut CheckReport) -> Result<()
         Some(s) if s < SHORT_RETENTION_SECS => report.push(
             "binlog_retention",
             CheckStatus::Warning,
-            format!(
-                "binlogs expire after {:.1} h: a sync stopped longer than that must resync; \
-                 consider binlog_expire_logs_seconds >= {SHORT_RETENTION_SECS}",
-                s as f64 / 3600.0
-            ),
+            short_retention_message(s, provider),
         ),
         Some(s) => report.push(
             "binlog_retention",
@@ -902,6 +1012,35 @@ mod tests {
         assert!(version_at_least("9.1.0", 8));
         assert!(!version_at_least("5.7.44-log", 8));
         assert!(!version_at_least("", 8));
+    }
+
+    /// With a provider the failed check names that provider's fix; without
+    /// one the message is the generic one it always was.
+    #[test]
+    fn messages_name_the_provider_fix() {
+        assert_eq!(
+            expect_message("MIXED", "ROW", None),
+            "is 'MIXED', set it to ROW"
+        );
+        let m = expect_message("MIXED", "ROW", Some(Provider::Aurora));
+        assert!(
+            m.contains("DB cluster parameter group") && m.contains("reboot"),
+            "{m}"
+        );
+        assert!(expect_message("minimal", "FULL", Some(Provider::CloudSql)).contains("flags"));
+        assert!(log_bin_message(Some(Provider::Rds)).contains("automated backups"));
+        assert!(log_bin_message(Some(Provider::CloudSql)).contains("point-in-time recovery"));
+        assert!(log_bin_message(None).contains("log_bin"));
+        let m = short_retention_message(3600, Some(Provider::Rds));
+        assert!(
+            m.contains("binlog retention hours") && m.contains("1.0 h"),
+            "{m}"
+        );
+        assert!(short_retention_message(3600, None).contains("binlog_expire_logs_seconds"));
+        assert!(
+            short_retention_message(3600, Some(Provider::Azure))
+                .contains("binlog_expire_logs_seconds")
+        );
     }
 
     fn state(position: Position) -> StreamState {

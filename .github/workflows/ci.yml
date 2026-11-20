@@ -80,8 +80,17 @@ jobs:
     env:
       # Enables the store's Postgres tests (they skip without it).
       DATABASE_URL: postgres://postgres:postgres@localhost:5432/connect_test
+      # Enables the Firestore source's emulator tests (they skip without it).
+      FIRESTORE_TEST_EMULATOR_HOST: 127.0.0.1:8086
     steps:
       - uses: actions/checkout@v4
+      # A service container cannot be given a command: start it by hand,
+      # first, so it is up by the time the build is done.
+      - name: Firestore emulator
+        run: >-
+          docker run -d --name firestore -p 127.0.0.1:8086:8080
+          gcr.io/google.com/cloudsdktool/google-cloud-cli:emulators
+          gcloud emulators firestore start --host-port=0.0.0.0:8080
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.94"
@@ -90,6 +99,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build
         run: cargo build --workspace --all-targets
+      - name: Wait for the Firestore emulator
+        run: |
+          for _ in $(seq 1 60); do
+            if curl -sf localhost:8086 >/dev/null; then exit 0; fi
+            sleep 2
+          done
+          docker logs firestore
+          exit 1
       - name: Test
         run: cargo test --workspace
 

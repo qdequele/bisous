@@ -4,12 +4,13 @@ use meili_connect_core::{
     Endpoint, Source, SourceError, SourceFactory, SourceKind, SourceSpec, StreamMapping,
 };
 use meili_connect_source_dynamodb::DynamoSourceFactory;
+use meili_connect_source_firestore::FirestoreSourceFactory;
 use meili_connect_source_kafka::KafkaSourceFactory;
 use meili_connect_source_mongodb::MongoSourceFactory;
 use meili_connect_source_mysql::MysqlSourceFactory;
 use meili_connect_source_postgres::PostgresSourceFactory;
 
-/// The five connectors behind one [`SourceFactory`]. Postgres serves both
+/// The six connectors behind one [`SourceFactory`]. Postgres serves both
 /// `postgres` and `supabase`.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SourceRegistry;
@@ -31,6 +32,7 @@ impl SourceFactory for SourceRegistry {
             SourceKind::Mongodb => MongoSourceFactory.endpoints(spec).await,
             SourceKind::Kafka => KafkaSourceFactory.endpoints(spec).await,
             SourceKind::Dynamodb => DynamoSourceFactory.endpoints(spec).await,
+            SourceKind::Firestore => FirestoreSourceFactory.endpoints(spec).await,
         }
     }
 
@@ -48,6 +50,7 @@ impl SourceFactory for SourceRegistry {
             SourceKind::Mongodb => MongoSourceFactory.build(sync_id, spec, streams),
             SourceKind::Kafka => KafkaSourceFactory.build(sync_id, spec, streams),
             SourceKind::Dynamodb => DynamoSourceFactory.build(sync_id, spec, streams),
+            SourceKind::Firestore => FirestoreSourceFactory.build(sync_id, spec, streams),
         }
     }
 }
@@ -90,6 +93,11 @@ mod tests {
                 SourceKind::Dynamodb,
                 json!({"region": "eu-west-1"}),
                 "table",
+            ),
+            (
+                SourceKind::Firestore,
+                json!({"emulator_host": "localhost:8080", "project_id": "demo-app"}),
+                "**/orders",
             ),
         ];
         for (kind, config, collection) in cases {
@@ -141,6 +149,11 @@ mod tests {
                 SourceKind::Dynamodb,
                 json!({"region": "eu-west-1", "endpoint_url": "http://ddb.example.com:8000"}),
                 vec![Endpoint::new("ddb.example.com", 8000)],
+            ),
+            (
+                SourceKind::Firestore,
+                json!({"emulator_host": "fs.example.com:8080", "project_id": "demo-app"}),
+                vec![Endpoint::new("fs.example.com", 8080)],
             ),
         ];
         for (kind, config, expected) in cases {

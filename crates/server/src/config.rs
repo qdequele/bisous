@@ -100,6 +100,11 @@ pub struct Config {
     /// When a sync that makes no progress is reported as stuck
     /// (`MAX_LAG_HOLD_BYTES`, `MAX_LAG_HOLD_SECS`; off by default).
     pub lag_guard: LagGuard,
+    /// The public addresses this server's connections leave from
+    /// (`CONNECT_EGRESS_IPS`, IPs or CIDRs separated by commas or spaces),
+    /// for `GET /network`: what a database's allow-list must admit. Empty
+    /// when the operator has not published them.
+    pub egress_ips: Vec<String>,
 }
 
 /// Past these, a sync that is not making progress gets a warning in its
@@ -143,6 +148,37 @@ impl LagGuard {
             since_checkpoint.map_or(0, |d| d.as_secs() / 60)
         ))
     }
+}
+
+/// `CONNECT_EGRESS_IPS`: each entry an IP address or a CIDR block.
+fn parse_egress_ips(raw: Option<&str>) -> Result<Vec<String>, ConfigError> {
+    let Some(raw) = raw else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    for entry in raw.split([',', ' ', '\n', '\t']).filter(|e| !e.is_empty()) {
+        let (addr, prefix) = match entry.split_once('/') {
+            Some((a, p)) => (a, Some(p)),
+            None => (entry, None),
+        };
+        let ip: std::net::IpAddr = addr.parse().map_err(|_| {
+            ConfigError(format!(
+                "CONNECT_EGRESS_IPS: '{entry}' is not an IP address or a CIDR block"
+            ))
+        })?;
+        if let Some(p) = prefix {
+            let max = if ip.is_ipv4() { 32 } else { 128 };
+            if !p.parse::<u8>().is_ok_and(|n| n <= max) {
+                return Err(ConfigError(format!(
+                    "CONNECT_EGRESS_IPS: '{entry}' has an invalid prefix length"
+                )));
+            }
+        }
+        if !out.iter().any(|e: &String| e == entry) {
+            out.push(entry.to_owned());
+        }
+    }
+    Ok(out)
 }
 
 impl Config {
@@ -293,7 +329,9 @@ impl Config {
                 "CREDITS_CACHE_STALE_SECS must be at least CREDITS_CACHE_FRESH_SECS".into(),
             ));
         }
+        let egress_ips = parse_egress_ips(get("CONNECT_EGRESS_IPS").as_deref())?;
         Ok(Self {
+            egress_ips,
             listen_addr,
             database_url,
             secret_key,
@@ -438,6 +476,33 @@ mod tests {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
         Config::from_lookup(|k| map.get(k).cloned())
+    }
+
+    #[test]
+    fn egress_ips_are_ips_or_cidrs() {
+        let base = [("ADMIN_API_KEY", "k")];
+        assert!(cfg(&base).unwrap().egress_ips.is_empty());
+        let c = cfg(&[
+            ("ADMIN_API_KEY", "k"),
+            (
+                "CONNECT_EGRESS_IPS",
+                "203.0.113.7, 198.51.100.0/24 2001:db8::/64,203.0.113.7",
+            ),
+        ])
+        .unwrap();
+        assert_eq!(
+            c.egress_ips,
+            vec!["203.0.113.7", "198.51.100.0/24", "2001:db8::/64"]
+        );
+        for bad in [
+            "egress.example.com",
+            "10.0.0.0/33",
+            "10.0.0.1/x",
+            "2001:db8::/129",
+        ] {
+            let err = cfg(&[("ADMIN_API_KEY", "k"), ("CONNECT_EGRESS_IPS", bad)]).unwrap_err();
+            assert!(err.0.contains("CONNECT_EGRESS_IPS"), "{bad}: {}", err.0);
+        }
     }
 
     #[test]
