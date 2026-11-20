@@ -26,6 +26,26 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all --check
 
+  lab-contract-drift:
+    name: Lab contract drift
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compare the vendored schema with the Lab's
+        # meilisearch/lab is private: LAB_REPO_TOKEN is a fine-grained PAT with
+        # read access to its contents. Without it (forks, missing secret) the check
+        # is skipped loudly rather than failing every PR.
+        env:
+          LAB_REPO_TOKEN: ${{ secrets.LAB_REPO_TOKEN }}
+          LAB_SCHEMA_URL: https://raw.githubusercontent.com/meilisearch/lab/main/contracts/lab-events.schema.json
+        run: |
+          if [ -z "$LAB_REPO_TOKEN" ]; then
+            echo "::notice title=Lab contract drift::LAB_REPO_TOKEN is not set; skipping the drift check"
+            exit 0
+          fi
+          curl -fsSL -H "Authorization: Bearer $LAB_REPO_TOKEN" "$LAB_SCHEMA_URL" -o /tmp/lab-events.schema.json
+          diff -u /tmp/lab-events.schema.json contracts/vendor/lab/lab-events.schema.json
+
   clippy:
     name: clippy
     runs-on: ubuntu-latest

@@ -24,8 +24,8 @@ pub use secret::Secret;
 pub use sink::{ApplyReport, DocOp, IndexTarget, RejectedDoc, Sink};
 pub use source::{
     AckReceiver, AckSender, Capabilities, CheckItem, CheckReport, CheckStatus, CollectionInfo,
-    EventSender, FieldInfo, Lag, LagReporter, LagWatch, Opened, Source, SourceFactory, ack_channel,
-    seconds_since_unix_millis,
+    EventSender, FieldInfo, Lag, LagReporter, LagWatch, Opened, Retention, Source, SourceFactory,
+    ack_channel, seconds_since_unix_millis,
 };
 pub use spec::{
     FieldSelection, MeiliDestination, SourceKind, SourceSpec, StreamMapping, SyncSpec,

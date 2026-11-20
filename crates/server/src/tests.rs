@@ -50,6 +50,10 @@ struct Probe {
     last_opened: std::sync::Mutex<Option<Value>>,
     /// The configs torn down, in order.
     torn_down: std::sync::Mutex<Vec<Value>>,
+    /// What `retention` answers (every source), and whether it fails.
+    retention: std::sync::Mutex<Option<meili_connect_core::Retention>>,
+    retention_fails: AtomicBool,
+    retention_calls: AtomicUsize,
 }
 
 struct FakeSources(Arc<Probe>);
@@ -208,6 +212,16 @@ impl Source for FakeSource {
         self.lag = Some(reporter);
     }
 
+    async fn retention(&mut self) -> Result<Option<meili_connect_core::Retention>, SourceError> {
+        self.probe.retention_calls.fetch_add(1, Ordering::SeqCst);
+        if self.probe.retention_fails.load(Ordering::SeqCst) {
+            return Err(SourceError::Transient(
+                "connect to 10.0.0.5: refused".into(),
+            ));
+        }
+        Ok(self.probe.retention.lock().unwrap().clone())
+    }
+
     async fn teardown(&mut self) -> Result<(), SourceError> {
         self.probe.teardowns.fetch_add(1, Ordering::SeqCst);
         self.probe
@@ -337,6 +351,7 @@ fn app_tweaked(
         aws_principal: test_principal(),
         egress_ips: Vec::new(),
         usage_idle_flush: crate::usage::DEFAULT_IDLE_FLUSH,
+        sync_events_settle: crate::sync_events::DEFAULT_SETTLE,
         limits,
     };
     tweak(&mut wiring);
@@ -1116,6 +1131,7 @@ async fn a_loopback_destination_is_host_not_allowed_with_the_real_sinks() {
             aws_principal: test_principal(),
             egress_ips: Vec::new(),
             usage_idle_flush: crate::usage::DEFAULT_IDLE_FLUSH,
+            sync_events_settle: crate::sync_events::DEFAULT_SETTLE,
             limits: Limits::default(),
         },
         CancellationToken::new(),
@@ -2141,6 +2157,120 @@ async fn engine_progress_becomes_usage_events_for_tenant_syncs() {
         lease.events[0].payload["data"]["units"]["documents_streamed"],
         2
     );
+}
+
+/// Phase changes of a tenant's sync become `sync.state_changed` events
+/// (settled, with a reason when it is held), a deletion too; a global
+/// sync's never do. Every event matches the vendored contract.
+#[tokio::test]
+async fn phase_changes_become_sync_state_events_for_tenant_syncs() {
+    const TEAM: &str = "0190c5a0-0000-7000-8000-00000000000a";
+    let a = app(locked());
+    let events = Arc::clone(a.state.manager.sync_events());
+    let drain = async || -> Vec<Value> {
+        let lease = a
+            .store
+            .lease_events(100, Duration::from_secs(60))
+            .await
+            .unwrap();
+        a.store
+            .mark_events_sent(
+                lease.token,
+                &lease.events.iter().map(|e| e.id).collect::<Vec<_>>(),
+            )
+            .await
+            .unwrap();
+        lease
+            .events
+            .into_iter()
+            .filter(|e| e.payload["type"] == "sync.state_changed")
+            .inspect(|e| crate::sync_events::tests::assert_valid(&e.payload, e.id))
+            .map(|e| e.payload)
+            .collect()
+    };
+
+    let id = create(&a, &lab(TEAM), "s").await;
+    let global = create(&a, &admin(), "g").await;
+    for (sync, headers) in [(&id, lab(TEAM)), (&global, admin())] {
+        let uri = format!("/syncs/{sync}/status");
+        wait_for(async || {
+            let st = call(&a.router, "GET", &uri, &headers, None).await.1;
+            st["phase"] == "streaming" && st["has_checkpoint"] == true
+        })
+        .await;
+    }
+    // Still in the settle window: nothing yet.
+    assert_eq!(events.flush(false).await, 0);
+    // Settled (forced here): the first snapshot and its end are one change.
+    assert_eq!(
+        events.flush(true).await,
+        1,
+        "the global sync reports nothing"
+    );
+    let sent = drain().await;
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0]["account_id"], TEAM);
+    assert_eq!(
+        sent[0]["data"],
+        json!({"sync_id": id, "sync_name": "postgres → items",
+               "from": "snapshotting", "to": "streaming", "resync": false})
+    );
+    // Nothing changed since: nothing more.
+    assert_eq!(events.flush(true).await, 0);
+
+    // A pause, then the deletion right after.
+    let (status, _) = call(
+        &a.router,
+        "POST",
+        &format!("/syncs/{id}/pause"),
+        &lab(TEAM),
+        None,
+    )
+    .await;
+    assert!(status.is_success(), "{status}");
+    let (status, _) = call(
+        &a.router,
+        "DELETE",
+        &format!("/syncs/{id}"),
+        &lab(TEAM),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    // The pause had not settled: only the deletion is told.
+    assert_eq!(events.flush(true).await, 1);
+    let sent = drain().await;
+    let changes: Vec<(&str, &str)> = sent
+        .iter()
+        .map(|e| {
+            (
+                e["data"]["from"].as_str().unwrap(),
+                e["data"]["to"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(changes, [("paused", "deleted")]);
+
+    // A held sync says why, with the coarse message only.
+    let mut body = sync_body("held");
+    body["source"]["config"]["open_error"] = json!("relation 10.9.9.9 DRIVER-DETAIL");
+    let (status, created) = call(&a.router, "POST", "/syncs", &lab(TEAM), Some(body)).await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let held = created["id"].as_str().unwrap().to_owned();
+    let uri = format!("/syncs/{held}/status");
+    wait_for(async || call(&a.router, "GET", &uri, &lab(TEAM), None).await.1["phase"] == "held")
+        .await;
+    assert_eq!(events.flush(true).await, 1);
+    let sent = drain().await;
+    assert_eq!(sent[0]["data"]["from"], "pending");
+    assert_eq!(sent[0]["data"]["to"], "held");
+    assert_eq!(sent[0]["data"]["reason"], "source_config");
+    assert!(
+        !sent[0].to_string().contains("DRIVER-DETAIL"),
+        "{}",
+        sent[0]
+    );
+    assert!(!sent[0].to_string().contains("10.9.9.9"), "{}", sent[0]);
 }
 
 /// An idle sync sends no event per flush: its seconds accumulate (none
@@ -3516,4 +3646,148 @@ async fn a_stored_tenant_sync_with_a_foreign_external_id_is_held_at_start() {
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     wait_for(async || opened_external_id(&a).as_deref() == Some(expected.as_str())).await;
+}
+
+/// The health probe measures a Lab tenant's slot in every phase (paused
+/// included) and its lag while streaming, reports crossings as
+/// `sync.health_changed`, skips a probe that fails, and never measures a
+/// global sync.
+#[tokio::test]
+async fn health_crossings_become_sync_health_events_for_tenant_syncs() {
+    use crate::sync_health::{self, HealthConfig};
+    const TEAM: &str = "0190c5a0-0000-7000-8000-00000000000b";
+    const GIB: u64 = 1 << 30;
+    let a = app(locked());
+    let manager = Arc::clone(&a.state.manager);
+    let events = Arc::clone(manager.sync_events());
+    let cancel = CancellationToken::new();
+    let config = HealthConfig {
+        lag_warn_secs: 1,
+        ..HealthConfig::default()
+    };
+    let health = async || -> Vec<Value> {
+        events.flush(true).await;
+        let lease = a
+            .store
+            .lease_events(100, Duration::from_secs(60))
+            .await
+            .unwrap();
+        a.store
+            .mark_events_sent(
+                lease.token,
+                &lease.events.iter().map(|e| e.id).collect::<Vec<_>>(),
+            )
+            .await
+            .unwrap();
+        lease
+            .events
+            .into_iter()
+            .inspect(|e| crate::sync_events::tests::assert_valid(&e.payload, e.id))
+            .filter(|e| e.payload["type"] == sync_health::EVENT_TYPE)
+            .map(|e| e.payload)
+            .collect()
+    };
+    let id = create(&a, &lab(TEAM), "s").await;
+    let global = create(&a, &admin(), "g").await;
+    for (sync, headers) in [(&id, lab(TEAM)), (&global, admin())] {
+        let uri = format!("/syncs/{sync}/status");
+        wait_for(async || {
+            let st = call(&a.router, "GET", &uri, &headers, None).await.1;
+            st["phase"] == "streaming"
+        })
+        .await;
+    }
+
+    // Lag: the fake source reports 1.5 s while streaming.
+    sync_health::sample_lag(&manager, &config).await;
+    let sent = health().await;
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(sent[0]["account_id"], TEAM);
+    assert_eq!(
+        sent[0]["data"],
+        json!({"sync_id": id, "sync_name": "postgres → items", "status": "warning",
+               "cause": "lag", "state": "streaming", "lag_seconds": 1, "threshold": 1})
+    );
+
+    // WAL: only the tenant's sync is measured.
+    *a.probe.retention.lock().unwrap() = Some(meili_connect_core::Retention {
+        bytes: 3 * GIB,
+        limit_bytes: Some(4 * GIB),
+        status: Some("extended".into()),
+    });
+    assert_eq!(
+        sync_health::probe_retention(&manager, &config, &cancel).await,
+        1
+    );
+    assert_eq!(a.probe.retention_calls.load(Ordering::SeqCst), 1);
+    let sent = health().await;
+    assert_eq!(sent.len(), 1);
+    assert_eq!(
+        sent[0]["data"],
+        json!({"sync_id": id, "sync_name": "postgres → items", "status": "warning",
+               "cause": "wal_retained", "state": "streaming",
+               "retained_wal_bytes": 3 * GIB, "threshold": GIB,
+               "source_limit_bytes": 4 * GIB})
+    );
+    let text = sent[0].to_string();
+    assert!(
+        !text.contains("db:5432")
+            && !text.contains(SECRET_MARK)
+            && !text.contains("meili_connect_"),
+        "no host, secret or slot: {text}"
+    );
+
+    // Paused: still measured. A failing probe changes nothing.
+    let (status, _) = call(
+        &a.router,
+        "POST",
+        &format!("/syncs/{id}/pause"),
+        &lab(TEAM),
+        None,
+    )
+    .await;
+    assert!(status.is_success(), "{status}");
+    a.probe.retention_fails.store(true, Ordering::SeqCst);
+    assert_eq!(
+        sync_health::probe_retention(&manager, &config, &cancel).await,
+        0
+    );
+    a.probe.retention_fails.store(false, Ordering::SeqCst);
+    // The slot went away (or released its WAL): ok, while paused.
+    *a.probe.retention.lock().unwrap() = None;
+    assert_eq!(
+        sync_health::probe_retention(&manager, &config, &cancel).await,
+        1
+    );
+    let sent: Vec<Value> = health()
+        .await
+        .into_iter()
+        .filter(|e| e["data"]["cause"] == "wal_retained")
+        .collect();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0]["data"]["status"], "ok");
+    assert_eq!(sent[0]["data"]["state"], "paused");
+    assert_eq!(sent[0]["data"]["retained_wal_bytes"], 0);
+
+    // A deleted sync drops what waits and is not measured any more.
+    *a.probe.retention.lock().unwrap() = Some(meili_connect_core::Retention {
+        bytes: 3 * GIB,
+        limit_bytes: None,
+        status: None,
+    });
+    sync_health::probe_retention(&manager, &config, &cancel).await;
+    let (status, _) = call(
+        &a.router,
+        "DELETE",
+        &format!("/syncs/{id}"),
+        &lab(TEAM),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(health().await.is_empty(), "only the deletion");
+    assert_eq!(
+        sync_health::probe_retention(&manager, &config, &cancel).await,
+        0
+    );
 }

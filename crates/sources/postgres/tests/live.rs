@@ -1704,6 +1704,63 @@ async fn check_flags_tables_whose_rls_would_hide_rows() {
     .unwrap();
 }
 
+/// `retention` measures the WAL the sync's slot keeps on its own short
+/// connection, with no stream running (a stopped sync), and reports no
+/// slot once it is torn down.
+#[tokio::test]
+async fn retention_measures_the_wal_a_stopped_slot_keeps() {
+    let Some(url) = url() else { return };
+    let db = admin(&url).await;
+    let table = unique("kept");
+    create_items(&db, &table).await;
+    let sync_id = unique("kept");
+    let collection = format!("public.{table}");
+
+    // No slot yet: nothing kept.
+    let mut src = source(&url, &sync_id, &[&collection]);
+    assert_eq!(src.retention().await.unwrap(), None);
+
+    let mut src = source(&url, &sync_id, &[&collection]);
+    assert!(matches!(
+        src.open(None).await.unwrap(),
+        Opened::Fresh { .. }
+    ));
+    drop(src);
+    let mut probe = source(&url, &sync_id, &[&collection]);
+    let before = probe.retention().await.unwrap().expect("the slot exists");
+
+    // Nobody streams: every write is WAL the slot keeps.
+    db.batch_execute(&format!(
+        "INSERT INTO {table} SELECT g, g, repeat('x', 200) FROM generate_series(1, 20000) g"
+    ))
+    .await
+    .unwrap();
+    let after = probe.retention().await.unwrap().expect("the slot exists");
+    assert!(
+        after.bytes >= before.bytes + 4_000_000,
+        "{before:?} → {after:?}"
+    );
+    // The server's cap, as configured (unlimited by default: none).
+    let cap: String = db
+        .query_one("SHOW max_slot_wal_keep_size", &[])
+        .await
+        .unwrap()
+        .get(0);
+    if cap == "-1" {
+        assert_eq!(after.limit_bytes, None);
+    } else {
+        assert!(after.limit_bytes.is_some(), "{cap}: {after:?}");
+    }
+    assert!(after.status.is_some(), "wal_status from Postgres 13");
+
+    let mut src = source(&url, &sync_id, &[&collection]);
+    src.teardown().await.unwrap();
+    assert_eq!(probe.retention().await.unwrap(), None, "torn down");
+    db.batch_execute(&format!("DROP TABLE {table}"))
+        .await
+        .unwrap();
+}
+
 /// `provider: planetscale` creates a failover-enabled slot on Postgres 17+
 /// (PlanetScale requires it), together with the exported snapshot, and
 /// the check reports it; an older slot without failover is a warning.

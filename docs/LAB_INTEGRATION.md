@@ -146,7 +146,135 @@ recorded, so at any time they equal the events sent plus what is pending.
 ```
 
 The Lab owns `lab-events.schema.json`: it adds `connect` to `product` and the
-`sync` operation with those unit names first; the engine vendors the schema.
+`sync` operation with those unit names first; the engine vendors the schema
+(`contracts/vendor/lab/`, byte copy, drift-checked in CI) and its tests
+validate every event it builds against it.
+
+## Sync state event
+
+One `sync.state_changed` event when a tenant's sync changes phase, through
+the same signed outbox as usage (at least once, deduplicated by id). Global
+syncs and a server without the `LAB_*` event variables send none. The Lab
+turns them into the team's emails; the Lab must accept the type before an
+engine sends it (it does since the schema has `syncStateData`).
+
+- **When**: every change of phase the engine or the manager persists, and
+  the deletion of the sync (`to: "deleted"`). A save of the same phase
+  (checkpoints, a retried error's message) is not a change. The end of a
+  snapshot (`snapshotting` → `streaming`) is always one, `resync: true` when
+  it was a resync.
+- **No floods**: a change waits until its phase has held for
+  `SYNC_EVENTS_SETTLE_SECS` (default 30 s). A newer change replaces a waiting
+  one, and a change back to the phase last reported cancels it: a sync
+  flapping between `streaming` and `source_paused` every few seconds sends
+  nothing until it stays in one, then one event. At most one event per sync
+  per window; a deletion goes at the next tick (5 s) and drops a change
+  still waiting. A graceful shutdown sends what waits; a crash loses it (the
+  Lab learns the phase at the next change).
+- **Id**: the outbox row id, a UUIDv7 made when the change is enqueued and
+  kept across retries. `occurred_at` is when the change happened.
+- **Phases**: `pending`, `snapshotting`, `streaming`, `paused` (by the
+  user), `source_paused`, `held`, `failed`, `deleted`. `from` is the phase
+  right before `to`.
+- **reason** (with `message`, for `paused`, `source_paused`, `held`,
+  `failed`): a stable code from one mapping (`crates/server/src/reason.rs`).
+  `message` is what `GET /syncs/{id}/status` shows the tenant: the coarse,
+  fixed description of the error class, never a host, driver text or what a
+  remote server sent (cut at 1000 bytes).
+
+| reason | When |
+|---|---|
+| `insufficient_credits` | The team is out of credits (message `out_of_credits`) |
+| `source_auth` | The source refused the credentials |
+| `source_unreachable` | The source host does not resolve, refuses or does not answer; the source is paused |
+| `source_config` | Publication, replication slot, privileges, tables or prerequisites; a host-policy refusal |
+| `invalid_config` | The source configuration or the sync spec is invalid |
+| `resync_budget_spent` | The position was lost again after the allowed resyncs in a row |
+| `destination_auth` | Meilisearch refused the API key |
+| `destination_rejected` | Meilisearch refused the index (primary key) or the documents |
+| `destination_unreachable` | Meilisearch does not answer (also a batch held after failing 10 times) |
+| `delete_guard` | A truncate or a mass delete was held back |
+| `internal` | Anything else |
+
+```json
+{
+  "id": "<UUIDv7>",
+  "type": "sync.state_changed",
+  "occurred_at": "2026-11-20T10:00:00.000Z",
+  "account_id": "<tenant>",
+  "api_key_id": null,
+  "product": "connect",
+  "data": {
+    "sync_id": "<sync id>",
+    "sync_name": "postgres → products",
+    "from": "streaming",
+    "to": "held",
+    "reason": "source_auth",
+    "message": "source configuration error: the source refused the credentials: check the user and the password or key"
+  }
+}
+```
+
+## Sync health event
+
+One `sync.health_changed` event when a tenant's sync gets dangerous for its
+source, per cause, and one when it is fine again. Same outbox, signing,
+ids, Lab-tenants-only rule and settle window as the state event.
+
+- **`lag`**: a *streaming* sync is behind its source by
+  `SYNC_LAG_WARN_SECS` (default 900 s), from the lag the source already
+  reports (no query; looked at every 30 s). Not measured in other phases:
+  the state event covers a stopped sync, and a lag warning stands until the
+  sync streams under the threshold again.
+- **`wal_retained`**: the WAL the replication slot of a Postgres or Supabase
+  sync keeps on the customer's database
+  (`pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)`) reaches
+  `SYNC_WAL_WARN_BYTES` (default 1 GiB), or half of the source's positive
+  `max_slot_wal_keep_size` when that is lower (`source_limit_bytes`; past it
+  Postgres invalidates the slot and the sync resyncs). Measured every
+  `SYNC_HEALTH_INTERVAL_SECS` (default 300 s; `0` turns the probe off) in
+  **every** phase where the slot exists: streaming, snapshotting, paused,
+  held, failed, source paused. A stopped sync is the dangerous case: its
+  slot keeps WAL until the disk fills. Each measure is one query on its own
+  short-lived connection with the sync's credentials, behind the host
+  policy, at most 4 at a time and 20 s each; it never touches the sync's
+  own sessions. A measure that fails is logged and skipped (an unreachable
+  source is the state event's business). A slot that is gone counts as
+  0 bytes. Other source kinds are not measured (MySQL binlog retention is
+  out of scope).
+- **Status**: `warning` from the threshold, `ok` again only under 80 % of
+  it (no flapping around the threshold). `threshold` is the one that
+  applied: seconds for `lag`, bytes for `wal_retained`. `state` is the
+  sync's phase when it was measured.
+- **When**: on a change of status only, once it has held for
+  `SYNC_EVENTS_SETTLE_SECS`; a change back to what was reported last
+  cancels it. A deleted sync drops what waits.
+- **Restarts**: the status is kept in memory and starts `ok`. A sync still
+  over its threshold after a restart reports `warning` once more (the Lab
+  dedupes repeated warnings); one that recovered while the server was down
+  sends no `ok`.
+- **Privacy**: numbers only. No host, slot name or credentials.
+
+```json
+{
+  "id": "<UUIDv7>",
+  "type": "sync.health_changed",
+  "occurred_at": "2026-11-20T10:00:00.000Z",
+  "account_id": "<tenant>",
+  "api_key_id": null,
+  "product": "connect",
+  "data": {
+    "sync_id": "<sync id>",
+    "sync_name": "postgres → products",
+    "status": "warning",
+    "cause": "wal_retained",
+    "state": "paused",
+    "retained_wal_bytes": 3221225472,
+    "threshold": 536870912,
+    "source_limit_bytes": 1073741824
+  }
+}
+```
 
 ## Engine API the Lab relies on
 

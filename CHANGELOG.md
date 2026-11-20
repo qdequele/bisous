@@ -92,6 +92,34 @@ All notable changes to meili-connect are listed here. The format follows
   (`roles/datastore.viewer`) or database, `discover` lists collections with
   counts and collection groups found under sampled documents. Live tests
   run against the Firestore emulator (`FIRESTORE_TEST_EMULATOR_HOST`).
+- Lab mode: a `sync.state_changed` event tells the Lab when a tenant's sync
+  changes phase (`pending`, `snapshotting`, `streaming`, `paused`,
+  `source_paused`, `held`, `failed`, `deleted`), including the end of a
+  snapshot (`resync: true` for a resync), with a stable `reason` code
+  (`source_auth`, `source_unreachable`, `source_config`,
+  `insufficient_credits`, `delete_guard`, `resync_budget_spent`,
+  `destination_auth`, …) next to the coarse message. A change is reported
+  once its phase held for `SYNC_EVENTS_SETTLE_SECS` (default 30 s), so a
+  flapping sync sends one event, not one per flap. The Lab events schema is
+  vendored in `contracts/vendor/lab/` and drift-checked in CI. See
+  `docs/LAB_INTEGRATION.md`, "Sync state event".
+- Lab mode: a `sync.health_changed` event warns the Lab when a tenant's
+  sync gets dangerous for its source, and says when it is fine again:
+  `lag` (a streaming sync behind by `SYNC_LAG_WARN_SECS`, default 900 s) and
+  `wal_retained` (the WAL a Postgres or Supabase replication slot keeps on
+  the customer's database reaches `SYNC_WAL_WARN_BYTES`, default 1 GiB, or
+  half of a positive `max_slot_wal_keep_size`). The slot is measured every
+  `SYNC_HEALTH_INTERVAL_SECS` (default 300 s, `0` turns the probe off) in
+  every phase where it exists, paused, held and failed included: a stopped
+  sync's slot keeps WAL until the disk fills or the slot is invalidated.
+  `ok` comes back only under 80 % of the threshold, and changes settle like
+  state changes. See `docs/LAB_INTEGRATION.md`, "Sync health event".
+- `Source::retention` (core): what a sync keeps on its origin, read on a
+  short-lived connection in any phase; Postgres reads its slot's retained
+  WAL, `wal_status` and `max_slot_wal_keep_size`.
+- The coarse errors a Lab tenant sees name their cause more precisely
+  (credentials refused, host not found, configuration, API key refused,
+  index refused) without adding any detail from the driver or the server.
 - Postgres and Supabase: `manage_publication: false` (default `true`) uses a
   publication managed elsewhere, named by the then required
   `publication_name`. The sync never creates, alters or drops it and needs

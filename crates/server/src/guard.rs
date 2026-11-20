@@ -22,8 +22,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use meili_connect_core::{
     AckReceiver, ApplyReport, Capabilities, CheckReport, Checkpoint, CollectionInfo, DocOp,
-    Endpoint, EventSender, HostPolicy, HostPolicyError, IndexTarget, LagReporter, Opened, Sink,
-    SinkError, Source, SourceError, SourceFactory, SourceSpec, StreamMapping,
+    Endpoint, EventSender, HostPolicy, HostPolicyError, IndexTarget, LagReporter, Opened,
+    Retention, Sink, SinkError, Source, SourceError, SourceFactory, SourceSpec, StreamMapping,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -84,39 +84,18 @@ fn url_host_port(url: &str) -> Option<(String, u16)> {
 
 // ------------------------------------------------------------ coarse errors
 
-const SOURCE_UNREACHABLE: &str =
-    "the source could not be reached or did not answer in time; retrying";
-const SOURCE_POSITION_LOST: &str = "the source no longer holds the saved position";
-const SOURCE_CONFIG: &str = "the source refused the connection or the configuration (address, \
-     credentials, privileges or prerequisites); run the source check for details";
-const SOURCE_PAUSED: &str = "the source is paused";
-const SOURCE_FATAL: &str = "the source returned an unexpected error";
-
-const SINK_UNREACHABLE: &str = "Meilisearch could not be reached or did not answer in time";
-const SINK_CONFIG: &str =
-    "Meilisearch refused the request: check the URL, the API key and the index primary key";
-const SINK_FATAL: &str = "Meilisearch rejected the request";
-
-/// The class of a source error with a fixed description.
+/// The class of a source error with the fixed description of its reason
+/// (`crate::reason`).
 pub fn coarse_source_error(e: SourceError) -> SourceError {
     tracing::debug!(error = %e, "source error (reported coarsely)");
-    match e {
-        SourceError::Transient(_) => SourceError::Transient(SOURCE_UNREACHABLE.into()),
-        SourceError::PositionLost(_) => SourceError::PositionLost(SOURCE_POSITION_LOST.into()),
-        SourceError::Config(_) => SourceError::Config(SOURCE_CONFIG.into()),
-        SourceError::Paused(_) => SourceError::Paused(SOURCE_PAUSED.into()),
-        SourceError::Fatal(_) => SourceError::Fatal(SOURCE_FATAL.into()),
-    }
+    crate::reason::coarse_source(&e)
 }
 
-/// The class of a sink error with a fixed description.
+/// The class of a sink error with the fixed description of its reason
+/// (`crate::reason`).
 pub fn coarse_sink_error(e: SinkError) -> SinkError {
     tracing::debug!(error = %e, "Meilisearch error (reported coarsely)");
-    match e {
-        SinkError::Transient(_) => SinkError::Transient(SINK_UNREACHABLE.into()),
-        SinkError::Config(_) => SinkError::Config(SINK_CONFIG.into()),
-        SinkError::Fatal(_) => SinkError::Fatal(SINK_FATAL.into()),
-    }
+    crate::reason::coarse_sink(&e)
 }
 
 // ------------------------------------------------------------ sources
@@ -335,6 +314,12 @@ impl Source for GuardedSource {
 
     fn report_lag(&mut self, reporter: LagReporter) {
         self.inner.report_lag(reporter);
+    }
+
+    async fn retention(&mut self) -> Result<Option<Retention>, SourceError> {
+        self.ensure_vetted().await?;
+        let r = self.inner.retention().await;
+        r.map_err(|e| self.surface(e))
     }
 }
 
