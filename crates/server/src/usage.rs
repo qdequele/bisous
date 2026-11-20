@@ -47,6 +47,7 @@ use serde_json::{Value, json};
 
 use crate::limits::LogLimiter;
 use crate::metrics::Metrics;
+use crate::sync_events::SyncEvents;
 
 /// Lab product name of meili-connect.
 pub const PRODUCT: &str = "connect";
@@ -285,15 +286,27 @@ impl UsageEvents {
 }
 
 /// The engine's store as the server gives it to the engine: what it
-/// records is also counted in the Prometheus metrics.
+/// records is also counted in the Prometheus metrics, and every phase it
+/// saves is reported to [`SyncEvents`] (`sync.state_changed`).
 pub struct MeteredStore {
     inner: Arc<dyn StateStore>,
     metrics: Arc<Metrics>,
+    events: Arc<SyncEvents>,
 }
 
 impl MeteredStore {
     pub fn new(inner: Arc<dyn StateStore>, metrics: Arc<Metrics>) -> Self {
-        Self { inner, metrics }
+        Self {
+            inner,
+            metrics,
+            events: Arc::new(SyncEvents::disabled()),
+        }
+    }
+
+    /// Report the phases it saves.
+    pub fn with_sync_events(mut self, events: Arc<SyncEvents>) -> Self {
+        self.events = events;
+        self
     }
 }
 
@@ -304,7 +317,19 @@ impl StateStore for MeteredStore {
     }
 
     async fn save(&self, state: &SyncState) -> Result<(), StoreError> {
-        self.inner.save(state).await
+        // The phase before the first save of a tracked sync since boot.
+        if self.events.needs_baseline(&state.sync_id) {
+            match self.inner.load(&state.sync_id).await {
+                Ok(saved) => self.events.baseline(&state.sync_id, saved.as_ref()),
+                Err(e) => {
+                    tracing::debug!(sync_id = %state.sync_id, error = %e,
+                        "cannot read the previous phase; this save is the baseline");
+                }
+            }
+        }
+        self.inner.save(state).await?;
+        self.events.observe(state);
+        Ok(())
     }
 
     async fn push_dead_letters(&self, letters: &[DeadLetter]) -> Result<(), StoreError> {

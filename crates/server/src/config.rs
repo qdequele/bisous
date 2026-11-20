@@ -73,6 +73,9 @@ pub struct Config {
     /// How long a running sync's `sync_seconds` alone (an idle sync) stay
     /// pending before they become an event.
     pub usage_idle_flush: Duration,
+    /// How long a sync's new phase must hold before `sync.state_changed`
+    /// reports it (`crate::sync_events`).
+    pub sync_events_settle: Duration,
     /// How often the Lab sender looks for due events.
     pub lab_send_interval: Duration,
     /// Time limit of `/sources/check` and `/sources/discover`.
@@ -305,6 +308,7 @@ impl Config {
             log_filter,
             usage_flush_interval: secs(&get, "USAGE_FLUSH_INTERVAL_SECS", 60, 1, 3600)?,
             usage_idle_flush: secs(&get, "USAGE_IDLE_FLUSH_SECS", 3600, 1, 86_400)?,
+            sync_events_settle: secs(&get, "SYNC_EVENTS_SETTLE_SECS", 30, 0, 3600)?,
             lab_send_interval: secs(&get, "LAB_SEND_INTERVAL_SECS", 2, 1, 300)?,
             source_probe_timeout: secs(&get, "SOURCE_PROBE_TIMEOUT_SECS", 30, 1, 600)?,
             shutdown_grace,
@@ -450,6 +454,10 @@ mod tests {
         let c = cfg(&[("ADMIN_API_KEY", "k"), ("USAGE_IDLE_FLUSH_SECS", "120")]).unwrap();
         assert_eq!(c.usage_idle_flush, Duration::from_secs(120));
         assert!(cfg(&[("ADMIN_API_KEY", "k"), ("USAGE_IDLE_FLUSH_SECS", "0")]).is_err());
+        assert_eq!(c.sync_events_settle, Duration::from_secs(30));
+        let c = cfg(&[("ADMIN_API_KEY", "k"), ("SYNC_EVENTS_SETTLE_SECS", "0")]).unwrap();
+        assert_eq!(c.sync_events_settle, Duration::ZERO);
+        assert!(cfg(&[("ADMIN_API_KEY", "k"), ("SYNC_EVENTS_SETTLE_SECS", "3601")]).is_err());
     }
 
     #[test]

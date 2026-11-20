@@ -37,6 +37,7 @@ uuid.workspace = true
 
 [dev-dependencies]
 http-body-util.workspace = true
+jsonschema = { version = "0.45", default-features = false }
 serde_yaml.workspace = true
 tower.workspace = true
 wiremock.workspace = true

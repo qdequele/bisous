@@ -15,10 +15,12 @@ pub mod lab;
 pub mod limits;
 pub mod manager;
 pub mod metrics;
+pub mod reason;
 pub mod redact;
 pub mod registry;
 pub mod routes;
 pub mod state;
+pub mod sync_events;
 pub mod tinybird;
 pub mod usage;
 
@@ -44,6 +46,7 @@ use crate::manager::{ManagerDeps, SinkFactory, SyncManager, meili_sinks};
 use crate::metrics::Metrics;
 use crate::registry::SourceRegistry;
 use crate::state::{AppState, Backend};
+use crate::sync_events::SyncEvents;
 use crate::tinybird::{TinybirdConfig, TinybirdReader, TinybirdSender};
 use crate::usage::{MeteredStore, UsageEvents};
 
@@ -109,6 +112,9 @@ pub struct Wiring {
     /// `USAGE_IDLE_FLUSH_SECS`: how long a running sync's `sync_seconds`
     /// alone stay pending before they are sent.
     pub usage_idle_flush: std::time::Duration,
+    /// How long a sync's new phase must hold before `sync.state_changed`
+    /// reports it (`SYNC_EVENTS_SETTLE_SECS`).
+    pub sync_events_settle: std::time::Duration,
 }
 
 /// Assemble the shared state around a backend. The engine gets the
@@ -132,10 +138,20 @@ pub fn build_state(
     );
     backend.set_usage_lanes(usage.lanes());
     let metrics = Arc::new(Metrics::new());
-    let engine_store: Arc<dyn StateStore> = Arc::new(MeteredStore::new(
-        Arc::clone(&backend) as Arc<dyn StateStore>,
-        Arc::clone(&metrics),
-    ));
+    let sync_events = Arc::new(if wiring.lab_events {
+        SyncEvents::new(backend.outbox(Lane::Lab))
+            .with_backlog_cap(wiring.limits.outbox_max_pending)
+            .with_settle(wiring.sync_events_settle)
+    } else {
+        SyncEvents::disabled()
+    });
+    let engine_store: Arc<dyn StateStore> = Arc::new(
+        MeteredStore::new(
+            Arc::clone(&backend) as Arc<dyn StateStore>,
+            Arc::clone(&metrics),
+        )
+        .with_sync_events(Arc::clone(&sync_events)),
+    );
     let manager = Arc::new(SyncManager::new(ManagerDeps {
         store: engine_store,
         backend: Arc::clone(&backend),
@@ -144,6 +160,7 @@ pub fn build_state(
         policy: Arc::clone(&wiring.policy),
         config: wiring.supervisor,
         usage,
+        sync_events,
         max_syncs_per_tenant: wiring.limits.max_syncs_per_tenant,
         stop_grace: wiring.limits.stop_grace,
         credits: wiring.credits,
@@ -344,6 +361,7 @@ pub async fn run() -> Result<(), String> {
             external_ids,
             aws_principal: Arc::new(AwsPrincipal::from_host()),
             usage_idle_flush: config.usage_idle_flush,
+            sync_events_settle: config.sync_events_settle,
         },
         cancel.child_token(),
     );
@@ -364,6 +382,11 @@ pub async fn run() -> Result<(), String> {
             config.usage_flush_interval,
             background.child_token(),
         )));
+    }
+    if state.manager.sync_events().is_enabled() {
+        tasks.push(tokio::spawn(
+            Arc::clone(state.manager.sync_events()).run(background.child_token()),
+        ));
     }
     if credits.is_some() {
         tasks.push(tokio::spawn(Arc::clone(&state.manager).run_credit_checks(
@@ -408,6 +431,8 @@ pub async fn run() -> Result<(), String> {
     if let Err(e) = state.manager.usage().flush_all(&*backend).await {
         warn!(error = %e, "cannot enqueue the last usage; it stays pending");
     }
+    // Phase changes still in their settle window go now.
+    state.manager.sync_events().flush(true).await;
     background.cancel();
     for t in tasks {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), t).await;

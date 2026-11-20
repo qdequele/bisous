@@ -39,6 +39,7 @@ use crate::guard::{CoarseSink, GuardedSources};
 use crate::metrics::{InstrumentedSink, Metrics};
 use crate::redact::same_origin;
 use crate::state::Backend;
+use crate::sync_events::SyncEvents;
 use crate::usage::UsageEvents;
 
 type ApiResult<T> = Result<T, ApiError>;
@@ -85,6 +86,9 @@ pub struct ManagerDeps {
     /// Describes and drains the syncs' usage (a deleted sync's usage is
     /// enqueued before it goes).
     pub usage: Arc<UsageEvents>,
+    /// Reports the syncs' phase changes to the Lab (`sync.state_changed`);
+    /// the same instance the metered store reports saves to.
+    pub sync_events: Arc<SyncEvents>,
     /// Syncs one tenant may own.
     pub max_syncs_per_tenant: u64,
     /// Longest wait for one sync to stop.
@@ -109,6 +113,7 @@ pub struct SyncManager {
     config: SupervisorConfig,
     cancel: CancellationToken,
     usage: Arc<UsageEvents>,
+    sync_events: Arc<SyncEvents>,
     max_syncs_per_tenant: u64,
     stop_grace: Duration,
     /// Time limit of a teardown run outside a supervisor.
@@ -141,6 +146,7 @@ impl SyncManager {
             config: deps.config,
             cancel: deps.cancel,
             usage: deps.usage,
+            sync_events: deps.sync_events,
             max_syncs_per_tenant: deps.max_syncs_per_tenant,
             stop_grace: deps.stop_grace,
             teardown_timeout: Duration::from_secs(60),
@@ -157,6 +163,10 @@ impl SyncManager {
 
     pub fn usage(&self) -> &Arc<UsageEvents> {
         &self.usage
+    }
+
+    pub fn sync_events(&self) -> &Arc<SyncEvents> {
+        &self.sync_events
     }
 
     async fn serialize(&self, sync_id: &str) -> tokio::sync::OwnedMutexGuard<()> {
@@ -275,6 +285,7 @@ impl SyncManager {
 
     fn register(&self, spec: &SyncSpec) {
         self.usage.register(spec);
+        self.sync_events.register(spec);
         if let Some(tenant) = &spec.tenant {
             lock(&self.tenants).insert(spec.id.clone(), tenant.clone());
         }
@@ -282,6 +293,7 @@ impl SyncManager {
 
     fn unregister(&self, sync_id: &str) {
         self.usage.forget(sync_id);
+        self.sync_events.forget(sync_id);
         lock(&self.tenants).remove(sync_id);
         lock(&self.credit_held).remove(sync_id);
     }
@@ -563,8 +575,9 @@ impl SyncManager {
                 warn!(sync_id = %id, "deleting an unreadable sync; its origin is not cleaned up");
                 self.retire(id).await;
                 self.usage.flush_sync(&*self.backend, id).await;
-                self.unregister(id);
                 self.backend.delete_sync(tenant, id).await?;
+                self.sync_events.deleted(id);
+                self.unregister(id);
                 drop(op);
                 self.forget_lock(id);
                 return Ok(());
@@ -595,8 +608,9 @@ impl SyncManager {
         // Its pending usage goes now (or with the next flush: it is not
         // deleted with the sync).
         self.usage.flush_sync(&*self.backend, id).await;
-        self.unregister(id);
         self.backend.delete_sync(tenant, id).await?;
+        self.sync_events.deleted(id);
+        self.unregister(id);
         drop(op);
         self.forget_lock(id);
         info!(sync_id = %id, "sync deleted");

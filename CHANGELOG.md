@@ -51,6 +51,21 @@ All notable changes to meili-connect are listed here. The format follows
 
 ### Added
 
+- Lab mode: a `sync.state_changed` event tells the Lab when a tenant's sync
+  changes phase (`pending`, `snapshotting`, `streaming`, `paused`,
+  `source_paused`, `held`, `failed`, `deleted`), including the end of a
+  snapshot (`resync: true` for a resync), with a stable `reason` code
+  (`source_auth`, `source_unreachable`, `source_config`,
+  `insufficient_credits`, `delete_guard`, `resync_budget_spent`,
+  `destination_auth`, …) next to the coarse message. A change is reported
+  once its phase held for `SYNC_EVENTS_SETTLE_SECS` (default 30 s), so a
+  flapping sync sends one event, not one per flap. The Lab events schema is
+  vendored in `contracts/vendor/lab/` and drift-checked in CI. See
+  `docs/LAB_INTEGRATION.md`, "Sync state event".
+- The coarse errors a Lab tenant sees name their cause more precisely
+  (credentials refused, host not found, configuration, API key refused,
+  index refused) without adding any detail from the driver or the server.
+
 - Postgres and Supabase: `manage_publication: false` (default `true`) uses a
   publication managed elsewhere, named by the then required
   `publication_name`. The sync never creates, alters or drops it and needs

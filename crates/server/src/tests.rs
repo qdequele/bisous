@@ -336,6 +336,7 @@ fn app_tweaked(
         external_ids: None,
         aws_principal: test_principal(),
         usage_idle_flush: crate::usage::DEFAULT_IDLE_FLUSH,
+        sync_events_settle: crate::sync_events::DEFAULT_SETTLE,
         limits,
     };
     tweak(&mut wiring);
@@ -1114,6 +1115,7 @@ async fn a_loopback_destination_is_host_not_allowed_with_the_real_sinks() {
             external_ids: None,
             aws_principal: test_principal(),
             usage_idle_flush: crate::usage::DEFAULT_IDLE_FLUSH,
+            sync_events_settle: crate::sync_events::DEFAULT_SETTLE,
             limits: Limits::default(),
         },
         CancellationToken::new(),
@@ -2139,6 +2141,120 @@ async fn engine_progress_becomes_usage_events_for_tenant_syncs() {
         lease.events[0].payload["data"]["units"]["documents_streamed"],
         2
     );
+}
+
+/// Phase changes of a tenant's sync become `sync.state_changed` events
+/// (settled, with a reason when it is held), a deletion too; a global
+/// sync's never do. Every event matches the vendored contract.
+#[tokio::test]
+async fn phase_changes_become_sync_state_events_for_tenant_syncs() {
+    const TEAM: &str = "0190c5a0-0000-7000-8000-00000000000a";
+    let a = app(locked());
+    let events = Arc::clone(a.state.manager.sync_events());
+    let drain = async || -> Vec<Value> {
+        let lease = a
+            .store
+            .lease_events(100, Duration::from_secs(60))
+            .await
+            .unwrap();
+        a.store
+            .mark_events_sent(
+                lease.token,
+                &lease.events.iter().map(|e| e.id).collect::<Vec<_>>(),
+            )
+            .await
+            .unwrap();
+        lease
+            .events
+            .into_iter()
+            .filter(|e| e.payload["type"] == "sync.state_changed")
+            .inspect(|e| crate::sync_events::tests::assert_valid(&e.payload, e.id))
+            .map(|e| e.payload)
+            .collect()
+    };
+
+    let id = create(&a, &lab(TEAM), "s").await;
+    let global = create(&a, &admin(), "g").await;
+    for (sync, headers) in [(&id, lab(TEAM)), (&global, admin())] {
+        let uri = format!("/syncs/{sync}/status");
+        wait_for(async || {
+            let st = call(&a.router, "GET", &uri, &headers, None).await.1;
+            st["phase"] == "streaming" && st["has_checkpoint"] == true
+        })
+        .await;
+    }
+    // Still in the settle window: nothing yet.
+    assert_eq!(events.flush(false).await, 0);
+    // Settled (forced here): the first snapshot and its end are one change.
+    assert_eq!(
+        events.flush(true).await,
+        1,
+        "the global sync reports nothing"
+    );
+    let sent = drain().await;
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0]["account_id"], TEAM);
+    assert_eq!(
+        sent[0]["data"],
+        json!({"sync_id": id, "sync_name": "postgres → items",
+               "from": "snapshotting", "to": "streaming", "resync": false})
+    );
+    // Nothing changed since: nothing more.
+    assert_eq!(events.flush(true).await, 0);
+
+    // A pause, then the deletion right after.
+    let (status, _) = call(
+        &a.router,
+        "POST",
+        &format!("/syncs/{id}/pause"),
+        &lab(TEAM),
+        None,
+    )
+    .await;
+    assert!(status.is_success(), "{status}");
+    let (status, _) = call(
+        &a.router,
+        "DELETE",
+        &format!("/syncs/{id}"),
+        &lab(TEAM),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    // The pause had not settled: only the deletion is told.
+    assert_eq!(events.flush(true).await, 1);
+    let sent = drain().await;
+    let changes: Vec<(&str, &str)> = sent
+        .iter()
+        .map(|e| {
+            (
+                e["data"]["from"].as_str().unwrap(),
+                e["data"]["to"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(changes, [("paused", "deleted")]);
+
+    // A held sync says why, with the coarse message only.
+    let mut body = sync_body("held");
+    body["source"]["config"]["open_error"] = json!("relation 10.9.9.9 DRIVER-DETAIL");
+    let (status, created) = call(&a.router, "POST", "/syncs", &lab(TEAM), Some(body)).await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let held = created["id"].as_str().unwrap().to_owned();
+    let uri = format!("/syncs/{held}/status");
+    wait_for(async || call(&a.router, "GET", &uri, &lab(TEAM), None).await.1["phase"] == "held")
+        .await;
+    assert_eq!(events.flush(true).await, 1);
+    let sent = drain().await;
+    assert_eq!(sent[0]["data"]["from"], "pending");
+    assert_eq!(sent[0]["data"]["to"], "held");
+    assert_eq!(sent[0]["data"]["reason"], "source_config");
+    assert!(
+        !sent[0].to_string().contains("DRIVER-DETAIL"),
+        "{}",
+        sent[0]
+    );
+    assert!(!sent[0].to_string().contains("10.9.9.9"), "{}", sent[0]);
 }
 
 /// An idle sync sends no event per flush: its seconds accumulate (none

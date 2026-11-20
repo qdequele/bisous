@@ -230,9 +230,10 @@ Every variable, with defaults, is in [`.env.example`](.env.example).
 | `LAB_SERVICE_TOKEN` | unset | Lab token; requires `X-Connect-Tenant-Id`. Set but blank: startup error. |
 | `CONNECT_HOST_POLICY` | `public` with `LAB_SERVICE_TOKEN`, else `any` | Which hosts sources and destinations may point at: `public`, `any` or `allowlist`. See [Host policy](#host-policy). |
 | `CONNECT_HOST_ALLOWLIST` | unset | With `allowlist`: comma-separated `host`, `host:port`, IP addresses and CIDRs. |
-| `LAB_URL`, `LAB_INSTANCE_ID`, `LAB_INSTANCE_SECRET` | unset | Lab mode: usage events and credit holds. All three or none. |
+| `LAB_URL`, `LAB_INSTANCE_ID`, `LAB_INSTANCE_SECRET` | unset | Lab mode: usage and sync state events, credit holds. All three or none. |
 | `USAGE_FLUSH_INTERVAL_SECS` | `60` | How often recorded usage with documents or bytes becomes events. |
 | `USAGE_IDLE_FLUSH_SECS` | `3600` | How long a running sync's `sync_seconds` alone (an idle sync) wait before they become an event (1-86400). |
+| `SYNC_EVENTS_SETTLE_SECS` | `30` | Lab mode: how long a sync's new phase must hold before `sync.state_changed` reports it (0-3600). Flapping between two phases inside it sends nothing. |
 | `LAB_SEND_INTERVAL_SECS` | `2` | How often the outbox lanes are delivered. |
 | `CREDITS_CHECK_INTERVAL_SECS` | `15` | Lab mode: how often the teams' credits are checked. |
 | `CREDITS_CACHE_FRESH_SECS` / `CREDITS_CACHE_STALE_SECS` | `30` / `300` | How long a credits answer is reused, and kept quietly while the Lab cannot answer. |
