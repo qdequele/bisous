@@ -2517,6 +2517,7 @@ dependencies = [
  "meili-connect-source-kafka",
  "meili-connect-source-mongodb",
  "meili-connect-source-mysql",
+ "meili-connect-source-planetscale",
  "meili-connect-source-postgres",
  "meili-connect-store",
  "prometheus",
@@ -2652,6 +2653,26 @@ dependencies = [
  "tokio-util",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "meili-connect-source-planetscale"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "meili-connect-core",
+ "mysql_async",
+ "prost",
+ "rand 0.9.5",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-util",
+ "tonic",
+ "tonic-prost",
+ "tracing",
 ]
 
 [[package]]
@@ -4803,6 +4824,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "bytes",
+ "flate2",
  "h2",
  "http",
  "http-body",

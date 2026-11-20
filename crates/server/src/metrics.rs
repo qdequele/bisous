@@ -218,6 +218,7 @@ impl Metrics {
             "kafka",
             "dynamodb",
             "firestore",
+            "planetscale",
         ] {
             for class in ["transient", "position_lost", "config", "paused", "fatal"] {
                 source_errors.with_label_values(&[kind, class]);

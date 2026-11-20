@@ -17,6 +17,8 @@ pub enum SourceKind {
     Kafka,
     Dynamodb,
     Firestore,
+    /// PlanetScale's MySQL (Vitess): VStream over gRPC, not a binlog.
+    Planetscale,
 }
 
 impl SourceKind {
@@ -29,6 +31,7 @@ impl SourceKind {
             SourceKind::Kafka => "kafka",
             SourceKind::Dynamodb => "dynamodb",
             SourceKind::Firestore => "firestore",
+            SourceKind::Planetscale => "planetscale",
         }
     }
 }
