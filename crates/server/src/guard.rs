@@ -22,8 +22,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use meili_connect_core::{
     AckReceiver, ApplyReport, Capabilities, CheckReport, Checkpoint, CollectionInfo, DocOp,
-    Endpoint, EventSender, HostPolicy, HostPolicyError, IndexTarget, LagReporter, Opened, Sink,
-    SinkError, Source, SourceError, SourceFactory, SourceSpec, StreamMapping,
+    Endpoint, EventSender, HostPolicy, HostPolicyError, IndexTarget, LagReporter, Opened,
+    Retention, Sink, SinkError, Source, SourceError, SourceFactory, SourceSpec, StreamMapping,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -314,6 +314,12 @@ impl Source for GuardedSource {
 
     fn report_lag(&mut self, reporter: LagReporter) {
         self.inner.report_lag(reporter);
+    }
+
+    async fn retention(&mut self) -> Result<Option<Retention>, SourceError> {
+        self.ensure_vetted().await?;
+        let r = self.inner.retention().await;
+        r.map_err(|e| self.surface(e))
     }
 }
 

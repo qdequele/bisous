@@ -235,6 +235,9 @@ Every variable, with defaults, is in [`.env.example`](.env.example).
 | `USAGE_FLUSH_INTERVAL_SECS` | `60` | How often recorded usage with documents or bytes becomes events. |
 | `USAGE_IDLE_FLUSH_SECS` | `3600` | How long a running sync's `sync_seconds` alone (an idle sync) wait before they become an event (1-86400). |
 | `SYNC_EVENTS_SETTLE_SECS` | `30` | Lab mode: how long a sync's new phase must hold before `sync.state_changed` reports it (0-3600). Flapping between two phases inside it sends nothing. |
+| `SYNC_HEALTH_INTERVAL_SECS` | `300` | Lab mode: how often the replication slots of tenants' Postgres and Supabase syncs are measured for `sync.health_changed`, in every phase (0-86400, `0` turns the health probe off). |
+| `SYNC_LAG_WARN_SECS` | `900` | Lab mode: lag of a streaming sync that reports `sync.health_changed` `warning` (cause `lag`); `ok` again under 80 % of it. |
+| `SYNC_WAL_WARN_BYTES` | `1073741824` | Lab mode: WAL a sync's replication slot keeps that reports `warning` (cause `wal_retained`); half of a positive `max_slot_wal_keep_size` warns too when lower. `ok` again under 80 % of it. |
 | `LAB_SEND_INTERVAL_SECS` | `2` | How often the outbox lanes are delivered. |
 | `CREDITS_CHECK_INTERVAL_SECS` | `15` | Lab mode: how often the teams' credits are checked. |
 | `CREDITS_CACHE_FRESH_SECS` / `CREDITS_CACHE_STALE_SECS` | `30` / `300` | How long a credits answer is reused, and kept quietly while the Lab cannot answer. |

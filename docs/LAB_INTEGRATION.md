@@ -215,6 +215,67 @@ engine sends it (it does since the schema has `syncStateData`).
 }
 ```
 
+## Sync health event
+
+One `sync.health_changed` event when a tenant's sync gets dangerous for its
+source, per cause, and one when it is fine again. Same outbox, signing,
+ids, Lab-tenants-only rule and settle window as the state event.
+
+- **`lag`**: a *streaming* sync is behind its source by
+  `SYNC_LAG_WARN_SECS` (default 900 s), from the lag the source already
+  reports (no query; looked at every 30 s). Not measured in other phases:
+  the state event covers a stopped sync, and a lag warning stands until the
+  sync streams under the threshold again.
+- **`wal_retained`**: the WAL the replication slot of a Postgres or Supabase
+  sync keeps on the customer's database
+  (`pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)`) reaches
+  `SYNC_WAL_WARN_BYTES` (default 1 GiB), or half of the source's positive
+  `max_slot_wal_keep_size` when that is lower (`source_limit_bytes`; past it
+  Postgres invalidates the slot and the sync resyncs). Measured every
+  `SYNC_HEALTH_INTERVAL_SECS` (default 300 s; `0` turns the probe off) in
+  **every** phase where the slot exists: streaming, snapshotting, paused,
+  held, failed, source paused. A stopped sync is the dangerous case: its
+  slot keeps WAL until the disk fills. Each measure is one query on its own
+  short-lived connection with the sync's credentials, behind the host
+  policy, at most 4 at a time and 20 s each; it never touches the sync's
+  own sessions. A measure that fails is logged and skipped (an unreachable
+  source is the state event's business). A slot that is gone counts as
+  0 bytes. Other source kinds are not measured (MySQL binlog retention is
+  out of scope).
+- **Status**: `warning` from the threshold, `ok` again only under 80 % of
+  it (no flapping around the threshold). `threshold` is the one that
+  applied: seconds for `lag`, bytes for `wal_retained`. `state` is the
+  sync's phase when it was measured.
+- **When**: on a change of status only, once it has held for
+  `SYNC_EVENTS_SETTLE_SECS`; a change back to what was reported last
+  cancels it. A deleted sync drops what waits.
+- **Restarts**: the status is kept in memory and starts `ok`. A sync still
+  over its threshold after a restart reports `warning` once more (the Lab
+  dedupes repeated warnings); one that recovered while the server was down
+  sends no `ok`.
+- **Privacy**: numbers only. No host, slot name or credentials.
+
+```json
+{
+  "id": "<UUIDv7>",
+  "type": "sync.health_changed",
+  "occurred_at": "2026-11-20T10:00:00.000Z",
+  "account_id": "<tenant>",
+  "api_key_id": null,
+  "product": "connect",
+  "data": {
+    "sync_id": "<sync id>",
+    "sync_name": "postgres → products",
+    "status": "warning",
+    "cause": "wal_retained",
+    "state": "paused",
+    "retained_wal_bytes": 3221225472,
+    "threshold": 536870912,
+    "source_limit_bytes": 1073741824
+  }
+}
+```
+
 ## Engine API the Lab relies on
 
 Everything in `docs/openapi.yaml`, plus:

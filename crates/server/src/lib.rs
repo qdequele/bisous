@@ -21,6 +21,7 @@ pub mod registry;
 pub mod routes;
 pub mod state;
 pub mod sync_events;
+pub mod sync_health;
 pub mod tinybird;
 pub mod usage;
 
@@ -392,6 +393,13 @@ pub async fn run() -> Result<(), String> {
         tasks.push(tokio::spawn(
             Arc::clone(state.manager.sync_events()).run(background.child_token()),
         ));
+    }
+    if state.manager.sync_events().is_enabled() && !config.sync_health.interval.is_zero() {
+        tasks.push(tokio::spawn(sync_health::run(
+            Arc::clone(&state.manager),
+            config.sync_health,
+            background.child_token(),
+        )));
     }
     if credits.is_some() {
         tasks.push(tokio::spawn(Arc::clone(&state.manager).run_credit_checks(

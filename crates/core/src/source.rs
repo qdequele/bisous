@@ -43,6 +43,23 @@ pub struct Lag {
     pub records: Option<u64>,
 }
 
+/// What a sync keeps on its origin while it is not reading it, as
+/// [`Source::retention`] measures it (Postgres: the WAL its replication slot
+/// holds back). Kept in every phase: a stopped sync's slot keeps WAL until
+/// the origin's disk fills or the origin drops the slot.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct Retention {
+    /// Origin log bytes kept for the sync (Postgres: the WAL between the
+    /// slot's `restart_lsn` and the server's current position).
+    pub bytes: u64,
+    /// The origin's own cap past which it drops what it keeps and the sync
+    /// must resync (Postgres `max_slot_wal_keep_size`); `None`: no cap.
+    pub limit_bytes: Option<u64>,
+    /// The origin's own word on it (Postgres `wal_status`: `reserved`,
+    /// `extended`, `unreserved`, `lost`), when it has one.
+    pub status: Option<String>,
+}
+
 /// Where a source publishes its latest [`Lag`]: a `watch` cell, so
 /// publishing never blocks and reading it needs nothing from the source
 /// (no `&mut` on a source busy streaming). Cheap to clone; clones publish to
@@ -241,6 +258,16 @@ pub trait Source: Send {
     /// ignores it: the lag is then unknown.
     fn report_lag(&mut self, reporter: LagReporter) {
         let _ = reporter;
+    }
+
+    /// What the sync keeps on its origin right now ([`Retention`]), read on
+    /// a short-lived connection of its own: callable on a fresh value in
+    /// any phase (the sync's own run may be streaming, paused or failed),
+    /// never opened. Must not create or change anything. `Ok(None)`:
+    /// nothing is kept (no slot yet, or it was dropped). The default keeps
+    /// nothing the source can measure.
+    async fn retention(&mut self) -> Result<Option<Retention>, SourceError> {
+        Ok(None)
     }
 }
 
