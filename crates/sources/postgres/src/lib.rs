@@ -28,6 +28,14 @@
 //! ours. An existing object that is not ours is never altered, reused or
 //! dropped: `check` fails and `open` returns `Config` (the name is taken).
 //!
+//! With `manage_publication: false` the publication (`publication_name`,
+//! then required) is managed elsewhere, for example by the Lab, which
+//! creates it as the tables' owner. The sync never creates, alters,
+//! comments or drops it and needs no marker on it: `check` and `open`
+//! only verify it exists and covers every mapped table (`Config`
+//! otherwise), and `teardown` drops only the slot. The slot is ours only
+//! under the name derived from the sync id.
+//!
 //! Postgres 14 or later: `pgwire-replication` always asks pgoutput for
 //! `messages`, which older servers reject at `START_REPLICATION`.
 

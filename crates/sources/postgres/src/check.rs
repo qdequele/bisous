@@ -33,6 +33,7 @@ pub async fn run(src: &mut PostgresSource) -> Result<CheckReport, SourceError> {
     let owned = src.ownership().await?;
     let foreign_slot = owned.foreign_slot(&src.settings);
     let foreign_publication = owned.foreign_publication(&src.settings);
+    let manage_publication = src.settings.manage_publication;
     let sql = src.db()?;
 
     if version < MIN_VERSION {
@@ -173,7 +174,43 @@ pub async fn run(src: &mut PostgresSource) -> Result<CheckReport, SourceError> {
     }
 
     let existing = catalog::publication_tables(sql, &publication).await?;
-    if existing.is_none() {
+    if !manage_publication {
+        // Managed elsewhere: it must exist and cover every mapped table.
+        match &existing {
+            None => report.push(
+                "publication",
+                CheckStatus::Failed,
+                format!(
+                    "publication {publication} does not exist: it is managed outside \
+                     meili-connect (manage_publication: false)"
+                ),
+            ),
+            Some(have) => {
+                let missing: Vec<String> = targets
+                    .iter()
+                    .map(|t| t.canonical())
+                    .filter(|t| !have.contains(t))
+                    .collect();
+                if missing.is_empty() {
+                    report.push(
+                        "publication",
+                        CheckStatus::Ok,
+                        format!("publication {publication} exists (managed outside meili-connect)"),
+                    );
+                } else {
+                    report.push(
+                        "publication",
+                        CheckStatus::Failed,
+                        format!(
+                            "publication {publication} does not cover {}: it is managed outside \
+                             meili-connect (manage_publication: false), add them to it",
+                            missing.join(", ")
+                        ),
+                    );
+                }
+            }
+        }
+    } else if existing.is_none() {
         let can_create = sql
             .query(
                 "SELECT has_database_privilege(current_user, current_database(), 'CREATE')",
@@ -251,7 +288,8 @@ pub async fn run(src: &mut PostgresSource) -> Result<CheckReport, SourceError> {
         let in_publication = existing
             .as_ref()
             .is_some_and(|p| p.contains(&t.canonical()));
-        if !info.is_owner && !superuser && !in_publication {
+        // Only a publication we manage needs the table's owner to add it.
+        if manage_publication && !info.is_owner && !superuser && !in_publication {
             problems
                 .push("the role does not own it, so it cannot add it to a publication".to_owned());
         }
