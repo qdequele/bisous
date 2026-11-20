@@ -284,7 +284,8 @@ paths:
       summary: Replace a sync's spec
       description: |
         Stores the new spec. A new origin (kind, host, port, URL, user,
-        database, TLS, slot or publication name) is a fresh sync: the old
+        database, TLS, slot or publication name, `manage_publication`) is a
+        fresh sync: the old
         origin is torn down first with the old spec, and when that fails
         nothing changes (`502 teardown_failed`) unless `?force=true`. Other
         streams or another Meilisearch URL clear the checkpoint, so
@@ -654,7 +655,17 @@ components:
         kind: { type: string, enum: [postgres, supabase, mysql, mongodb, kafka, dynamodb] }
         config:
           type: object
-          description: The connector's own config (see the README, per source).
+          description: |
+            The connector's own config (see the README, per source).
+
+            `postgres` and `supabase` take `manage_publication` (boolean,
+            default `true`). With `false`, `publication_name` is required and
+            names a publication managed outside meili-connect: the sync never
+            creates, alters or drops it, `check` fails when it is missing or
+            does not cover a mapped table (and `open` answers a config
+            error), and deleting the sync drops only its replication slot.
+            Changing `manage_publication` is a new origin, like the
+            publication name.
 
     StreamMapping:
       type: object

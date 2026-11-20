@@ -51,6 +51,18 @@ All notable changes to meili-connect are listed here. The format follows
 
 ### Added
 
+- Postgres and Supabase: `manage_publication: false` (default `true`) uses a
+  publication managed elsewhere, named by the then required
+  `publication_name`. The sync never creates, alters or drops it and needs
+  no marker on it; `check` fails when it is missing or does not cover a
+  mapped table (without asking for table ownership or `CREATE` on the
+  database), `open` refuses it with a config error, and deleting the sync
+  drops only its slot. Changing it is a new origin. The Lab uses it for
+  Connect with Supabase (OAuth).
+- Postgres and Supabase: `check` fails a mapped table with row-level
+  security when the role neither owns it (or RLS is forced), nor is a
+  superuser, nor has `BYPASSRLS`: the snapshot would silently copy only the
+  rows its policies allow.
 - `meili-connect` server binary: the HTTP API (`docs/openapi.yaml`) to check
   and discover sources, create, read, list, update and delete syncs, pause,
   resume, resync and release them, and read their status, daily progress and
