@@ -16,6 +16,7 @@ pub enum SourceKind {
     Mongodb,
     Kafka,
     Dynamodb,
+    Firestore,
 }
 
 impl SourceKind {
@@ -27,6 +28,7 @@ impl SourceKind {
             SourceKind::Mongodb => "mongodb",
             SourceKind::Kafka => "kafka",
             SourceKind::Dynamodb => "dynamodb",
+            SourceKind::Firestore => "firestore",
         }
     }
 }

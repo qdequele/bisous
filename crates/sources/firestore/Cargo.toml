@@ -1,0 +1,38 @@
+[package]
+name = "meili-connect-source-firestore"
+description = "Firestore source: paginated query snapshot and realtime Listen changes."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+meili-connect-core.workspace = true
+async-trait.workspace = true
+base64.workspace = true
+chrono.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+
+# Raw Firestore v1 gRPC stubs (tonic/prost) and Google's own auth library
+# (google-cloud-auth) for service account keys. Default features off: they
+# pull native-tls (OpenSSL); webpki roots over rustls instead.
+gcloud-sdk = { version = "0.34", default-features = false, features = ["google-firestore-v1", "tls-webpki-roots", "auth-default-crypto"] }
+tokio-stream = "0.1"
+# Only to pick tonic's TLS crypto provider: the workspace compiles both of
+# rustls' providers, so without it tonic would ask for a process default
+# that nothing installs, and panic on the first TLS connection to Google.
+tonic = { version = "0.14", default-features = false, features = ["tls-aws-lc"] }
+
+[dev-dependencies]
+rand.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

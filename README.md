@@ -1,8 +1,8 @@
 # meili-connect
 
 Keeps Meilisearch indexes in sync with your database by following its change
-stream (CDC): **Postgres, Supabase, MySQL/MariaDB, MongoDB, Kafka and
-DynamoDB**. A sync snapshots the existing rows, then streams every insert,
+stream (CDC): **Postgres, Supabase, MySQL/MariaDB, MongoDB, Kafka,
+DynamoDB and Firestore**. A sync snapshots the existing rows, then streams every insert,
 update and delete into Meilisearch, and survives crashes, restarts and lost
 positions without missing or duplicating documents.
 
@@ -399,7 +399,8 @@ once the team can spend again, also after a restart. A pause wins.
 
 `collection` names: `schema.table` (Postgres, Supabase, MySQL as
 `database.table`), `database.collection` (MongoDB), the topic (Kafka), the
-table name (DynamoDB). Run `POST /sources/check` first: it reports exactly
+table name (DynamoDB), a collection, subcollection path or `**/<id>`
+collection group (Firestore). Run `POST /sources/check` first: it reports exactly
 what is missing.
 
 ### Postgres
@@ -500,6 +501,37 @@ Config: `region`, `endpoint_url` (DynamoDB Local), `credentials`
 - IAM: `DescribeTable`, `Scan` on the tables; `DescribeStream`,
   `GetShardIterator`, `GetRecords` on `<table arn>/stream/*`.
 - Stream records live 24 hours: a sync stopped longer resyncs.
+
+### Firestore
+
+Config: `service_account` (the JSON key file of a service account, as
+text), optional `project_id` (the key's by default), `database_id`
+(`(default)`), `snapshot.page_size` (300), `stream.max_tracked_documents`
+(500000). `emulator_host` (`host:port`) targets the Firestore emulator
+instead, with no key.
+
+```json
+{"kind": "firestore", "config": {"service_account": "{\"type\": \"service_account\", \"project_id\": \"my-app\", ...}"}}
+```
+
+- IAM: **Cloud Datastore Viewer** (`roles/datastore.viewer`) for the
+  service account on the project. Native mode databases only.
+- `collection`: `products` (a top-level collection), `users/alice/orders`
+  (one subcollection), or `**/orders` (every collection named `orders`, at
+  any depth). The document id is the Firestore document id for a
+  collection and the document path for a collection group (where ids
+  repeat across parents); every document carries `_path`, its path.
+- Types: timestamps → RFC 3339 strings (UTC, microseconds); geopoints →
+  `{"lat", "lng"}` (rename the field to `_geo` to filter by distance);
+  references → the referenced document's path; bytes → base64; maps and
+  arrays as JSON.
+- Changes arrive through realtime listeners (`Listen`); the checkpoint is
+  the stream's resume token. When Firestore cannot send what changed since
+  the token (after a long stop) it re-sends every document: a sync that
+  has not restarted since its snapshot applies it (deleting what was not
+  re-sent), a restarted one resyncs into shadow indexes. The emulator
+  re-sends on every resume, so there a restart always resyncs.
+- The key is sent only to Google: its `token_uri` is ignored.
 
 ## Guarantees and known limits
 
