@@ -81,6 +81,17 @@ services:
       timeout: 3s
       retries: 30
 
+  # The Firestore emulator, for a `firestore` source with
+  # `"emulator_host": "firestore:8080"` (or 127.0.0.1:8086 from the host) and
+  # the crate's live tests. Not started by default:
+  #   docker compose --profile emulators up -d firestore
+  firestore:
+    image: gcr.io/google.com/cloudsdktool/google-cloud-cli:emulators
+    command: ["gcloud", "emulators", "firestore", "start", "--host-port=0.0.0.0:8080"]
+    profiles: ["emulators"]
+    ports:
+      - "127.0.0.1:8086:8080"
+
 volumes:
   state:
   meili:

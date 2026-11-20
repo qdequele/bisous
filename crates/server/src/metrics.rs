@@ -217,6 +217,7 @@ impl Metrics {
             "mongodb",
             "kafka",
             "dynamodb",
+            "firestore",
             "planetscale",
         ] {
             for class in ["transient", "position_lost", "config", "paused", "fatal"] {

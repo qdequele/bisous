@@ -30,6 +30,7 @@ fn known_secret_paths(kind: SourceKind) -> &'static [&'static [&'static str]] {
             &["credentials", "session_token"],
             &["credentials", "external_id"],
         ],
+        SourceKind::Firestore => &[&["service_account"]],
     }
 }
 
@@ -192,6 +193,7 @@ fn identity_paths(kind: SourceKind) -> &'static [&'static [&'static str]] {
             &["credentials", "role_arn"],
             &["credentials", "session_name"],
         ],
+        SourceKind::Firestore => &[&["project_id"], &["database_id"], &["emulator_host"]],
     }
 }
 
@@ -419,6 +421,12 @@ mod tests {
             json!({"region": "r", "credentials": {"type": "assume_role", "role_arn": "arn",
                 "external_id": "hunter2"}}),
         );
+        let c = redacted(
+            "firestore",
+            json!({"service_account": "{\"type\": \"service_account\", \"private_key\": \"hunter2\"}",
+                "project_id": "my-app", "database_id": "(default)"}),
+        );
+        assert_eq!(c["project_id"], "my-app");
         let c = redacted(
             "planetscale",
             json!({"host": "aws.connect.psdb.cloud", "database": "shop", "user": "u",
