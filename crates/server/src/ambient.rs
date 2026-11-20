@@ -27,7 +27,10 @@
 //! Nothing to refuse: **Kafka** takes PEM inline (`ca_pem`, `cert_pem`,
 //! `key_pem`) and only `PLAIN` / `SCRAM-*` SASL, and its config refuses
 //! unknown keys (no raw librdkafka property such as `ssl.ca.location`);
-//! **MySQL** takes the CA inline (`tls.ca_pem`) and never uses a socket.
+//! **MySQL** takes the CA inline (`tls.ca_pem`) and never uses a socket;
+//! **Firestore** requires an inline service account key (never the host's
+//! Application Default Credentials) and sends it only to Google's token
+//! endpoint, whatever the key's `token_uri` says.
 
 use meili_connect_core::{SourceKind, SourceSpec};
 use serde_json::Value;
@@ -130,7 +133,7 @@ pub fn ambient_identity(spec: &SourceSpec) -> Option<String> {
                     )
                 })
         }
-        SourceKind::Kafka | SourceKind::Mysql => None,
+        SourceKind::Kafka | SourceKind::Mysql | SourceKind::Firestore => None,
     }
 }
 

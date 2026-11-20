@@ -11,6 +11,7 @@ members = [
     "crates/sources/mongodb",
     "crates/sources/kafka",
     "crates/sources/dynamodb",
+    "crates/sources/firestore",
 ]
 
 [workspace.package]
@@ -30,6 +31,7 @@ meili-connect-source-mysql = { path = "crates/sources/mysql", version = "0.1.0" 
 meili-connect-source-mongodb = { path = "crates/sources/mongodb", version = "0.1.0" }
 meili-connect-source-kafka = { path = "crates/sources/kafka", version = "0.1.0" }
 meili-connect-source-dynamodb = { path = "crates/sources/dynamodb", version = "0.1.0" }
+meili-connect-source-firestore = { path = "crates/sources/firestore", version = "0.1.0" }
 
 async-trait = "0.1"
 axum = "0.8"

@@ -169,6 +169,16 @@ Everything in `docs/openapi.yaml`, plus:
 - `provider` in a `postgres` or `mysql` config: the console's hosted-database
   tiles (Neon, RDS, Aurora, Cloud SQL, Azure) set it so failed checks name
   the provider's fix. Engine first: an engine without it refuses the field.
+- Firestore (`"kind": "firestore"`): the console sends the service account
+  key file as text in `config.service_account` (the engine redacts it on
+  every answer; a `PUT` may send `"<redacted>"` back while `project_id`,
+  `database_id` and `emulator_host` are unchanged), an optional
+  `project_id`, and a `database_id`. It never offers `emulator_host` (a
+  hosted engine's host policy refuses it anyway). `discover` names
+  top-level collections and `**/<id>` collection groups, with
+  `estimated_rows` when Firestore counts them within 5 s; a subcollection
+  path (`users/alice/orders`) can be typed. The role to grant is
+  `roles/datastore.viewer`.
 - `GET /metrics`: Prometheus text, authenticated with `METRICS_TOKEN` (never
   the tenant tokens), no tenant labels beyond counts.
 - `GET /health`.
