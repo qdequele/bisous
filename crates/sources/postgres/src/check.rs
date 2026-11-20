@@ -61,18 +61,20 @@ pub async fn run(src: &mut PostgresSource) -> Result<CheckReport, SourceError> {
         .query(
             "SELECT r.rolsuper, r.rolreplication,
                     COALESCE((SELECT pg_has_role(current_user, x.oid, 'MEMBER')
-                              FROM pg_roles x WHERE x.rolname = 'rds_replication'), false)
+                              FROM pg_roles x WHERE x.rolname = 'rds_replication'), false),
+                    r.rolbypassrls
              FROM pg_roles r WHERE r.rolname = current_user",
             &[],
         )
         .await?;
-    let (superuser, replication, rds) = match rows.first() {
+    let (superuser, replication, rds, bypass_rls) = match rows.first() {
         Some(r) => (
             r.try_get::<_, bool>(0).unwrap_or(false),
             r.try_get::<_, bool>(1).unwrap_or(false),
             r.try_get::<_, bool>(2).unwrap_or(false),
+            r.try_get::<_, bool>(3).unwrap_or(false),
         ),
-        None => (false, false, false),
+        None => (false, false, false, false),
     };
     if superuser || replication || rds {
         report.push(
@@ -293,6 +295,9 @@ pub async fn run(src: &mut PostgresSource) -> Result<CheckReport, SourceError> {
             problems
                 .push("the role does not own it, so it cannot add it to a publication".to_owned());
         }
+        if info.rls_hides_rows(superuser, bypass_rls) {
+            problems.push(RLS.to_owned());
+        }
         if problems.is_empty() {
             let key = info.key().unwrap_or_default().join(", ");
             let rows = info
@@ -306,6 +311,10 @@ pub async fn run(src: &mut PostgresSource) -> Result<CheckReport, SourceError> {
     }
     Ok(report)
 }
+
+/// A mapped table whose row-level security policies apply to the role.
+const RLS: &str = "row-level security is on and the role does not bypass it: the snapshot would \
+     only copy the rows its policies allow; grant BYPASSRLS to the role or use the table owner";
 
 async fn setting(sql: &Sql, name: &str) -> Result<Option<String>, SourceError> {
     let rows = sql

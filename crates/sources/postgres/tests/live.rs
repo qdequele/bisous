@@ -1546,3 +1546,96 @@ async fn an_external_publication_is_used_and_never_changed() {
     .await
     .unwrap();
 }
+
+/// A table with row-level security, read by a role that neither owns it
+/// nor bypasses RLS, would be snapshotted only partly: check fails it. The
+/// same role needs no table ownership with an external publication.
+#[tokio::test]
+async fn check_flags_tables_whose_rls_would_hide_rows() {
+    let Some(url) = url() else { return };
+    let db = admin(&url).await;
+    let open = unique("rls_open");
+    let guarded = unique("rls_on");
+    let forced = unique("rls_forced");
+    let role = unique("rls_role");
+    let password = format!("pw_{}", unique("x"));
+    let publication = unique("rls_pub");
+    for t in [&open, &guarded, &forced] {
+        create_items(&db, t).await;
+    }
+    db.batch_execute(&format!(
+        "ALTER TABLE {guarded} ENABLE ROW LEVEL SECURITY;
+         ALTER TABLE {forced} ENABLE ROW LEVEL SECURITY;
+         ALTER TABLE {forced} FORCE ROW LEVEL SECURITY;
+         CREATE ROLE {role} LOGIN REPLICATION PASSWORD '{password}';
+         GRANT SELECT ON {open}, {guarded}, {forced} TO {role};
+         CREATE PUBLICATION {publication} FOR TABLE {open}, {guarded}, {forced};"
+    ))
+    .await
+    .unwrap();
+    let as_role = json!({
+        "user": role, "password": password,
+        "publication_name": publication, "manage_publication": false,
+    });
+    let collections = [
+        format!("public.{open}"),
+        format!("public.{guarded}"),
+        format!("public.{forced}"),
+    ];
+    let refs: Vec<&str> = collections.iter().map(String::as_str).collect();
+
+    let mut src = source_with(&url, &unique("rls"), &refs, as_role.clone());
+    let report = src.check().await.unwrap();
+    // Not the owner, but the publication is managed elsewhere: no
+    // ownership problem, so the RLS-free table passes.
+    let plain = item(&report, &format!("table {}", collections[0]));
+    assert_eq!(plain.status, CheckStatus::Ok, "{report:#?}");
+    for c in &collections[1..] {
+        let t = item(&report, &format!("table {c}"));
+        assert_eq!(t.status, CheckStatus::Failed, "{report:#?}");
+        assert!(t.message.contains("row-level security"), "{t:?}");
+        assert!(!t.message.contains("does not own"), "{t:?}");
+    }
+    assert!(
+        !report
+            .items
+            .iter()
+            .any(|i| i.message.contains("cannot create publications")),
+        "{report:#?}"
+    );
+
+    // BYPASSRLS clears both.
+    db.batch_execute(&format!("ALTER ROLE {role} BYPASSRLS"))
+        .await
+        .unwrap();
+    let mut src = source_with(&url, &unique("rls"), &refs, as_role.clone());
+    let report = src.check().await.unwrap();
+    assert!(report.passed(), "{report:#?}");
+
+    // The owner is exempt, unless RLS is forced on it.
+    db.batch_execute(&format!(
+        "ALTER ROLE {role} NOBYPASSRLS;
+         ALTER TABLE {guarded} OWNER TO {role};
+         ALTER TABLE {forced} OWNER TO {role};"
+    ))
+    .await
+    .unwrap();
+    let mut src = source_with(&url, &unique("rls"), &refs, as_role);
+    let report = src.check().await.unwrap();
+    assert_eq!(
+        item(&report, &format!("table {}", collections[1])).status,
+        CheckStatus::Ok,
+        "{report:#?}"
+    );
+    let t = item(&report, &format!("table {}", collections[2]));
+    assert_eq!(t.status, CheckStatus::Failed, "{report:#?}");
+    assert!(t.message.contains("row-level security"), "{t:?}");
+
+    db.batch_execute(&format!(
+        "DROP PUBLICATION {publication};
+         DROP TABLE {open}, {guarded}, {forced};
+         DROP OWNED BY {role}; DROP ROLE {role};"
+    ))
+    .await
+    .unwrap();
+}
