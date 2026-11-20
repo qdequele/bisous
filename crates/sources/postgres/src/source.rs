@@ -33,6 +33,30 @@ const TEARDOWN_ATTEMPTS: usize = 20;
 /// START_REPLICATION. Refuse it before creating anything.
 pub(crate) const MIN_VERSION: i32 = 140_000;
 
+/// The slot is synced to standbys (`FAILOVER`, Postgres 17+) only where
+/// the provider requires it: PlanetScale notifies, then lets a switchover
+/// lose a slot without it. Elsewhere a failover slot could hold back the
+/// primary for standbys listed in `synchronized_standby_slots`.
+pub(crate) fn slot_failover(version: i32, provider: Option<crate::provider::Provider>) -> bool {
+    version >= 170_000 && provider == Some(crate::provider::Provider::PlanetScale)
+}
+
+pub(crate) fn create_slot_command(
+    slot_name: &str,
+    version: i32,
+    provider: Option<crate::provider::Provider>,
+) -> String {
+    if slot_failover(version, provider) {
+        format!(
+            "CREATE_REPLICATION_SLOT {slot_name} LOGICAL pgoutput (SNAPSHOT 'export', FAILOVER true)"
+        )
+    } else if version >= 150_000 {
+        format!("CREATE_REPLICATION_SLOT {slot_name} LOGICAL pgoutput (SNAPSHOT 'export')")
+    } else {
+        format!("CREATE_REPLICATION_SLOT {slot_name} LOGICAL pgoutput EXPORT_SNAPSHOT")
+    }
+}
+
 pub(crate) fn too_old(version: i32) -> String {
     format!(
         "Postgres {}.{} is too old: logical replication through this connector needs \
@@ -367,11 +391,7 @@ impl PostgresSource {
         let mut session = ReplicationClient::connect_gated(cfg)
             .await
             .map_err(|e| error::from_wire(&e, Context::Query, supabase))?;
-        let command = if version >= 150_000 {
-            format!("CREATE_REPLICATION_SLOT {slot_name} LOGICAL pgoutput (SNAPSHOT 'export')")
-        } else {
-            format!("CREATE_REPLICATION_SLOT {slot_name} LOGICAL pgoutput EXPORT_SNAPSHOT")
-        };
+        let command = create_slot_command(&slot_name, version, self.provider());
         let rows = session
             .simple_query(&command)
             .await
