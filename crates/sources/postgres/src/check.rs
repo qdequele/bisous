@@ -150,6 +150,29 @@ pub async fn run(src: &mut PostgresSource) -> Result<CheckReport, SourceError> {
         }
     }
 
+    if crate::source::slot_failover(version, provider) {
+        let failover = if slot_exists {
+            sql.query(
+                "SELECT failover FROM pg_replication_slots WHERE slot_name = $1",
+                &[&slot_name],
+            )
+            .await?
+            .first()
+            .and_then(|r| r.try_get::<_, bool>(0).ok())
+        } else {
+            None
+        };
+        report.push(
+            "slot_failover",
+            if failover == Some(false) {
+                CheckStatus::Warning
+            } else {
+                CheckStatus::Ok
+            },
+            failover_message(&slot_name, slot_exists, failover),
+        );
+    }
+
     match setting(sql, "max_slot_wal_keep_size").await? {
         None => report.push(
             "max_slot_wal_keep_size",
@@ -309,6 +332,22 @@ pub async fn run(src: &mut PostgresSource) -> Result<CheckReport, SourceError> {
     Ok(report)
 }
 
+/// PlanetScale requires failover-enabled slots: a new one is created so, an
+/// older one (created before) is fixed with `ALTER_REPLICATION_SLOT`.
+fn failover_message(slot: &str, exists: bool, failover: Option<bool>) -> String {
+    match (exists, failover) {
+        (true, Some(false)) => format!(
+            "slot {slot} is not failover-enabled: PlanetScale gives 3 days to fix it, then a \
+             switchover may lose it. Pause the sync, then on a replication=database \
+             connection: ALTER_REPLICATION_SLOT {slot} (FAILOVER true); or resync it"
+        ),
+        (true, _) => format!("slot {slot} is failover-enabled"),
+        (false, _) => format!(
+            "slot {slot} will be created failover-enabled (FAILOVER true), as PlanetScale requires"
+        ),
+    }
+}
+
 /// Appended to a connection failure: what lets Connect in on that provider.
 fn connection_hint(provider: Provider) -> String {
     format!(". On {}: {}", provider.name(), provider.network_fix())
@@ -433,5 +472,35 @@ mod tests {
         assert!(senders_full_message(10, Some(Provider::Azure)).contains("server parameters"));
         assert!(connection_hint(Provider::CloudSql).contains("authorized networks"));
         assert!(connection_hint(Provider::Rds).contains("security group"));
+        assert!(replication_message(Some(Provider::PlanetScale)).contains("<branch id>"));
+        assert!(failover_message("s", true, Some(false)).contains("ALTER_REPLICATION_SLOT s"));
+        assert!(failover_message("s", false, None).contains("FAILOVER true"));
+        assert_eq!(
+            failover_message("s", true, Some(true)),
+            "slot s is failover-enabled"
+        );
+    }
+
+    #[test]
+    fn slots_fail_over_only_where_the_provider_requires_it() {
+        use crate::provider::Provider;
+        use crate::source::create_slot_command;
+        let ps = Some(Provider::PlanetScale);
+        assert_eq!(
+            create_slot_command("s", 170_002, ps),
+            "CREATE_REPLICATION_SLOT s LOGICAL pgoutput (SNAPSHOT 'export', FAILOVER true)"
+        );
+        assert_eq!(
+            create_slot_command("s", 180_000, Some(Provider::Rds)),
+            "CREATE_REPLICATION_SLOT s LOGICAL pgoutput (SNAPSHOT 'export')"
+        );
+        assert_eq!(
+            create_slot_command("s", 160_000, ps),
+            "CREATE_REPLICATION_SLOT s LOGICAL pgoutput (SNAPSHOT 'export')"
+        );
+        assert_eq!(
+            create_slot_command("s", 140_000, None),
+            "CREATE_REPLICATION_SLOT s LOGICAL pgoutput EXPORT_SNAPSHOT"
+        );
     }
 }

@@ -441,6 +441,13 @@ optional `slot_name` / `publication_name` / `manage_publication` /
   Logical replication setting. A Neon `-pooler` host is refused: use the
   direct one. Neon removes a slot that has not advanced for about 40 hours,
   so a sync stopped longer resyncs.
+- PlanetScale Postgres (`provider: planetscale`, detected from
+  `*.horizon.psdb.cloud`): set `wal_level = logical` in the cluster's
+  Parameters, use a role `WITH REPLICATION` (log in as `<role>.<branch id>`)
+  on port 5432, not PgBouncer's 6432. Its connection string's
+  `sslrootcert=system` (the system trust store, not a file) is accepted.
+  The slot is created failover-enabled, as PlanetScale requires; `check`
+  warns about an older slot without failover.
 - Allow-list `GET /network`'s `egress_ips` in the database's security
   group, authorized networks or firewall rules.
 

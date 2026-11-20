@@ -22,6 +22,10 @@ pub enum Provider {
     /// Azure Database for PostgreSQL flexible server
     /// (`*.postgres.database.azure.com`).
     Azure,
+    /// PlanetScale Postgres (`*.horizon.psdb.cloud`): Postgres 17 or later,
+    /// whose logical slots must be failover-enabled to survive a switchover.
+    #[serde(rename = "planetscale")]
+    PlanetScale,
 }
 
 impl Provider {
@@ -40,6 +44,8 @@ impl Provider {
             }
         } else if h.ends_with(".postgres.database.azure.com") {
             Some(Provider::Azure)
+        } else if h.ends_with(".horizon.psdb.cloud") {
+            Some(Provider::PlanetScale)
         } else {
             None
         }
@@ -52,6 +58,7 @@ impl Provider {
             Provider::Aurora => "Aurora",
             Provider::CloudSql => "Cloud SQL",
             Provider::Azure => "Azure",
+            Provider::PlanetScale => "PlanetScale",
         }
     }
 
@@ -77,6 +84,10 @@ impl Provider {
             Provider::Azure => {
                 "set the server parameter wal_level = logical, then restart the server"
             }
+            Provider::PlanetScale => {
+                "set wal_level = logical in the cluster's Parameters (Queue parameter changes, \
+                 then Apply changes); the cluster restarts"
+            }
         }
     }
 
@@ -90,6 +101,10 @@ impl Provider {
                 "ALTER USER <user> WITH REPLICATION (as a cloudsqlsuperuser, such as postgres)"
             }
             Provider::Azure => "ALTER ROLE <user> WITH REPLICATION (as the server admin)",
+            Provider::PlanetScale => {
+                "create the role WITH REPLICATION (Settings, Roles), or CREATE USER <user> WITH \
+                 REPLICATION, and log in as <user>.<branch id>"
+            }
             Provider::Neon => {
                 "use a role created in the Neon console, CLI or API (a neon_superuser member, \
                  which has REPLICATION), or ALTER ROLE <user> WITH REPLICATION for a role \
@@ -105,6 +120,7 @@ impl Provider {
             Provider::Aurora => "in the DB cluster parameter group",
             Provider::CloudSql => "with the instance's database flags",
             Provider::Azure => "in the server parameters",
+            Provider::PlanetScale => "in the cluster's Parameters (the cluster restarts)",
             Provider::Neon => "(Neon sets it from the compute size: drop an unused slot)",
         }
     }
@@ -125,9 +141,16 @@ impl Provider {
                  addresses"
             }
             Provider::Neon => "if IP Allow is on, add Connect's egress addresses to it",
+            Provider::PlanetScale => {
+                "if the database has IP restrictions (Settings, IP restrictions), add Connect's \
+                 egress addresses to them"
+            }
         }
     }
 }
+
+/// PlanetScale's PgBouncer port: no replication connections.
+pub const PLANETSCALE_BOUNCER_PORT: u16 = 6432;
 
 /// A Neon pooled host (`ep-<name>-pooler.<region>...neon.tech`): PgBouncer
 /// in transaction mode, which cannot carry a replication session.
@@ -165,6 +188,11 @@ mod tests {
             ),
             ("db.abc.rds.amazonaws.com.cn", Some(Provider::Rds)),
             ("srv.postgres.database.azure.com", Some(Provider::Azure)),
+            (
+                "abc-useast1-1.horizon.psdb.cloud",
+                Some(Provider::PlanetScale),
+            ),
+            ("aws.connect.psdb.cloud", None),
             ("34.76.1.2", None),
             ("db.example.com", None),
             ("neon.tech.example.com", None),
@@ -191,6 +219,10 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&Provider::Aurora).unwrap(),
             "\"aurora\""
+        );
+        assert_eq!(
+            serde_json::to_string(&Provider::PlanetScale).unwrap(),
+            "\"planetscale\""
         );
         assert!(serde_json::from_str::<Provider>("\"heroku\"").is_err());
     }

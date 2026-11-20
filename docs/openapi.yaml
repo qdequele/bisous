@@ -695,10 +695,14 @@ components:
 
             `postgres` and `mysql` take `provider` (optional): the hosted
             service the database runs on, `neon`, `rds`, `aurora`,
-            `cloud_sql` or `azure` (`mysql`: `rds`, `aurora`, `cloud_sql`,
-            `azure`). Without it the provider is detected from the host
-            (`*.neon.tech`, `*.rds.amazonaws.com`, `*.cluster-*.rds.amazonaws.com`,
-            `*.postgres.database.azure.com`, `*.mysql.database.azure.com`).
+            `cloud_sql`, `azure` or `planetscale` (`mysql`: `rds`, `aurora`,
+            `cloud_sql`, `azure`). Without it the provider is detected from
+            the host (`*.neon.tech`, `*.rds.amazonaws.com`,
+            `*.cluster-*.rds.amazonaws.com`, `*.postgres.database.azure.com`,
+            `*.mysql.database.azure.com`, `*.horizon.psdb.cloud`).
+            With `planetscale` on Postgres 17+ the replication slot is
+            created failover-enabled (`FAILOVER true`), as PlanetScale
+            requires, and PgBouncer's port 6432 is refused.
             It changes nothing about how the sync runs: failed checks then
             name that provider's fix (parameter group, database flag,
             server parameter, grant, network allow-list). An unknown value

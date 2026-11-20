@@ -60,6 +60,13 @@ All notable changes to meili-connect are listed here. The format follows
   (`mysql.rds_set_configuration`, Azure's `binlog_expire_logs_seconds = 0`
   now warns), and the network allow-list on a connection failure. A Neon
   pooled host (`-pooler`) is refused with the direct host to use instead.
+- PlanetScale Postgres: `provider: planetscale` (detected from
+  `*.horizon.psdb.cloud`) creates the replication slot failover-enabled
+  (`FAILOVER true`, Postgres 17+), as PlanetScale requires to keep it across
+  a switchover; `check` reports the slot's failover state and how to fix an
+  older one, names PlanetScale's settings, and refuses PgBouncer's port 6432.
+  `sslrootcert=system` in a Postgres URL (the system trust store) is no longer
+  refused as a file parameter on a hosted server.
 - `GET /network` lists the server's egress addresses (`CONNECT_EGRESS_IPS`)
   for database allow-lists.
 
