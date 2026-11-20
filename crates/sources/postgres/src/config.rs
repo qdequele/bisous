@@ -196,6 +196,14 @@ impl PostgresConfig {
                     .into(),
             ));
         }
+        let provider = self.provider.or_else(|| Provider::detect(&host));
+        if provider == Some(Provider::PlanetScale) && port == provider::PLANETSCALE_BOUNCER_PORT {
+            return Err(SourceError::Config(
+                "port 6432 is PlanetScale's PgBouncer, which cannot carry logical replication: \
+                 use the direct port 5432"
+                    .into(),
+            ));
+        }
         if (supabase || supabase_host) && sslmode == SslMode::Disable {
             return Err(SourceError::Config(
                 "Supabase requires TLS: set sslmode to require or verify-full".into(),
@@ -237,7 +245,6 @@ impl PostgresConfig {
             None => ident::default_name(sync_id),
         };
 
-        let provider = self.provider.or_else(|| Provider::detect(&host));
         Ok(Settings {
             conn: ConnParams {
                 host,
@@ -393,6 +400,28 @@ mod tests {
             ),
             Err(SourceError::Config(_))
         ));
+    }
+
+    #[test]
+    fn planetscale_bouncer_port_rejected() {
+        let url = "postgresql://cdc.abc123:p@abc-useast1-1.horizon.psdb.cloud";
+        let s = resolve(
+            json!({"url": format!("{url}:5432/postgres?sslmode=verify-full&sslrootcert=system")}),
+            SourceKind::Postgres,
+        )
+        .unwrap();
+        assert_eq!(s.conn.provider, Some(Provider::PlanetScale));
+        assert_eq!(s.conn.sslmode, SslMode::VerifyFull);
+        assert_eq!(s.conn.user, "cdc.abc123");
+        let err = resolve(
+            json!({"url": format!("{url}:6432/postgres")}),
+            SourceKind::Postgres,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, SourceError::Config(m) if m.contains("5432")),
+            "{err:?}"
+        );
     }
 
     #[test]

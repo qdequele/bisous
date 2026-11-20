@@ -119,7 +119,12 @@ pub fn ambient_identity(spec: &SourceSpec) -> Option<String> {
             let url = spec.config.get("url").and_then(Value::as_str)?;
             query_params(url)
                 .into_iter()
-                .find(|(k, _)| PG_FILE_PARAMS.contains(&k.as_str()))
+                // `sslrootcert=system` is libpq's keyword for the system
+                // trust store, not a file: the server's roots are used anyway.
+                .find(|(k, v)| {
+                    PG_FILE_PARAMS.contains(&k.as_str())
+                        && !(k == "sslrootcert" && v.eq_ignore_ascii_case("system"))
+                })
                 .map(|(key, _)| {
                     format!(
                         "the connection URL parameter `{key}` names a file or service on this \
@@ -128,7 +133,10 @@ pub fn ambient_identity(spec: &SourceSpec) -> Option<String> {
                     )
                 })
         }
-        SourceKind::Kafka | SourceKind::Mysql | SourceKind::Firestore => None,
+        // PlanetScale: a user and password on the host's own ports, no file.
+        SourceKind::Kafka | SourceKind::Mysql | SourceKind::Firestore | SourceKind::Planetscale => {
+            None
+        }
     }
 }
 
@@ -193,12 +201,23 @@ mod tests {
             "postgres://u:p@h/db?sslmode=verify-full&sslrootcert=/etc/ssl/ca.pem",
             "postgresql://u@h/db?passfile=/root/.pgpass",
             "postgres://h/db?service=prod",
+            // Only the bare keyword is the system store; a file named
+            // like it is still a file.
+            "postgres://u:p@h/db?sslrootcert=./system",
         ] {
             assert!(
                 ambient_identity(&spec(SourceKind::Postgres, json!({"url": url}))).is_some(),
                 "{url}"
             );
         }
+        // PlanetScale's connection strings name the system trust store.
+        assert_eq!(
+            ambient_identity(&spec(
+                SourceKind::Postgres,
+                json!({"url": "postgresql://u.b:p@x-useast1-1.horizon.psdb.cloud:5432/postgres?sslmode=verify-full&sslrootcert=system&sslnegotiation=direct"})
+            )),
+            None
+        );
         assert_eq!(
             ambient_identity(&spec(
                 SourceKind::Supabase,

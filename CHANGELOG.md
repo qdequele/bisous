@@ -51,6 +51,14 @@ All notable changes to meili-connect are listed here. The format follows
 
 ### Added
 
+- `planetscale` source: PlanetScale's MySQL (Vitess), which has no binlog
+  for outside readers, through Vitess's VStream API (gRPC over TLS, the
+  database's user and password). The first copy reads keyset pages over the
+  MySQL protocol after capturing every shard's position; the stream emits
+  inserts, updates (a key change deletes the old document), deletes and
+  `TRUNCATE`, with every shard's GTID set as the checkpoint. Documents are
+  the `mysql` source's JSON. New `SourceKind::Planetscale` in `core`.
+
 - Hosted-database hints: `postgres` and `mysql` configs take an optional
   `provider` (`neon`, `rds`, `aurora`, `cloud_sql`, `azure`; MySQL without
   `neon`), also detected from RDS, Aurora, Neon and Azure host names. A
@@ -60,6 +68,13 @@ All notable changes to meili-connect are listed here. The format follows
   (`mysql.rds_set_configuration`, Azure's `binlog_expire_logs_seconds = 0`
   now warns), and the network allow-list on a connection failure. A Neon
   pooled host (`-pooler`) is refused with the direct host to use instead.
+- PlanetScale Postgres: `provider: planetscale` (detected from
+  `*.horizon.psdb.cloud`) creates the replication slot failover-enabled
+  (`FAILOVER true`, Postgres 17+), as PlanetScale requires to keep it across
+  a switchover; `check` reports the slot's failover state and how to fix an
+  older one, names PlanetScale's settings, and refuses PgBouncer's port 6432.
+  `sslrootcert=system` in a Postgres URL (the system trust store) is no longer
+  refused as a file parameter on a hosted server.
 - `GET /network` lists the server's egress addresses (`CONNECT_EGRESS_IPS`)
   for database allow-lists.
 - Firestore source (`"kind": "firestore"`): a service account JSON key

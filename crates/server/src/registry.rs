@@ -8,6 +8,7 @@ use meili_connect_source_firestore::FirestoreSourceFactory;
 use meili_connect_source_kafka::KafkaSourceFactory;
 use meili_connect_source_mongodb::MongoSourceFactory;
 use meili_connect_source_mysql::MysqlSourceFactory;
+use meili_connect_source_planetscale::PlanetScaleSourceFactory;
 use meili_connect_source_postgres::PostgresSourceFactory;
 
 /// The six connectors behind one [`SourceFactory`]. Postgres serves both
@@ -33,6 +34,7 @@ impl SourceFactory for SourceRegistry {
             SourceKind::Kafka => KafkaSourceFactory.endpoints(spec).await,
             SourceKind::Dynamodb => DynamoSourceFactory.endpoints(spec).await,
             SourceKind::Firestore => FirestoreSourceFactory.endpoints(spec).await,
+            SourceKind::Planetscale => PlanetScaleSourceFactory.endpoints(spec).await,
         }
     }
 
@@ -51,6 +53,7 @@ impl SourceFactory for SourceRegistry {
             SourceKind::Kafka => KafkaSourceFactory.build(sync_id, spec, streams),
             SourceKind::Dynamodb => DynamoSourceFactory.build(sync_id, spec, streams),
             SourceKind::Firestore => FirestoreSourceFactory.build(sync_id, spec, streams),
+            SourceKind::Planetscale => PlanetScaleSourceFactory.build(sync_id, spec, streams),
         }
     }
 }
