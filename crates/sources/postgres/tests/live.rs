@@ -321,6 +321,70 @@ async fn check_and_discover() {
     assert_eq!(slots, 0);
 }
 
+/// A table nobody analyzed yet (`reltuples` = -1) still gets an estimate,
+/// from the live-row statistics: the setup UI prices its first sync. So
+/// does a partitioned table, summed over its partitions; an empty one is 0.
+#[tokio::test]
+async fn row_estimate_without_analyze() {
+    let Some(url) = url() else { return };
+    let table = unique("est");
+    {
+        // Its own connection: closing it flushes its statistics.
+        let db = admin(&url).await;
+        db.batch_execute(&format!(
+            "CREATE TABLE {table} (id int4 PRIMARY KEY, v text);
+             INSERT INTO {table} SELECT g, 'x' FROM generate_series(1, 3) g;
+             CREATE TABLE {table}_empty (id int4 PRIMARY KEY);
+             CREATE TABLE {table}_parts (id int4, k int4, PRIMARY KEY (id, k)) PARTITION BY LIST (k);
+             CREATE TABLE {table}_p1 PARTITION OF {table}_parts FOR VALUES IN (1);
+             CREATE TABLE {table}_p2 PARTITION OF {table}_parts FOR VALUES IN (2);
+             INSERT INTO {table}_parts SELECT g, 1 + g % 2 FROM generate_series(1, 5) g;"
+        ))
+        .await
+        .unwrap();
+    }
+    let db = admin(&url).await;
+    let reltuples: f32 = db
+        .query_one(
+            &format!("SELECT reltuples FROM pg_class WHERE relname = '{table}'"),
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert!(
+        reltuples < 0.0,
+        "the fixture must not be analyzed: {reltuples}"
+    );
+
+    let mut src = source(&url, &unique("est"), &[]);
+    let want = [
+        (format!("public.{table}"), Some(3)),
+        (format!("public.{table}_empty"), Some(0)),
+        (format!("public.{table}_parts"), Some(5)),
+    ];
+    // Statistics reach the shared counters asynchronously: give them a moment.
+    let mut got = Vec::new();
+    for _ in 0..50 {
+        let all = src.discover().await.unwrap();
+        got = want
+            .iter()
+            .map(|(name, _)| {
+                let info = all.iter().find(|c| &c.name == name).expect("listed");
+                (name.clone(), info.estimated_rows)
+            })
+            .collect();
+        if got == want {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert_eq!(got, want);
+    db.batch_execute(&format!("DROP TABLE {table}, {table}_empty, {table}_parts"))
+        .await
+        .unwrap();
+}
+
 /// No table picked yet (the setup UI tests the connection first): every
 /// server-level check runs, the table checks are one `Ok` item, and the
 /// report passes. Nothing is created.

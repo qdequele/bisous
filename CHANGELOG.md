@@ -113,6 +113,11 @@ All notable changes to meili-connect are listed here. The format follows
 
 ### Fixed
 
+- Postgres and Supabase: a table nobody has analyzed yet (created or
+  filled recently, before autovacuum ran) now gets a row estimate from the
+  live-row statistics, so the setup UI shows its first-sync cost instead
+  of "Unknown". A partitioned table sums its partitions. A table whose
+  statistics were reset still reads as unknown, never as empty.
 - An idle sync no longer sends a `usage.recorded` event (and a Tinybird row)
   every flush interval carrying only its free `sync_seconds`: about 1,440
   zero-amount ledger rows a day per sync. Its seconds accumulate (none is

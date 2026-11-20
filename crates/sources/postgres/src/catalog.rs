@@ -22,7 +22,8 @@ pub struct TableInfo {
     pub relkind: String,
     /// `d` default (primary key), `i` index, `f` full, `n` nothing.
     pub replica_identity: String,
-    pub reltuples: f64,
+    /// Approximate row count: see [`row_estimate_sql`]. `None` when unknown.
+    pub row_estimate: Option<f64>,
     pub primary_key: Vec<String>,
     pub replica_identity_index: Vec<String>,
     pub columns: Vec<ColumnInfo>,
@@ -76,9 +77,46 @@ impl TableInfo {
     }
 
     pub fn estimated_rows(&self) -> Option<u64> {
-        // -1 (PG 14+) means never analyzed.
-        (self.reltuples >= 0.0).then_some(self.reltuples as u64)
+        self.row_estimate
+            .filter(|n| n.is_finite() && *n >= 0.0)
+            .map(|n| n.round() as u64)
     }
+}
+
+/// SQL estimate of a relation's rows (`{rel}` is a `pg_class` alias).
+///
+/// `reltuples` is the planner's figure, but it is -1 (PG 14+) until the
+/// table is first analyzed, which autovacuum does only after enough writes:
+/// a table created and filled minutes ago has none, and the setup UI then
+/// shows its first-sync cost as unknown. The cumulative statistics count
+/// live rows on every insert, update and delete, so they stand in. They
+/// read 0 both for an empty table and when the statistics were reset (crash,
+/// `pg_stat_reset`): a table with pages on disk and 0 live rows is unknown
+/// (NULL), not empty.
+fn leaf_estimate(rel: &str) -> String {
+    format!(
+        "CASE WHEN {rel}.reltuples >= 0 THEN {rel}.reltuples::float8
+              WHEN pg_stat_get_live_tuples({rel}.oid) > 0
+                OR pg_relation_size({rel}.oid) = 0
+                THEN pg_stat_get_live_tuples({rel}.oid)::float8
+         END"
+    )
+}
+
+/// [`leaf_estimate`] for `pg_class c`; a partitioned table (no storage of
+/// its own, `reltuples` -1 unless analyzed by hand) sums its leaf
+/// partitions, and is unknown when any of them is.
+fn row_estimate_sql() -> String {
+    let leaf = leaf_estimate("l");
+    let own = leaf_estimate("c");
+    format!(
+        "CASE WHEN c.relkind = 'p' THEN
+           (SELECT CASE WHEN bool_and(e IS NOT NULL) THEN sum(e) END
+            FROM (SELECT {leaf} AS e
+                  FROM pg_partition_tree(c.oid) pt JOIN pg_class l ON l.oid = pt.relid
+                  WHERE pt.isleaf AND l.relkind = 'r') leaves)
+         ELSE {own} END"
+    )
 }
 
 pub async fn server_version(sql: &Sql) -> Result<i32, SourceError> {
@@ -130,7 +168,7 @@ pub async fn tables(
     };
     let query = format!(
         "SELECT n.nspname::text, c.relname::text, c.relkind::text, c.relreplident::text,
-                c.reltuples::float8,
+                {estimate},
                 {pk}, {ri},
                 {names}, {oids}, {types}, {notnull},
                 has_table_privilege(c.oid, 'SELECT'),
@@ -141,6 +179,7 @@ pub async fn tables(
          FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
          WHERE c.relkind IN ('r', 'p') AND {where_clause}
          ORDER BY 1, 2",
+        estimate = row_estimate_sql(),
         pk = key_agg("indisprimary"),
         ri = key_agg("indisreplident"),
         names = col_agg("a.attname::text", "text"),
@@ -179,7 +218,7 @@ pub async fn tables(
             table: col(&row, 1)?,
             relkind: col(&row, 2)?,
             replica_identity: col(&row, 3)?,
-            reltuples: col(&row, 4)?,
+            row_estimate: col(&row, 4)?,
             primary_key: col(&row, 5)?,
             replica_identity_index: col(&row, 6)?,
             columns,
@@ -520,13 +559,18 @@ pub async fn ensure_publication(
 mod tests {
     use super::*;
 
-    fn table(row_security: bool, force: bool, is_owner: bool) -> TableInfo {
+    fn table_info(
+        row_estimate: Option<f64>,
+        row_security: bool,
+        force: bool,
+        is_owner: bool,
+    ) -> TableInfo {
         TableInfo {
             schema: "public".into(),
             table: "t".into(),
             relkind: "r".into(),
             replica_identity: "d".into(),
-            reltuples: -1.0,
+            row_estimate,
             primary_key: vec!["id".into()],
             replica_identity_index: Vec::new(),
             columns: Vec::new(),
@@ -537,6 +581,14 @@ mod tests {
             row_security,
             force_row_security: force,
         }
+    }
+
+    fn table(row_security: bool, force: bool, is_owner: bool) -> TableInfo {
+        table_info(None, row_security, force, is_owner)
+    }
+
+    fn with_estimate(row_estimate: Option<f64>) -> TableInfo {
+        table_info(row_estimate, false, false, true)
     }
 
     #[test]
@@ -552,5 +604,14 @@ mod tests {
         assert!(table(true, true, true).rls_hides_rows(false, false));
         assert!(!table(true, true, true).rls_hides_rows(false, true));
         assert!(!table(true, true, true).rls_hides_rows(true, false));
+    }
+
+    #[test]
+    fn estimated_rows_is_unknown_only_without_a_usable_figure() {
+        assert_eq!(with_estimate(None).estimated_rows(), None);
+        assert_eq!(with_estimate(Some(-1.0)).estimated_rows(), None);
+        assert_eq!(with_estimate(Some(f64::NAN)).estimated_rows(), None);
+        assert_eq!(with_estimate(Some(0.0)).estimated_rows(), Some(0));
+        assert_eq!(with_estimate(Some(2.6)).estimated_rows(), Some(3));
     }
 }
