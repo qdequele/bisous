@@ -195,6 +195,17 @@ impl PostgresConfig {
         }
 
         let slot = match &self.slot_name {
+            // With a publication managed elsewhere, only the slot name derived
+            // from the sync id marks the slot as ours: a custom one would be
+            // refused as foreign after an interrupted first run, and never
+            // dropped by teardown.
+            Some(_) if !self.manage_publication => {
+                return Err(SourceError::Config(
+                    "postgres source: 'slot_name' cannot be set with manage_publication: false \
+                     (the slot is named after the sync)"
+                        .into(),
+                ));
+            }
             Some(name) => ident::validate_slot_name(name)?,
             None => ident::default_name(sync_id),
         };
@@ -527,6 +538,17 @@ mod tests {
                 SourceKind::Postgres
             )
             .is_err()
+        );
+        // The slot keeps its derived name: a custom one is refused.
+        let err = resolve(
+            json!({"host": "h", "user": "u", "publication_name": "p", "slot_name": "mine",
+                   "manage_publication": false}),
+            SourceKind::Supabase,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, SourceError::Config(m) if m.contains("slot_name")),
+            "{err:?}"
         );
         // A boolean only.
         assert!(

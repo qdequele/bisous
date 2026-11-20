@@ -427,7 +427,8 @@ optional `slot_name` / `publication_name` / `manage_publication`.
   (publish_via_partition_root = true)`. The sync never creates, alters or
   drops it, so the role needs neither `CREATE` on the database nor
   ownership of the tables; `check` fails when it is missing or does not
-  cover a mapped table, and deleting the sync drops only the slot.
+  cover a mapped table, and deleting the sync drops only the slot. `slot_name`
+  cannot be set in this mode: the slot is always named after the sync.
 
 ### Supabase
 
