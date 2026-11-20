@@ -3,8 +3,8 @@ info:
   title: meili-connect
   version: 0.1.0
   description: |
-    Change-data-capture from Postgres, Supabase, MySQL, MongoDB, Kafka and
-    DynamoDB into Meilisearch.
+    Change-data-capture from Postgres, Supabase, MySQL, MongoDB, Kafka,
+    DynamoDB and Firestore into Meilisearch.
 
     **Auth.** `Authorization: Bearer <LAB_SERVICE_TOKEN>` requires
     `X-Connect-Tenant-Id` and scopes every call to that tenant.
@@ -636,7 +636,7 @@ components:
           type: [object, "null"]
           description: How far behind its origin the sync is, while streaming and when the source can tell; `null` otherwise.
           properties:
-            seconds: { type: [number, "null"], description: "Age of the newest change seen, 0 once caught up (Postgres, MongoDB, Kafka, DynamoDB)." }
+            seconds: { type: [number, "null"], description: "Age of the newest change seen, 0 once caught up (Postgres, MongoDB, Kafka, DynamoDB, Firestore)." }
             bytes: { type: [integer, "null"], description: "WAL the replication slot retains past the confirmed position (Postgres)." }
             records: { type: integer, description: "Records not read yet (Kafka only; absent otherwise)." }
         lag_warning:
@@ -652,7 +652,7 @@ components:
       type: object
       required: [kind, config]
       properties:
-        kind: { type: string, enum: [postgres, supabase, mysql, mongodb, kafka, dynamodb] }
+        kind: { type: string, enum: [postgres, supabase, mysql, mongodb, kafka, dynamodb, firestore] }
         config:
           type: object
           description: |
@@ -666,6 +666,15 @@ components:
             error), and deleting the sync drops only its replication slot.
             Changing `manage_publication` is a new origin, like the
             publication name.
+
+            `firestore` takes `service_account` (the JSON key file of a
+            service account, as a string; write-only like every secret),
+            `project_id` (defaults to the key's), `database_id` (default
+            `(default)`), `snapshot.page_size`, `stream.max_tracked_documents`,
+            or `emulator_host` (`host:port`, no key) for the emulator. A
+            stream's `collection` is a top-level collection (`products`), a
+            subcollection path (`users/alice/orders`) or a collection group
+            (`**/orders`).
 
     StreamMapping:
       type: object

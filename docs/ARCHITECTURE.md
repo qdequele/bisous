@@ -102,7 +102,8 @@ keep-alives, data and commits; no extra query) and the age of the last
 commit; MongoDB the age of each event's cluster time; Kafka the records
 behind the high watermarks (measured every 15 s off the event loop: the
 watermark requests block) and the last record's age; DynamoDB the worst
-shard's `ApproximateCreationDateTime` age. Each reports 0 once caught up.
+shard's `ApproximateCreationDateTime` age; Firestore the age of the last
+consistent snapshot's read time. Each reports 0 once caught up.
 The engine clears it whenever a run stops streaming; `SyncStatus` carries it
 with the time since the last checkpoint, which the server's lag guard
 (`MAX_LAG_HOLD_*`) uses to warn about a stuck sync. Nothing is dropped
@@ -117,6 +118,16 @@ automatically.
 | `mongodb` | Change streams, `fullDocument: updateLookup` | Resume token | `find` per collection after capturing the cluster time |
 | `kafka` | Consumer, manual offset commit | `{topic: {partition: offset}}` | None |
 | `dynamodb` | DynamoDB Streams, shards read in lineage order | `{shard_id: sequence_number}` | `Scan` |
+| `firestore` | Realtime `Listen`, one target per collection | Resume token of the last consistent snapshot (a read time before the first) | `RunQuery` pages in name order |
+
+Firestore's `Listen` sends deltas, except after a `RESET` (a token too
+old, and always on the emulator): the whole result set again, where a
+document not re-sent was deleted. Applying one needs the set of documents
+the index holds, which the source keeps in memory per collection (paths,
+capped by `stream.max_tracked_documents`) from its snapshot and its
+changes. A restarted source does not know it: a reset, or an existence
+filter it cannot check, is `PositionLost`. Its service account key goes
+only to Google's token endpoint (the key's `token_uri` is dropped).
 
 Supabase is the Postgres connector plus setup rules: direct connection (not
 the transaction pooler), IPv6, a paused project maps to `SourceError::Paused`,
@@ -209,7 +220,7 @@ in every mode.
 - Each connector declares where it connects: `SourceFactory::endpoints`
   (Postgres/MySQL host, every MongoDB seed host and the hosts of a
   `mongodb+srv` SRV record, every Kafka bootstrap server, DynamoDB's
-  `endpoint_url`).
+  `endpoint_url`, Firestore's `emulator_host`).
 - The server vets them at `check`, `discover`, `POST` and `PUT`, and wraps
   the registry (`server::guard::GuardedSources`) so that every source the
   engine builds, one per attempt, vets them again before its first call
