@@ -197,14 +197,30 @@ fn origin_object_paths(kind: SourceKind) -> &'static [&'static [&'static str]] {
     }
 }
 
+/// Boolean fields that decide which origin objects the sync owns, with
+/// their default: absent and the default are the same value.
+fn origin_flag_paths(kind: SourceKind) -> &'static [(&'static [&'static str], bool)] {
+    match kind {
+        // Who owns the publication: the sync, or someone else (the Lab).
+        SourceKind::Postgres | SourceKind::Supabase => &[(&["manage_publication"], true)],
+        _ => &[],
+    }
+}
+
 /// Both source specs (real values, no placeholders) reach the same origin
 /// as the same user and own the same objects there.
 pub fn same_origin(old: &SourceSpec, new: &SourceSpec) -> bool {
+    let flag = |config: &Value, path: &[&str], default: bool| {
+        at(config, path).and_then(Value::as_bool).unwrap_or(default)
+    };
     old.kind == new.kind
         && identity_paths(old.kind)
             .iter()
             .chain(origin_object_paths(old.kind))
             .all(|path| at(&old.config, path) == at(&new.config, path))
+        && origin_flag_paths(old.kind).iter().all(|(path, default)| {
+            flag(&old.config, path, *default) == flag(&new.config, path, *default)
+        })
 }
 
 fn at<'a>(value: &'a Value, path: &[&str]) -> Option<&'a Value> {
@@ -494,6 +510,27 @@ mod tests {
         check_placeholders(&view, &mongo).unwrap();
         view["source"]["config"]["uri"] = json!("mongodb://evil");
         check_placeholders(&view, &mongo).unwrap();
+    }
+
+    #[test]
+    fn manage_publication_is_part_of_the_origin() {
+        let spec = |config: Value| SourceSpec {
+            kind: SourceKind::Supabase,
+            config,
+        };
+        let base = json!({"host": "db.x.supabase.co", "user": "u", "publication_name": "p"});
+        let mut external = base.clone();
+        external["manage_publication"] = json!(false);
+        let mut explicit = base.clone();
+        explicit["manage_publication"] = json!(true);
+        assert!(!same_origin(&spec(base.clone()), &spec(external.clone())));
+        assert!(!same_origin(
+            &spec(external.clone()),
+            &spec(explicit.clone())
+        ));
+        // Absent is the default, `true`.
+        assert!(same_origin(&spec(base), &spec(explicit)));
+        assert!(same_origin(&spec(external.clone()), &spec(external)));
     }
 
     #[test]

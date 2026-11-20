@@ -207,13 +207,21 @@ impl PostgresSource {
     /// is ours when it is a pgoutput slot of this database and either has
     /// the name derived from the sync id or is paired with a publication of
     /// ours.
+    ///
+    /// With `manage_publication: false` the publication is never ours and
+    /// never judged (`publication` is `None`): it belongs to whoever manages
+    /// it, and a slot is ours only under the name derived from the sync id.
     pub(crate) async fn ownership(&mut self) -> Result<Ownership, SourceError> {
         self.connect().await?;
         let sql = self.db()?;
         let marker = catalog::marker(&self.settings.sync_id);
-        let publication = catalog::publication_comment(sql, &self.settings.publication)
-            .await?
-            .map(|comment| comment.as_deref() == Some(marker.as_str()));
+        let publication = if self.settings.manage_publication {
+            catalog::publication_comment(sql, &self.settings.publication)
+                .await?
+                .map(|comment| comment.as_deref() == Some(marker.as_str()))
+        } else {
+            None
+        };
         let slot = catalog::slot(sql, &self.settings.slot).await?.map(|slot| {
             let ours = slot.plugin.as_deref() == Some("pgoutput")
                 && slot.database.as_deref() == Some(self.settings.conn.database.as_str())
@@ -311,7 +319,27 @@ impl PostgresSource {
 
         // The publication must exist before the slot's start point, or
         // decoding fails on changes it cannot see the publication for.
-        catalog::ensure_publication(sql, &publication, &marker, &list).await?;
+        if self.settings.manage_publication {
+            catalog::ensure_publication(sql, &publication, &marker, &list).await?;
+        } else {
+            // Managed elsewhere: only verify it covers every mapped table.
+            let wanted: BTreeSet<String> = self.targets.iter().map(Target::canonical).collect();
+            let missing: Vec<String> = match catalog::publication_tables(sql, &publication).await? {
+                None => {
+                    return Err(SourceError::Config(format!(
+                        "publication {publication} does not exist: it is managed outside \
+                         meili-connect (manage_publication: false)"
+                    )));
+                }
+                Some(have) => wanted.difference(&have).cloned().collect(),
+            };
+            if !missing.is_empty() {
+                return Err(SourceError::Config(format!(
+                    "publication {publication} does not cover {missing:?}: it is managed outside \
+                     meili-connect (manage_publication: false), add them to it"
+                )));
+            }
+        }
 
         // A slot left by an interrupted first sync: its exported snapshot is
         // gone, so start over with a new one.
@@ -875,6 +903,8 @@ impl Source for PostgresSource {
                     .unwrap_or_default()
             )));
         }
+        // `manage_publication: false`: `owned.publication` is `None`, the
+        // publication is left to whoever manages it.
         match owned.publication {
             Some(true) => {
                 sql.simple(&format!(
@@ -888,7 +918,11 @@ impl Source for PostgresSource {
             }
             None => {}
         }
-        tracing::info!(slot = %slot_name, %publication, "dropped replication slot and publication");
+        if self.settings.manage_publication {
+            tracing::info!(slot = %slot_name, %publication, "dropped replication slot and publication");
+        } else {
+            tracing::info!(slot = %slot_name, %publication, "dropped replication slot; the publication is managed elsewhere");
+        }
         Ok(())
     }
 

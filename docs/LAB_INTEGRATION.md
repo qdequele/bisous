@@ -40,6 +40,35 @@ on all indexes; same lifecycle as `lab-pipelines`). On responses the Lab maps
 the URL back to the instance slug. Standalone meili-connect keeps the
 `{"url", "api_key"}` form.
 
+## Supabase OAuth
+
+"Connect with Supabase" is a Lab feature; the engine only sees a plain
+Postgres spec. Design: [SUPABASE_OAUTH.md](SUPABASE_OAUTH.md).
+
+- **Lab-only source form.** The console sends `{"kind": "supabase",
+  "config": {"project": "<supabase_projects id>"}}` on `/sources/check`,
+  `/sources/discover`, `POST /syncs` and `PUT /syncs/{id}`. The Lab proxy
+  rewrites it into a full spec (host, provisioned role and password,
+  `sslmode: require`) with `"manage_publication": false` and the
+  `publication_name` it created, and maps a matching spec back to
+  `{"project": id}` on answers. The engine never accepts the `project` form
+  itself, and never sees the OAuth tokens.
+- **The Lab owns the role and the publication.** It provisions the
+  least-privilege role (`LOGIN REPLICATION`, `BYPASSRLS` when possible), and
+  creates, alters and drops `meili_connect_lab_<random>` `FOR TABLE` the
+  mapped tables as `postgres` through the Supabase Management API: only a
+  table's owner can add it to a publication. It grants `SELECT` on the
+  tables before forwarding a create or update.
+- **The engine only uses the publication** (`manage_publication: false`):
+  `check` fails when it is missing or does not cover a mapped table, `open`
+  refuses it with a config error, and it is never created, altered or
+  dropped. `DELETE /syncs/{id}` drops only the sync's slot; the Lab drops the
+  publication after the `204`. Keeping the same `publication_name` on a
+  `PUT` keeps the origin (no fresh snapshot); changing it or
+  `manage_publication` is a new origin.
+- `check` also fails a table with row-level security that the role does not
+  bypass (snapshot would copy only the rows the policies allow).
+
 ## Pricing
 
 Two meters, both reported by the engine and priced by the Lab

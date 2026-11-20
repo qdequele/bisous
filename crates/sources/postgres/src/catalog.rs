@@ -34,6 +34,10 @@ pub struct TableInfo {
     /// reads their rows, but their changes are published under their own
     /// names.
     pub has_inheritance_children: bool,
+    /// `relrowsecurity`: row-level security is enabled.
+    pub row_security: bool,
+    /// `relforcerowsecurity`: the policies apply to the owner too.
+    pub force_row_security: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -60,6 +64,16 @@ impl TableInfo {
             _ => Vec::new(),
         };
         (!key.is_empty()).then_some(key)
+    }
+
+    /// Whether row-level security hides rows from a role with these
+    /// attributes: the policies apply unless the role is a superuser, has
+    /// `BYPASSRLS`, or owns the table and RLS is not forced on owners.
+    pub fn rls_hides_rows(&self, superuser: bool, bypass_rls: bool) -> bool {
+        self.row_security
+            && !superuser
+            && !bypass_rls
+            && (!self.is_owner || self.force_row_security)
     }
 
     pub fn estimated_rows(&self) -> Option<u64> {
@@ -160,7 +174,8 @@ pub async fn tables(
                 has_table_privilege(c.oid, 'SELECT'),
                 pg_has_role(c.relowner, 'USAGE'),
                 c.oid,
-                c.relkind = 'r' AND EXISTS (SELECT 1 FROM pg_inherits h WHERE h.inhparent = c.oid)
+                c.relkind = 'r' AND EXISTS (SELECT 1 FROM pg_inherits h WHERE h.inhparent = c.oid),
+                c.relrowsecurity, c.relforcerowsecurity
          FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
          WHERE c.relkind IN ('r', 'p') AND {where_clause}
          ORDER BY 1, 2",
@@ -211,6 +226,8 @@ pub async fn tables(
             is_owner: col(&row, 12)?,
             oid: col(&row, 13)?,
             has_inheritance_children: col(&row, 14)?,
+            row_security: col(&row, 15)?,
+            force_row_security: col(&row, 16)?,
         });
     }
     Ok(out)
@@ -542,7 +559,12 @@ pub async fn ensure_publication(
 mod tests {
     use super::*;
 
-    fn with_estimate(row_estimate: Option<f64>) -> TableInfo {
+    fn table_info(
+        row_estimate: Option<f64>,
+        row_security: bool,
+        force: bool,
+        is_owner: bool,
+    ) -> TableInfo {
         TableInfo {
             schema: "public".into(),
             table: "t".into(),
@@ -553,10 +575,35 @@ mod tests {
             replica_identity_index: Vec::new(),
             columns: Vec::new(),
             can_select: true,
-            is_owner: true,
+            is_owner,
             oid: 1,
             has_inheritance_children: false,
+            row_security,
+            force_row_security: force,
         }
+    }
+
+    fn table(row_security: bool, force: bool, is_owner: bool) -> TableInfo {
+        table_info(None, row_security, force, is_owner)
+    }
+
+    fn with_estimate(row_estimate: Option<f64>) -> TableInfo {
+        table_info(row_estimate, false, false, true)
+    }
+
+    #[test]
+    fn rls_hides_rows_unless_the_role_bypasses_it() {
+        // RLS off: nothing is hidden.
+        assert!(!table(false, false, false).rls_hides_rows(false, false));
+        // A non-owner without BYPASSRLS sees only what policies allow.
+        assert!(table(true, false, false).rls_hides_rows(false, false));
+        assert!(!table(true, false, false).rls_hides_rows(false, true));
+        assert!(!table(true, false, false).rls_hides_rows(true, false));
+        // The owner bypasses it, unless FORCE ROW LEVEL SECURITY.
+        assert!(!table(true, false, true).rls_hides_rows(false, false));
+        assert!(table(true, true, true).rls_hides_rows(false, false));
+        assert!(!table(true, true, true).rls_hides_rows(false, true));
+        assert!(!table(true, true, true).rls_hides_rows(true, false));
     }
 
     #[test]

@@ -36,7 +36,7 @@ impl SslMode {
 /// `SourceSpec.config` for `postgres` and `supabase`. Either `url` or the
 /// discrete fields; discrete fields override the URL's parts when both are
 /// given.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PostgresConfig {
     /// `postgres://user:password@host:port/database?sslmode=require`.
@@ -64,6 +64,34 @@ pub struct PostgresConfig {
     /// Override the publication name (default `meili_connect_<sync_id>`).
     #[serde(default)]
     pub publication_name: Option<String>,
+    /// `true` (default): the sync creates, updates and drops its own
+    /// publication. `false`: the publication named by `publication_name`
+    /// (then required) is managed elsewhere, for example by the Lab, and the
+    /// sync only reads it: never creates, alters or drops it.
+    #[serde(default = "default_true")]
+    pub manage_publication: bool,
+}
+
+impl Default for PostgresConfig {
+    fn default() -> Self {
+        Self {
+            url: None,
+            host: None,
+            port: None,
+            database: None,
+            user: None,
+            password: None,
+            sslmode: None,
+            ca_cert: None,
+            slot_name: None,
+            publication_name: None,
+            manage_publication: true,
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Everything needed to open a connection, resolved and validated.
@@ -85,6 +113,9 @@ pub struct Settings {
     pub conn: ConnParams,
     pub slot: String,
     pub publication: String,
+    /// Whether the sync owns its publication (creates, updates and drops
+    /// it). `false`: it exists already, managed elsewhere.
+    pub manage_publication: bool,
     /// The sync these objects belong to: their ownership marker.
     pub sync_id: String,
 }
@@ -164,11 +195,29 @@ impl PostgresConfig {
         }
 
         let slot = match &self.slot_name {
+            // With a publication managed elsewhere, only the slot name derived
+            // from the sync id marks the slot as ours: a custom one would be
+            // refused as foreign after an interrupted first run, and never
+            // dropped by teardown.
+            Some(_) if !self.manage_publication => {
+                return Err(SourceError::Config(
+                    "postgres source: 'slot_name' cannot be set with manage_publication: false \
+                     (the slot is named after the sync)"
+                        .into(),
+                ));
+            }
             Some(name) => ident::validate_slot_name(name)?,
             None => ident::default_name(sync_id),
         };
         let publication = match &self.publication_name {
             Some(name) => ident::validate_publication_name(name)?,
+            None if !self.manage_publication => {
+                return Err(SourceError::Config(
+                    "postgres source: 'publication_name' is required with \
+                     manage_publication: false (the publication is managed outside meili-connect)"
+                        .into(),
+                ));
+            }
             None => ident::default_name(sync_id),
         };
 
@@ -185,6 +234,7 @@ impl PostgresConfig {
             },
             slot,
             publication,
+            manage_publication: self.manage_publication,
             sync_id: sync_id.to_owned(),
         })
     }
@@ -442,6 +492,73 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, SourceError::Config(_)));
+    }
+
+    #[test]
+    fn manage_publication_defaults_to_true() {
+        let s = resolve(json!({"host": "h", "user": "u"}), SourceKind::Postgres).unwrap();
+        assert!(s.manage_publication);
+        assert!(PostgresConfig::default().manage_publication);
+        let s = resolve(
+            json!({"host": "h", "user": "u", "manage_publication": true}),
+            SourceKind::Postgres,
+        )
+        .unwrap();
+        assert!(s.manage_publication);
+    }
+
+    #[test]
+    fn external_publication_needs_its_name() {
+        let err = resolve(
+            json!({"host": "h", "user": "u", "manage_publication": false}),
+            SourceKind::Supabase,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, SourceError::Config(m) if m.contains("publication_name")),
+            "{err:?}"
+        );
+
+        let s = resolve(
+            json!({"host": "db.abc.supabase.co", "user": "meili_connect_x", "password": "pw",
+                   "publication_name": "meili_connect_lab_abc", "manage_publication": false}),
+            SourceKind::Supabase,
+        )
+        .unwrap();
+        assert!(!s.manage_publication);
+        assert_eq!(s.publication, "meili_connect_lab_abc");
+        // The slot keeps the name derived from the sync id.
+        assert_eq!(s.slot, ident::default_name("sync-1"));
+
+        // Still never Supabase Realtime's.
+        assert!(
+            resolve(
+                json!({"host": "h", "user": "u", "publication_name": "supabase_realtime",
+                       "manage_publication": false}),
+                SourceKind::Postgres
+            )
+            .is_err()
+        );
+        // The slot keeps its derived name: a custom one is refused.
+        let err = resolve(
+            json!({"host": "h", "user": "u", "publication_name": "p", "slot_name": "mine",
+                   "manage_publication": false}),
+            SourceKind::Supabase,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, SourceError::Config(m) if m.contains("slot_name")),
+            "{err:?}"
+        );
+        // A boolean only.
+        assert!(
+            resolve(
+                json!({"host": "h", "user": "u", "publication_name": "p",
+                       "manage_publication": "no"}),
+                SourceKind::Postgres
+            )
+            .is_err()
+        );
     }
 
     #[test]

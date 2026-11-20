@@ -131,7 +131,7 @@ spec the API returns has the Meilisearch key and the source's secrets
 `PUT` replaces the spec. What happens next depends on what changed:
 
 - **Another origin** (kind, host, port, URL, user, database, TLS, slot or
-  publication name): the old origin is cleaned up first with the old spec
+  publication name, `manage_publication`): the old origin is cleaned up first with the old spec
   (slot, publication…); if that fails nothing changes (`502
   teardown_failed`, or `?force=true` to go on and clean up by hand). Then the
   sync starts fresh: full snapshot.
@@ -407,7 +407,7 @@ what is missing.
 Config: `{"url": "postgres://user:pass@host:5432/db?sslmode=require"}` or
 `host`, `port`, `database`, `user`, `password`, `sslmode`
 (`disable`/`prefer`/`require`/`verify-ca`/`verify-full`), `ca_cert`, and
-optional `slot_name` / `publication_name`.
+optional `slot_name` / `publication_name` / `manage_publication`.
 
 - `wal_level = logical` (restart required), free `max_replication_slots` and
   `max_wal_senders`.
@@ -417,6 +417,18 @@ optional `slot_name` / `publication_name`.
 - Every table needs a primary key (or `REPLICA IDENTITY FULL` and a key).
 - One slot + one publication per sync, named `meili_connect_<sync id>`. A
   stalled sync retains WAL: set `max_slot_wal_keep_size` on busy databases.
+- A table with row-level security needs a role that bypasses it
+  (`BYPASSRLS`, a superuser, or the table owner without `FORCE ROW LEVEL
+  SECURITY`): otherwise the snapshot copies only the rows the policies
+  allow, and `check` fails the table.
+- `manage_publication: false` (default `true`) uses a publication managed
+  elsewhere, named by the required `publication_name`: create it yourself
+  (as the tables' owner) `FOR TABLE` the mapped tables, ideally `WITH
+  (publish_via_partition_root = true)`. The sync never creates, alters or
+  drops it, so the role needs neither `CREATE` on the database nor
+  ownership of the tables; `check` fails when it is missing or does not
+  cover a mapped table, and deleting the sync drops only the slot. `slot_name`
+  cannot be set in this mode: the slot is always named after the sync.
 
 ### Supabase
 

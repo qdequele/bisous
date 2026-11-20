@@ -121,7 +121,9 @@ automatically.
 Supabase is the Postgres connector plus setup rules: direct connection (not
 the transaction pooler), IPv6, a paused project maps to `SourceError::Paused`,
 an invalidated slot maps to `PositionLost`, and the `supabase_realtime`
-publication is never reused.
+publication is never reused. With `manage_publication: false` the publication
+belongs to someone else (the Lab, for Supabase OAuth): the connector only
+verifies it covers the mapped tables and never changes or drops it.
 
 `Source::check` built without mappings is a connection-level pre-flight:
 the setup UI tests the connection before the user picks anything. It checks

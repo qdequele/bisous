@@ -1430,3 +1430,276 @@ async fn slot_invalidated_before_start_replication_is_position_lost() {
     assert!(matches!(err, SourceError::PositionLost(_)), "{err:?}");
     src.teardown().await.unwrap();
 }
+
+fn item<'a>(
+    report: &'a meili_connect_core::CheckReport,
+    name: &str,
+) -> &'a meili_connect_core::CheckItem {
+    report
+        .items
+        .iter()
+        .find(|i| i.name == name)
+        .unwrap_or_else(|| panic!("{name}: {report:#?}"))
+}
+
+/// `manage_publication: false`: the publication is someone else's (the
+/// Lab's). Check and open only verify it; open, stream and teardown never
+/// create, alter, comment or drop it, and teardown drops only the slot.
+#[tokio::test]
+async fn an_external_publication_is_used_and_never_changed() {
+    let Some(url) = url() else { return };
+    let db = admin(&url).await;
+    let covered = unique("ext");
+    let uncovered = unique("ext_out");
+    create_items(&db, &covered).await;
+    create_items(&db, &uncovered).await;
+    db.batch_execute(&format!("INSERT INTO {covered} VALUES (1, 1, 'a')"))
+        .await
+        .unwrap();
+    let publication = unique("ext_pub");
+    db.batch_execute(&format!(
+        "CREATE PUBLICATION {publication} FOR TABLE {covered}"
+    ))
+    .await
+    .unwrap();
+    let external = |name: &str| json!({ "publication_name": name, "manage_publication": false });
+    let pub_state = || async {
+        let tables: Vec<String> = db
+            .query(
+                "SELECT tablename::text FROM pg_publication_tables WHERE pubname = $1",
+                &[&publication],
+            )
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.get(0))
+            .collect();
+        let row = db
+            .query_one(
+                "SELECT obj_description(oid, 'pg_publication'), pubviaroot FROM pg_publication
+                 WHERE pubname = $1",
+                &[&publication],
+            )
+            .await
+            .unwrap();
+        (
+            tables,
+            row.get::<_, Option<String>>(0),
+            row.get::<_, bool>(1),
+        )
+    };
+    let untouched = (vec![covered.clone()], None, false);
+    let c_covered = format!("public.{covered}");
+    let c_uncovered = format!("public.{uncovered}");
+
+    // Covered: check passes, without any marker on the publication.
+    let sync_id = unique("ext");
+    let mut src = source_with(&url, &sync_id, &[&c_covered], external(&publication));
+    let report = src.check().await.unwrap();
+    assert!(report.passed(), "{report:#?}");
+    assert_eq!(item(&report, "publication").status, CheckStatus::Ok);
+
+    // Partial coverage: check names the missing table, open refuses.
+    let mut partial = source_with(
+        &url,
+        &unique("ext"),
+        &[&c_covered, &c_uncovered],
+        external(&publication),
+    );
+    let report = partial.check().await.unwrap();
+    let p = item(&report, "publication");
+    assert_eq!(p.status, CheckStatus::Failed, "{report:#?}");
+    assert!(
+        p.message.contains(&c_uncovered) && !p.message.contains(&c_covered),
+        "{p:?}"
+    );
+    let err = partial.open(None).await.unwrap_err();
+    assert!(
+        matches!(&err, SourceError::Config(m) if m.contains(&c_uncovered)),
+        "{err:?}"
+    );
+
+    // Missing publication: check fails, open refuses, nothing is created.
+    let missing = unique("ext_missing");
+    let mut absent = source_with(&url, &unique("ext"), &[&c_covered], external(&missing));
+    let report = absent.check().await.unwrap();
+    let p = item(&report, "publication");
+    assert_eq!(p.status, CheckStatus::Failed, "{report:#?}");
+    assert!(
+        p.message.contains("does not exist") && p.message.contains("manage_publication: false"),
+        "{p:?}"
+    );
+    let err = absent.open(None).await.unwrap_err();
+    assert!(matches!(err, SourceError::Config(_)), "{err:?}");
+    let created: i64 = db
+        .query_one(
+            "SELECT count(*) FROM pg_publication WHERE pubname = $1",
+            &[&missing],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(created, 0);
+    assert_eq!(pub_state().await, untouched);
+
+    // Open, snapshot and stream through it: the publication is unchanged.
+    let slot = format!("meili_connect_{sync_id}");
+    assert!(matches!(
+        src.open(None).await.unwrap(),
+        Opened::Fresh { .. }
+    ));
+    assert_eq!(pub_state().await, untouched);
+    let (tx, mut rx) = mpsc::channel(64);
+    src.snapshot(tx, CancellationToken::new()).await.unwrap();
+    let mut model = Model::default();
+    while let Ok(ev) = rx.try_recv() {
+        model.apply(ev);
+    }
+    assert_eq!(model.table(&c_covered).len(), 1);
+    let mut s = start_stream(src);
+    db.batch_execute(&format!("INSERT INTO {covered} VALUES (2, 2, 'b')"))
+        .await
+        .unwrap();
+    assert!(
+        pump_until(&mut s.rx, &mut model, Duration::from_secs(20), |m| m
+            .table(&c_covered)
+            .len()
+            == 2)
+        .await,
+        "{model:#?}"
+    );
+    let mut src = s.stop().await;
+
+    // A reopen of the same sync (interrupted first run) adopts its slot.
+    let mut again = source_with(&url, &sync_id, &[&c_covered], external(&publication));
+    assert!(matches!(
+        again.open(None).await.unwrap(),
+        Opened::Fresh { .. }
+    ));
+    drop(again);
+
+    // Teardown drops the slot and keeps the publication as it was.
+    src.teardown().await.unwrap();
+    let slots: i64 = db
+        .query_one(
+            "SELECT count(*) FROM pg_replication_slots WHERE slot_name = $1",
+            &[&slot],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(slots, 0);
+    assert_eq!(pub_state().await, untouched);
+
+    // A publication the sync would own under `manage_publication: true`
+    // (it carries our marker) is still left alone with `false`.
+    let marked_id = unique("ext");
+    db.batch_execute(&format!(
+        "COMMENT ON PUBLICATION {publication} IS 'meili-connect:{marked_id}'"
+    ))
+    .await
+    .unwrap();
+    let mut marked = source_with(&url, &marked_id, &[&c_covered], external(&publication));
+    marked.open(None).await.unwrap();
+    marked.teardown().await.unwrap();
+    assert_eq!(pub_state().await.0, vec![covered.clone()]);
+
+    db.batch_execute(&format!(
+        "DROP PUBLICATION {publication}; DROP TABLE {covered}, {uncovered};"
+    ))
+    .await
+    .unwrap();
+}
+
+/// A table with row-level security, read by a role that neither owns it
+/// nor bypasses RLS, would be snapshotted only partly: check fails it. The
+/// same role needs no table ownership with an external publication.
+#[tokio::test]
+async fn check_flags_tables_whose_rls_would_hide_rows() {
+    let Some(url) = url() else { return };
+    let db = admin(&url).await;
+    let open = unique("rls_open");
+    let guarded = unique("rls_on");
+    let forced = unique("rls_forced");
+    let role = unique("rls_role");
+    let password = format!("pw_{}", unique("x"));
+    let publication = unique("rls_pub");
+    for t in [&open, &guarded, &forced] {
+        create_items(&db, t).await;
+    }
+    db.batch_execute(&format!(
+        "ALTER TABLE {guarded} ENABLE ROW LEVEL SECURITY;
+         ALTER TABLE {forced} ENABLE ROW LEVEL SECURITY;
+         ALTER TABLE {forced} FORCE ROW LEVEL SECURITY;
+         CREATE ROLE {role} LOGIN REPLICATION PASSWORD '{password}';
+         GRANT SELECT ON {open}, {guarded}, {forced} TO {role};
+         CREATE PUBLICATION {publication} FOR TABLE {open}, {guarded}, {forced};"
+    ))
+    .await
+    .unwrap();
+    let as_role = json!({
+        "user": role, "password": password,
+        "publication_name": publication, "manage_publication": false,
+    });
+    let collections = [
+        format!("public.{open}"),
+        format!("public.{guarded}"),
+        format!("public.{forced}"),
+    ];
+    let refs: Vec<&str> = collections.iter().map(String::as_str).collect();
+
+    let mut src = source_with(&url, &unique("rls"), &refs, as_role.clone());
+    let report = src.check().await.unwrap();
+    // Not the owner, but the publication is managed elsewhere: no
+    // ownership problem, so the RLS-free table passes.
+    let plain = item(&report, &format!("table {}", collections[0]));
+    assert_eq!(plain.status, CheckStatus::Ok, "{report:#?}");
+    for c in &collections[1..] {
+        let t = item(&report, &format!("table {c}"));
+        assert_eq!(t.status, CheckStatus::Failed, "{report:#?}");
+        assert!(t.message.contains("row-level security"), "{t:?}");
+        assert!(!t.message.contains("does not own"), "{t:?}");
+    }
+    assert!(
+        !report
+            .items
+            .iter()
+            .any(|i| i.message.contains("cannot create publications")),
+        "{report:#?}"
+    );
+
+    // BYPASSRLS clears both.
+    db.batch_execute(&format!("ALTER ROLE {role} BYPASSRLS"))
+        .await
+        .unwrap();
+    let mut src = source_with(&url, &unique("rls"), &refs, as_role.clone());
+    let report = src.check().await.unwrap();
+    assert!(report.passed(), "{report:#?}");
+
+    // The owner is exempt, unless RLS is forced on it.
+    db.batch_execute(&format!(
+        "ALTER ROLE {role} NOBYPASSRLS;
+         ALTER TABLE {guarded} OWNER TO {role};
+         ALTER TABLE {forced} OWNER TO {role};"
+    ))
+    .await
+    .unwrap();
+    let mut src = source_with(&url, &unique("rls"), &refs, as_role);
+    let report = src.check().await.unwrap();
+    assert_eq!(
+        item(&report, &format!("table {}", collections[1])).status,
+        CheckStatus::Ok,
+        "{report:#?}"
+    );
+    let t = item(&report, &format!("table {}", collections[2]));
+    assert_eq!(t.status, CheckStatus::Failed, "{report:#?}");
+    assert!(t.message.contains("row-level security"), "{t:?}");
+
+    db.batch_execute(&format!(
+        "DROP PUBLICATION {publication};
+         DROP TABLE {open}, {guarded}, {forced};
+         DROP OWNED BY {role}; DROP ROLE {role};"
+    ))
+    .await
+    .unwrap();
+}
