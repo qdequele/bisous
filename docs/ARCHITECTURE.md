@@ -128,6 +128,7 @@ reports `sync.health_changed`.
 | `kafka` | Consumer, manual offset commit | `{topic: {partition: offset}}` | None |
 | `dynamodb` | DynamoDB Streams, shards read in lineage order | `{shard_id: sequence_number}` | `Scan` |
 | `firestore` | Realtime `Listen`, one target per collection | Resume token of the last consistent snapshot (a read time before the first) | `RunQuery` pages in name order |
+| `planetscale` | Vitess `VStream` over gRPC (PlanetScale MySQL has no external binlog) | `{shards: [{keyspace, shard, gtid}]}` | Keyset reads over the MySQL protocol, after capturing every shard's current position |
 
 Firestore's `Listen` sends deltas, except after a `RESET` (a token too
 old, and always on the emulator): the whole result set again, where a

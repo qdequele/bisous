@@ -1760,3 +1760,110 @@ async fn retention_measures_the_wal_a_stopped_slot_keeps() {
         .await
         .unwrap();
 }
+
+/// `provider: planetscale` creates a failover-enabled slot on Postgres 17+
+/// (PlanetScale requires it), together with the exported snapshot, and
+/// the check reports it; an older slot without failover is a warning.
+/// Other providers keep plain slots.
+#[tokio::test]
+async fn planetscale_slots_are_failover_enabled() {
+    let Some(url) = url() else { return };
+    let db = admin(&url).await;
+    let version: i32 = db
+        .query_one("SELECT current_setting('server_version_num')::int4", &[])
+        .await
+        .unwrap()
+        .get(0);
+    if version < 170_000 {
+        eprintln!("Postgres {version} has no failover slots: skipping");
+        return;
+    }
+    let table = unique("psfo");
+    create_items(&db, &table).await;
+    db.batch_execute(&format!("INSERT INTO {table} VALUES (1, 1, 'a')"))
+        .await
+        .unwrap();
+    let collection = format!("public.{table}");
+    let failover = |slot: String| {
+        let db = &db;
+        async move {
+            db.query_one(
+                "SELECT failover FROM pg_replication_slots WHERE slot_name = $1",
+                &[&slot],
+            )
+            .await
+            .unwrap()
+            .get::<_, bool>(0)
+        }
+    };
+    let item = |report: &meili_connect_core::CheckReport| {
+        report
+            .items
+            .iter()
+            .find(|i| i.name == "slot_failover")
+            .map(|i| (i.status.clone(), i.message.clone()))
+    };
+
+    let ps = json!({"provider": "planetscale"});
+    let sync_id = unique("psfo");
+    let slot = format!("meili_connect_{sync_id}");
+    let mut src = source_with(&url, &sync_id, &[&collection], ps.clone());
+    let report = src.check().await.unwrap();
+    assert_eq!(item(&report).unwrap().0, CheckStatus::Ok, "{report:#?}");
+    assert!(matches!(
+        src.open(None).await.unwrap(),
+        Opened::Fresh { .. }
+    ));
+    // The snapshot exported with the slot is still importable.
+    let (tx, mut rx) = mpsc::channel(64);
+    let cancel = CancellationToken::new();
+    let (got, snap) = tokio::join!(
+        async {
+            let mut n = 0;
+            while let Some(ev) = rx.recv().await {
+                if matches!(ev, SourceEvent::Change(_)) {
+                    n += 1;
+                }
+            }
+            n
+        },
+        src.snapshot(tx, cancel.clone())
+    );
+    snap.unwrap();
+    assert!(got > 0, "the snapshot read no row");
+    assert!(failover(slot.clone()).await);
+    let report = source_with(&url, &sync_id, &[&collection], ps.clone())
+        .check()
+        .await
+        .unwrap();
+    assert_eq!(
+        item(&report),
+        Some((CheckStatus::Ok, format!("slot {slot} is failover-enabled")))
+    );
+    src.teardown().await.unwrap();
+
+    // A plain slot left from before: the check says how to fix it.
+    let sync_id = unique("psfo");
+    let slot = format!("meili_connect_{sync_id}");
+    let mut plain = source(&url, &sync_id, &[&collection]);
+    plain.open(None).await.unwrap();
+    assert!(!failover(slot.clone()).await);
+    drop(plain);
+    let report = source_with(&url, &sync_id, &[&collection], ps)
+        .check()
+        .await
+        .unwrap();
+    let (status, message) = item(&report).unwrap();
+    assert_eq!(status, CheckStatus::Warning);
+    assert!(message.contains("ALTER_REPLICATION_SLOT"), "{message}");
+    // Without the provider there is no failover item at all.
+    let report = source(&url, &sync_id, &[&collection])
+        .check()
+        .await
+        .unwrap();
+    assert!(item(&report).is_none());
+    source(&url, &sync_id, &[&collection])
+        .teardown()
+        .await
+        .unwrap();
+}
