@@ -163,6 +163,12 @@ Everything in `docs/openapi.yaml`, plus:
   null)}`. The console shows it in the DynamoDB `assume_role` form and never
   sends `external_id` (the engine sets it; another value is
   `422 external_id_not_allowed`).
+- `GET /network`: `{"egress_ips": [...]}`, the addresses the database
+  allow-lists must admit (`CONNECT_EGRESS_IPS`; empty when unset). The
+  console shows them in the hosted-database setup guides.
+- `provider` in a `postgres` or `mysql` config: the console's hosted-database
+  tiles (Neon, RDS, Aurora, Cloud SQL, Azure) set it so failed checks name
+  the provider's fix. Engine first: an engine without it refuses the field.
 - `GET /metrics`: Prometheus text, authenticated with `METRICS_TOKEN` (never
   the tenant tokens), no tenant labels beyond counts.
 - `GET /health`.

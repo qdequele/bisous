@@ -230,6 +230,7 @@ Every variable, with defaults, is in [`.env.example`](.env.example).
 | `LAB_SERVICE_TOKEN` | unset | Lab token; requires `X-Connect-Tenant-Id`. Set but blank: startup error. |
 | `CONNECT_HOST_POLICY` | `public` with `LAB_SERVICE_TOKEN`, else `any` | Which hosts sources and destinations may point at: `public`, `any` or `allowlist`. See [Host policy](#host-policy). |
 | `CONNECT_HOST_ALLOWLIST` | unset | With `allowlist`: comma-separated `host`, `host:port`, IP addresses and CIDRs. |
+| `CONNECT_EGRESS_IPS` | unset | The public IPs or CIDRs this server's connections leave from, comma- or space-separated. Published by `GET /network` for users' database allow-lists. Informational: the server does not check it. |
 | `LAB_URL`, `LAB_INSTANCE_ID`, `LAB_INSTANCE_SECRET` | unset | Lab mode: usage events and credit holds. All three or none. |
 | `USAGE_FLUSH_INTERVAL_SECS` | `60` | How often recorded usage with documents or bytes becomes events. |
 | `USAGE_IDLE_FLUSH_SECS` | `3600` | How long a running sync's `sync_seconds` alone (an idle sync) wait before they become an event (1-86400). |
@@ -407,7 +408,8 @@ what is missing.
 Config: `{"url": "postgres://user:pass@host:5432/db?sslmode=require"}` or
 `host`, `port`, `database`, `user`, `password`, `sslmode`
 (`disable`/`prefer`/`require`/`verify-ca`/`verify-full`), `ca_cert`, and
-optional `slot_name` / `publication_name` / `manage_publication`.
+optional `slot_name` / `publication_name` / `manage_publication` /
+`provider`.
 
 - `wal_level = logical` (restart required), free `max_replication_slots` and
   `max_wal_senders`.
@@ -429,6 +431,18 @@ optional `slot_name` / `publication_name` / `manage_publication`.
   ownership of the tables; `check` fails when it is missing or does not
   cover a mapped table, and deleting the sync drops only the slot. `slot_name`
   cannot be set in this mode: the slot is always named after the sync.
+- `provider` (`neon`, `rds`, `aurora`, `cloud_sql`, `azure`; optional,
+  detected from `*.neon.tech`, `*.rds.amazonaws.com` and
+  `*.postgres.database.azure.com` hosts) makes failed checks name that
+  service's fix: RDS `rds.logical_replication = 1` in a custom parameter
+  group (Aurora: the cluster parameter group) and `GRANT rds_replication`;
+  Cloud SQL the `cloudsql.logical_decoding` flag and `ALTER USER … WITH
+  REPLICATION`; Azure the `wal_level` server parameter; Neon the project's
+  Logical replication setting. A Neon `-pooler` host is refused: use the
+  direct one. Neon removes a slot that has not advanced for about 40 hours,
+  so a sync stopped longer resyncs.
+- Allow-list `GET /network`'s `egress_ips` in the database's security
+  group, authorized networks or firewall rules.
 
 ### Supabase
 
@@ -441,13 +455,23 @@ publication is never reused. Supabase limits slots per plan.
 
 Config: `host`, `port`, `user`, `password`, `database`, `tls`
 (`{"mode": "disabled|required|verify_ca|verify_identity", "ca_pem": "..."}`, default `required`),
-`server_id`, `snapshot_batch_size`.
+`server_id`, `snapshot_batch_size`, `provider` (`rds`, `aurora`,
+`cloud_sql`, `azure`; optional, detected from `*.rds.amazonaws.com` and
+`*.mysql.database.azure.com` hosts: failed checks then name that service's
+parameter group, flag or procedure).
 
 - `binlog_format = ROW`, `binlog_row_image = FULL`; GTIDs
   (`gtid_mode = ON`, `enforce_gtid_consistency = ON`) recommended, file +
   position otherwise (always on MariaDB).
 - `REPLICATION SLAVE`, `REPLICATION CLIENT`, `SELECT` on the tables.
-- Binlog retention longer than any downtime, or the sync resyncs.
+- Binlog retention longer than any downtime, or the sync resyncs. RDS and
+  Aurora: `CALL mysql.rds_set_configuration('binlog retention hours', 72)`
+  (RDS keeps none by default, and writes binlogs only with automated
+  backups on; Aurora needs `binlog_format` set in the cluster parameter
+  group). Cloud SQL: point-in-time recovery on, `binlog_expire_logs_seconds`
+  flag. Azure: `binlog_expire_logs_seconds` (0, the default, purges at once).
+- PlanetScale (Vitess) exposes no MySQL binlog to external readers: not
+  supported yet.
 
 ### MongoDB
 

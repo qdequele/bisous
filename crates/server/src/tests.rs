@@ -335,6 +335,7 @@ fn app_tweaked(
         hosted: false,
         external_ids: None,
         aws_principal: test_principal(),
+        egress_ips: Vec::new(),
         usage_idle_flush: crate::usage::DEFAULT_IDLE_FLUSH,
         limits,
     };
@@ -1113,6 +1114,7 @@ async fn a_loopback_destination_is_host_not_allowed_with_the_real_sinks() {
             hosted: false,
             external_ids: None,
             aws_principal: test_principal(),
+            egress_ips: Vec::new(),
             usage_idle_flush: crate::usage::DEFAULT_IDLE_FLUSH,
             limits: Limits::default(),
         },
@@ -3326,6 +3328,40 @@ async fn the_trust_route_gives_each_tenant_its_own_external_id_and_policy() {
         body["trust_policy"]["Statement"][0]["Principal"]["AWS"],
         crate::external_id::PRINCIPAL_PLACEHOLDER
     );
+}
+
+/// `GET /network` gives the published egress addresses (empty when the
+/// operator has not set them), to any authenticated caller, never anonymous.
+#[tokio::test]
+async fn the_network_route_lists_the_egress_addresses() {
+    let a = app_tweaked(
+        locked(),
+        Arc::new(MemStore::new()),
+        HostPolicy::any(),
+        Limits::default(),
+        Duration::from_millis(200),
+        |w| w.egress_ips = vec!["203.0.113.7".into(), "2001:db8::/64".into()],
+    );
+    let (status, body) = call(&a.router, "GET", "/network", &lab("team-a"), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body,
+        json!({"egress_ips": ["203.0.113.7", "2001:db8::/64"]})
+    );
+    let (status, _) = call(&a.router, "GET", "/network", &[], None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let plain = app_tweaked(
+        locked(),
+        Arc::new(MemStore::new()),
+        HostPolicy::any(),
+        Limits::default(),
+        Duration::from_millis(200),
+        |_| {},
+    );
+    let (status, body) = call(&plain.router, "GET", "/network", &admin(), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body, json!({"egress_ips": []}));
 }
 
 #[tokio::test]

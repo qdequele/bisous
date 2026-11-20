@@ -50,6 +50,7 @@ mod error;
 mod ident;
 mod lsn;
 mod pgoutput;
+mod provider;
 mod source;
 
 use meili_connect_core::{
@@ -57,6 +58,7 @@ use meili_connect_core::{
 };
 
 pub use config::{PostgresConfig, SslMode};
+pub use provider::Provider;
 pub use source::PostgresSource;
 
 /// Builds [`PostgresSource`]s for `postgres` and `supabase` specs.

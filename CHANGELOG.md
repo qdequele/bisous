@@ -51,6 +51,18 @@ All notable changes to meili-connect are listed here. The format follows
 
 ### Added
 
+- Hosted-database hints: `postgres` and `mysql` configs take an optional
+  `provider` (`neon`, `rds`, `aurora`, `cloud_sql`, `azure`; MySQL without
+  `neon`), also detected from RDS, Aurora, Neon and Azure host names. A
+  failed check then names that provider's fix: the parameter group, database
+  flag or server parameter for `wal_level` / the binlog settings, the grant
+  (`rds_replication`, `WITH REPLICATION`), binlog retention
+  (`mysql.rds_set_configuration`, Azure's `binlog_expire_logs_seconds = 0`
+  now warns), and the network allow-list on a connection failure. A Neon
+  pooled host (`-pooler`) is refused with the direct host to use instead.
+- `GET /network` lists the server's egress addresses (`CONNECT_EGRESS_IPS`)
+  for database allow-lists.
+
 - Postgres and Supabase: `manage_publication: false` (default `true`) uses a
   publication managed elsewhere, named by the then required
   `publication_name`. The sync never creates, alters or drops it and needs

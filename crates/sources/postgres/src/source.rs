@@ -133,6 +133,10 @@ impl PostgresSource {
         self.settings.conn.supabase
     }
 
+    pub(crate) fn provider(&self) -> Option<crate::provider::Provider> {
+        self.settings.conn.provider
+    }
+
     pub(crate) fn table_list(&self) -> Vec<(String, String)> {
         self.targets
             .iter()
