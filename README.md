@@ -478,8 +478,8 @@ parameter group, flag or procedure).
   backups on; Aurora needs `binlog_format` set in the cluster parameter
   group). Cloud SQL: point-in-time recovery on, `binlog_expire_logs_seconds`
   flag. Azure: `binlog_expire_logs_seconds` (0, the default, purges at once).
-- PlanetScale (Vitess) exposes no MySQL binlog to external readers: not
-  supported yet.
+- PlanetScale (Vitess) exposes no MySQL binlog to external readers: use
+  the [`planetscale`](#planetscale) source.
 
 ### MongoDB
 
@@ -563,6 +563,30 @@ instead, with no key.
   re-sent), a restarted one resyncs into shadow indexes. The emulator
   re-sends on every resume, so there a restart always resyncs.
 - The key is sent only to Google: its `token_uri` is ignored.
+
+### PlanetScale
+
+`"kind": "planetscale"`, for PlanetScale's MySQL databases (Vitess). They
+serve no binlog to outside readers, so changes come from Vitess's
+**VStream** API (gRPC over TLS), like PlanetScale's own connectors.
+PlanetScale Postgres is the [Postgres](#postgres) source.
+
+Config: `host` (the database's host, e.g. `aws.connect.psdb.cloud`),
+`database`, `user`, `password` (a PlanetScale password, `pscale_pw_…`), and
+optional `grpc_port` (443, VStream), `mysql_port` (3306, discovery and the
+first copy), `tls` (`true`; `false` only for a local Vitess),
+`tablet_type` (`primary`, `replica`, `rdonly`), `cells` (default
+PlanetScale's own cell on `*.psdb.cloud`), `snapshot_batch_size`.
+
+- Collections are `database.table`, all in the configured database; every
+  table needs a primary key. Documents are the same JSON as the `mysql`
+  source's.
+- A password with read access is enough: nothing is created on the
+  database. VStream and the MySQL protocol use the same credentials.
+- The checkpoint is every shard's GTID set. A sync stopped longer than the
+  binlog retention of a shard resyncs.
+- Tested against a two-shard `vttestserver`
+  (`crates/sources/planetscale/tests/live.rs`, `VITESS_TEST_CONFIG`).
 
 ## Guarantees and known limits
 

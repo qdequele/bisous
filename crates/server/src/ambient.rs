@@ -133,7 +133,10 @@ pub fn ambient_identity(spec: &SourceSpec) -> Option<String> {
                     )
                 })
         }
-        SourceKind::Kafka | SourceKind::Mysql | SourceKind::Firestore => None,
+        // PlanetScale: a user and password on the host's own ports, no file.
+        SourceKind::Kafka | SourceKind::Mysql | SourceKind::Firestore | SourceKind::Planetscale => {
+            None
+        }
     }
 }
 
