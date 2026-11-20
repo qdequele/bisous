@@ -1,6 +1,6 @@
 # Connect with Supabase (OAuth): design
 
-Status: **draft for review**. Nothing here is built yet.
+Status: **accepted and built** (2026-11-20). Section 11 lists where the build differs from this design.
 
 Today a Supabase sync needs the project's direct connection string, with the
 `postgres` password, pasted into the Lab console. This page designs a
@@ -248,12 +248,13 @@ retries; the new password is stored before step 1.
    connection. The console lists those syncs and offers to delete them
    first; deleting a sync drops its slot and publication.
 2. For each project: drop any `meili_connect_lab_*` publication carrying our
-   comment, drop the role's inactive slots, then `drop owned by <role>;
-   drop role <role>`. `DROP OWNED` is what revokes the grants.
+   comment, then `drop owned by <role>; drop role <role>`. `DROP OWNED` is
+   what revokes the grants. Slots are not dropped here: each sync drops its
+   own slot when it is deleted, and a slot has no owner to find it by.
 3. Revoke the token at Supabase (`/v1/oauth/revoke`), then delete the rows.
 
-A failed step leaves the row in place with `status: error`, so Disconnect
-can be retried.
+A failed step leaves the rows in place with the error, so Disconnect can be
+retried.
 
 **User revokes the app on Supabase's side.** We learn it from the next 401:
 the connection becomes `revoked`.
@@ -275,7 +276,7 @@ the connection becomes `revoked`.
 
 1. `manage_publication: false`, as §5 describes: config, check, open,
    teardown, the OpenAPI `SourceSpec` note, and tests (unit tests plus a live
-   test gated on `POSTGRES_TEST_URL`).
+   test gated on `PG_TEST_URL`).
 2. **RLS check.** In `check`, a mapped table with `relrowsecurity`, when the
    role is neither its owner, nor a superuser, nor `BYPASSRLS`, is
    `failed`: "row-level security is on and the role does not bypass it: the
@@ -369,9 +370,41 @@ Lab vendors the new `openapi.yaml`, and the Lab PR that uses
   seconds.
 - **We hold org-wide `database:write` tokens.** That is a high-value secret.
   It is encrypted at rest, used only by the services above, never returned
-  by the API, and every SQL statement we send is written to the team's audit
-  log (without the verifier). Supabase may later let users limit a grant to
+  by the API. The Lab has no team audit log yet: the SQL it runs is in its
+  logs only through errors (see section 11). Supabase may later let users limit a grant to
   some projects (`project_refs`); we honour it when it is not null.
 - **WAL retention.** We do not change `max_slot_wal_keep_size`: that
   restarts the user's database. The engine's lag guard already holds a sync
   before it hurts.
+
+## 11. As built
+
+Where the build differs from the sections above:
+
+- **No IPv4 add-on lookup.** The hosted engine reaches IPv6, so the
+  `billing/addons` call was left out: it would cost one rate-limited call per
+  project for a hint nobody needs.
+- **The check grants SELECT.** `POST /sources/check` with a project source
+  grants `SELECT` on the probed tables first, so the check reports on the
+  role as the sync will use it, RLS included. The Lab answers the check's
+  `publication` item itself ("the Lab creates the publication when the sync
+  is saved"), because the publication is only made with the sync. `SELECT`
+  on a table no sync maps is revoked after the next sync write or delete of
+  that project.
+- **The publication of a failed call.** If the destination is refused before
+  the engine call, or the engine refuses the sync, the new publication is
+  dropped again, and a changed one gets its tables back. After an engine
+  timeout a new publication is kept as an orphan, because the engine may hold
+  the sync. Orphans are listed with their `DROP PUBLICATION` SQL on the team
+  page.
+- **`slot_name` is refused** with `manage_publication: false`. Only the slot
+  name derived from the sync id marks a slot as the sync's, so a custom name
+  would leak the slot.
+- **One organization per team.** "Switch organization" authorizes again and
+  replaces the tokens. Provisioned projects stay, and they work again as soon
+  as the new grant reaches them.
+- **Console.** The Supabase source has a third mode, "Your Supabase account",
+  which is the default. Its config is `{"project": "<id>"}` and nothing else.
+  The team page has a Supabase card: the projects, password rotation (owner
+  or admin), cleanup SQL and Disconnect.
+
