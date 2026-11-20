@@ -88,6 +88,20 @@ All notable changes to meili-connect are listed here. The format follows
   flapping sync sends one event, not one per flap. The Lab events schema is
   vendored in `contracts/vendor/lab/` and drift-checked in CI. See
   `docs/LAB_INTEGRATION.md`, "Sync state event".
+- Lab mode: a `sync.health_changed` event warns the Lab when a tenant's
+  sync gets dangerous for its source, and says when it is fine again:
+  `lag` (a streaming sync behind by `SYNC_LAG_WARN_SECS`, default 900 s) and
+  `wal_retained` (the WAL a Postgres or Supabase replication slot keeps on
+  the customer's database reaches `SYNC_WAL_WARN_BYTES`, default 1 GiB, or
+  half of a positive `max_slot_wal_keep_size`). The slot is measured every
+  `SYNC_HEALTH_INTERVAL_SECS` (default 300 s, `0` turns the probe off) in
+  every phase where it exists, paused, held and failed included: a stopped
+  sync's slot keeps WAL until the disk fills or the slot is invalidated.
+  `ok` comes back only under 80 % of the threshold, and changes settle like
+  state changes. See `docs/LAB_INTEGRATION.md`, "Sync health event".
+- `Source::retention` (core): what a sync keeps on its origin, read on a
+  short-lived connection in any phase; Postgres reads its slot's retained
+  WAL, `wal_status` and `max_slot_wal_keep_size`.
 - The coarse errors a Lab tenant sees name their cause more precisely
   (credentials refused, host not found, configuration, API key refused,
   index refused) without adding any detail from the driver or the server.

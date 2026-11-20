@@ -169,6 +169,20 @@ impl SyncManager {
         &self.sync_events
     }
 
+    pub(crate) fn backend(&self) -> &Arc<dyn Backend> {
+        &self.backend
+    }
+
+    /// The stored phase of a sync (`None`: none stored, or unreadable).
+    pub(crate) async fn state_phase(&self, sync_id: &str) -> Option<SyncPhase> {
+        self.store
+            .load(sync_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|s| s.phase)
+    }
+
     async fn serialize(&self, sync_id: &str) -> tokio::sync::OwnedMutexGuard<()> {
         let op = Arc::clone(lock(&self.ops).entry(sync_id.to_owned()).or_default());
         op.lock_owned().await
@@ -199,7 +213,7 @@ impl SyncManager {
 
     /// The connectors of one sync, behind the host policy; coarse errors
     /// for a tenant's sync.
-    fn guarded_sources(&self, spec: &SyncSpec) -> GuardedSources {
+    pub(crate) fn guarded_sources(&self, spec: &SyncSpec) -> GuardedSources {
         GuardedSources::new(
             Arc::clone(&self.sources),
             Arc::clone(&self.policy),

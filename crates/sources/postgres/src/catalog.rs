@@ -430,6 +430,41 @@ pub async fn slot(sql: &Sql, name: &str) -> Result<Option<SlotInfo>, SourceError
     }))
 }
 
+/// The WAL the slot `name` of this database keeps, with the server's cap
+/// (`max_slot_wal_keep_size`, in bytes, `None` when unlimited or unknown)
+/// and its `wal_status`. `None` when the slot does not exist or keeps
+/// nothing (invalidated: no `restart_lsn`).
+pub async fn slot_retention(
+    sql: &Sql,
+    name: &str,
+) -> Result<Option<meili_connect_core::Retention>, SourceError> {
+    // `to_jsonb` keeps `wal_status` optional; `current_setting(.., true)`
+    // is NULL where the setting does not exist (before 13).
+    let rows = sql
+        .query(
+            "SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), s.restart_lsn)::bigint, \
+                    to_jsonb(s)->>'wal_status', \
+                    pg_size_bytes(NULLIF(current_setting('max_slot_wal_keep_size', true), ''))::bigint \
+             FROM pg_replication_slots s \
+             WHERE s.slot_name = $1 AND s.database = current_database()",
+            &[&name],
+        )
+        .await?;
+    let Some(row) = rows.first() else {
+        return Ok(None);
+    };
+    let Some(retained) = col::<Option<i64>>(row, 0)? else {
+        return Ok(None);
+    };
+    let status: Option<String> = col(row, 1)?;
+    let limit: Option<i64> = col(row, 2)?;
+    Ok(Some(meili_connect_core::Retention {
+        bytes: u64::try_from(retained).unwrap_or(0),
+        limit_bytes: limit.and_then(|l| u64::try_from(l).ok()),
+        status,
+    }))
+}
+
 impl SlotInfo {
     /// Why the slot cannot stream any more, if it cannot.
     pub fn lost_reason(&self) -> Option<String> {

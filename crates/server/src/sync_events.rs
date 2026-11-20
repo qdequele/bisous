@@ -25,8 +25,13 @@
 //! retried at the next tick. A change still waiting when the process stops
 //! gracefully is sent then; one waiting at a crash is lost (the Lab then
 //! learns the phase at the next change).
+//!
+//! `sync.health_changed` (`crate::sync_health`) rides the same machinery:
+//! per (sync, cause) status changes wait for the same settle window, go
+//! through the same queue and outbox, and a deleted or forgotten sync drops
+//! its health state with the rest.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -38,6 +43,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::limits::LogLimiter;
 use crate::reason;
+use crate::sync_health::{self, Cause, HealthTrack, Reading};
 use crate::usage::{PRODUCT, description};
 
 /// The Lab event type.
@@ -100,6 +106,8 @@ struct Tracked {
     /// What the Lab was told last (or the phase found at the first save).
     reported: Option<SyncPhase>,
     pending: Option<Change>,
+    /// `sync.health_changed`, per cause (`crate::sync_health`).
+    health: BTreeMap<Cause, HealthTrack>,
 }
 
 #[derive(Debug, Default)]
@@ -233,9 +241,32 @@ impl SyncEvents {
                         current: None,
                         reported: None,
                         pending: None,
+                        health: BTreeMap::new(),
                     },
                 );
             }
+        }
+    }
+
+    /// Whether the sync is reported (a Lab tenant's, with the Lab events
+    /// on).
+    pub fn tracks(&self, sync_id: &str) -> bool {
+        self.lock().syncs.contains_key(sync_id)
+    }
+
+    /// A health measure of a tracked sync (`crate::sync_health`): a status
+    /// change waits for the settle window like a phase change. `state` is
+    /// the sync's phase when it was measured.
+    pub fn observe_health(
+        &self,
+        sync_id: &str,
+        cause: Cause,
+        reading: Reading,
+        state: Option<SyncPhase>,
+    ) {
+        let mut inner = self.lock();
+        if let Some(t) = inner.syncs.get_mut(sync_id) {
+            t.health.entry(cause).or_default().observe(reading, state);
         }
     }
 
@@ -373,10 +404,7 @@ impl SyncEvents {
                     .pending
                     .as_ref()
                     .is_some_and(|p| force || p.since.elapsed() >= self.settle);
-                if !due {
-                    continue;
-                }
-                if let Some(change) = t.pending.take() {
+                if due && let Some(change) = t.pending.take() {
                     if let Reported::Phase(p) = change.to {
                         t.reported = Some(p);
                     }
@@ -385,6 +413,15 @@ impl SyncEvents {
                         t.tenant.clone(),
                         event(id, &t.tenant, &t.label, &change),
                     );
+                }
+                for (cause, track) in &mut t.health {
+                    if let Some(change) = track.take_due(self.settle, force) {
+                        push(
+                            queue,
+                            t.tenant.clone(),
+                            sync_health::event(id, &t.tenant, &t.label, *cause, &change),
+                        );
+                    }
                 }
             }
             if queue.is_empty() {
@@ -413,7 +450,7 @@ impl SyncEvents {
                 Err(e) => {
                     self.lock().queue.push_front((tenant, payload));
                     self.warn(format_args!(
-                        "cannot enqueue sync state changes ({e}); retrying"
+                        "cannot enqueue sync state or health changes ({e}); retrying"
                     ));
                     break;
                 }
@@ -796,6 +833,129 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(events.flush(false).await, 1, "sent once there is room");
+    }
+
+    // ------------------------------------------------ sync.health_changed
+
+    use crate::sync_health::{self as health, Cause, HealthConfig, Reading};
+
+    fn wal(bytes: u64, limit: Option<u64>) -> Reading {
+        Reading::wal(
+            Some(&meili_connect_core::Retention {
+                bytes,
+                limit_bytes: limit,
+                status: Some("reserved".into()),
+            }),
+            &HealthConfig::default(),
+        )
+    }
+
+    const GIB: u64 = 1 << 30;
+
+    #[test]
+    fn every_health_event_matches_the_contract() {
+        let id = uuid::Uuid::now_v7();
+        let readings = [wal(0, None), wal(3 * GIB, Some(GIB)), wal(5, Some(0))];
+        let states = [
+            None,
+            Some(SyncPhase::Streaming),
+            Some(SyncPhase::Paused),
+            Some(SyncPhase::Held),
+            Some(SyncPhase::Failed),
+            Some(SyncPhase::SourcePaused),
+            Some(SyncPhase::Snapshotting),
+        ];
+        for cause in [Cause::Lag, Cause::WalRetained] {
+            for status in [health::Status::Ok, health::Status::Warning] {
+                for reading in readings {
+                    for state in states {
+                        let c = health::HealthChange {
+                            status,
+                            reading,
+                            state,
+                            at: Utc::now(),
+                            since: Instant::now(),
+                        };
+                        assert_valid(&health::event("s1", TENANT, "l", cause, &c), id);
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn health_changes_are_reported_per_cause_once_settled() {
+        let (store, events) = setup(Duration::from_millis(300));
+        events.baseline("s1", Some(&state("s1", SyncPhase::Paused, false, None)));
+        let paused = Some(SyncPhase::Paused);
+        // A paused sync's slot over its cap's half: warning (settled).
+        events.observe_health("s1", Cause::WalRetained, wal(600 << 20, Some(GIB)), paused);
+        assert_eq!(events.flush(false).await, 0, "not settled yet");
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        assert_eq!(events.flush(false).await, 1);
+        // Lag is another cause: its own change.
+        let lag = Reading::lag(1000.0, &HealthConfig::default());
+        events.observe_health("s1", Cause::Lag, lag, Some(SyncPhase::Streaming));
+        assert_eq!(events.flush(true).await, 1);
+        // Hovering in the band, or still over: nothing.
+        for b in [GIB / 2 - 1, 2 * GIB, GIB * 9 / 20] {
+            events.observe_health("s1", Cause::WalRetained, wal(b, Some(GIB)), paused);
+        }
+        assert_eq!(events.flush(true).await, 0);
+        // Flapping across inside the window: nothing.
+        for _ in 0..10 {
+            events.observe_health("s1", Cause::WalRetained, wal(0, Some(GIB)), paused);
+            events.observe_health("s1", Cause::WalRetained, wal(GIB, Some(GIB)), paused);
+        }
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        assert_eq!(events.flush(false).await, 0, "back where the Lab is");
+        // Well under: ok.
+        events.observe_health("s1", Cause::WalRetained, wal(GIB / 10, Some(GIB)), paused);
+        assert_eq!(events.flush(true).await, 1);
+        let all = sent(&store).await;
+        assert_eq!(all.len(), 3);
+        assert!(all.iter().all(|e| e["type"] == health::EVENT_TYPE));
+        assert_eq!(
+            all[0]["data"],
+            json!({"sync_id": "s1", "sync_name": "postgres → products", "status": "warning",
+                   "cause": "wal_retained", "state": "paused",
+                   "retained_wal_bytes": 600u64 << 20, "threshold": GIB / 2,
+                   "source_limit_bytes": GIB})
+        );
+        assert_eq!(all[1]["data"]["cause"], "lag");
+        assert_eq!(all[1]["data"]["lag_seconds"], 1000);
+        assert_eq!(all[1]["data"]["threshold"], 900);
+        assert_eq!(all[2]["data"]["status"], "ok");
+        assert_eq!(all[2]["data"]["retained_wal_bytes"], GIB / 10);
+    }
+
+    #[tokio::test]
+    async fn a_deleted_sync_drops_its_pending_health() {
+        let (store, events) = setup(Duration::from_secs(3600));
+        events.baseline("s1", Some(&state("s1", SyncPhase::Failed, false, None)));
+        events.observe_health("s1", Cause::WalRetained, wal(2 * GIB, None), None);
+        events.deleted("s1");
+        assert_eq!(events.flush(true).await, 1, "only the deletion");
+        let all = sent(&store).await;
+        assert_eq!(all[0]["type"], EVENT_TYPE);
+        // Measures of an untracked sync are ignored.
+        events.observe_health("s1", Cause::WalRetained, wal(2 * GIB, None), None);
+        assert!(!events.tracks("s1"));
+        assert_eq!(events.flush(true).await, 0);
+    }
+
+    #[tokio::test]
+    async fn health_of_global_syncs_and_without_the_lab_is_not_reported() {
+        let (store, events) = setup(Duration::ZERO);
+        events.register(&spec("g", None));
+        assert!(!events.tracks("g"));
+        events.observe_health("g", Cause::WalRetained, wal(2 * GIB, None), None);
+        assert_eq!(events.flush(true).await, 0);
+        assert!(sent(&store).await.is_empty());
+        let off = SyncEvents::disabled();
+        off.register(&spec("s1", Some(TENANT)));
+        off.observe_health("s1", Cause::WalRetained, wal(2 * GIB, None), None);
+        assert_eq!(off.flush(true).await, 0);
     }
 
     #[test]

@@ -12,6 +12,7 @@ use meili_connect_core::{Endpoint, HostPolicy, Secret};
 use thiserror::Error;
 
 use crate::limits::Limits;
+use crate::sync_health::HealthConfig;
 use crate::tinybird::TinybirdConfig;
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -76,6 +77,10 @@ pub struct Config {
     /// How long a sync's new phase must hold before `sync.state_changed`
     /// reports it (`crate::sync_events`).
     pub sync_events_settle: Duration,
+    /// The health probe of Lab tenants' syncs and its thresholds
+    /// (`SYNC_HEALTH_INTERVAL_SECS`, `SYNC_LAG_WARN_SECS`,
+    /// `SYNC_WAL_WARN_BYTES`; `crate::sync_health`).
+    pub sync_health: HealthConfig,
     /// How often the Lab sender looks for due events.
     pub lab_send_interval: Duration,
     /// Time limit of `/sources/check` and `/sources/discover`.
@@ -347,6 +352,11 @@ impl Config {
             usage_flush_interval: secs(&get, "USAGE_FLUSH_INTERVAL_SECS", 60, 1, 3600)?,
             usage_idle_flush: secs(&get, "USAGE_IDLE_FLUSH_SECS", 3600, 1, 86_400)?,
             sync_events_settle: secs(&get, "SYNC_EVENTS_SETTLE_SECS", 30, 0, 3600)?,
+            sync_health: HealthConfig {
+                interval: secs(&get, "SYNC_HEALTH_INTERVAL_SECS", 300, 0, 86_400)?,
+                lag_warn_secs: num(&get, "SYNC_LAG_WARN_SECS", 900, 1, 365 * 86_400)?,
+                wal_warn_bytes: num(&get, "SYNC_WAL_WARN_BYTES", 1 << 30, 1, u64::MAX)?,
+            },
             lab_send_interval: secs(&get, "LAB_SEND_INTERVAL_SECS", 2, 1, 300)?,
             source_probe_timeout: secs(&get, "SOURCE_PROBE_TIMEOUT_SECS", 30, 1, 600)?,
             shutdown_grace,
@@ -523,6 +533,33 @@ mod tests {
         let c = cfg(&[("ADMIN_API_KEY", "k"), ("SYNC_EVENTS_SETTLE_SECS", "0")]).unwrap();
         assert_eq!(c.sync_events_settle, Duration::ZERO);
         assert!(cfg(&[("ADMIN_API_KEY", "k"), ("SYNC_EVENTS_SETTLE_SECS", "3601")]).is_err());
+    }
+
+    #[test]
+    fn health_probe_defaults_and_bounds() {
+        let c = cfg(&[("ADMIN_API_KEY", "k")]).unwrap();
+        assert_eq!(c.sync_health, HealthConfig::default());
+        assert_eq!(c.sync_health.interval, Duration::from_secs(300));
+        assert_eq!(c.sync_health.lag_warn_secs, 900);
+        assert_eq!(c.sync_health.wal_warn_bytes, 1 << 30);
+        let c = cfg(&[
+            ("ADMIN_API_KEY", "k"),
+            ("SYNC_HEALTH_INTERVAL_SECS", "0"),
+            ("SYNC_LAG_WARN_SECS", "60"),
+            ("SYNC_WAL_WARN_BYTES", "1048576"),
+        ])
+        .unwrap();
+        assert_eq!(c.sync_health.interval, Duration::ZERO, "0 turns it off");
+        assert_eq!(c.sync_health.lag_warn_secs, 60);
+        assert_eq!(c.sync_health.wal_warn_bytes, 1 << 20);
+        for (k, v) in [
+            ("SYNC_LAG_WARN_SECS", "0"),
+            ("SYNC_WAL_WARN_BYTES", "0"),
+            ("SYNC_WAL_WARN_BYTES", "1GB"),
+            ("SYNC_HEALTH_INTERVAL_SECS", "86401"),
+        ] {
+            assert!(cfg(&[("ADMIN_API_KEY", "k"), (k, v)]).is_err(), "{k}={v}");
+        }
     }
 
     #[test]

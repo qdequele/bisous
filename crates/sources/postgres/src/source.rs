@@ -6,8 +6,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use meili_connect_core::{
     AckReceiver, Capabilities, Change, CheckReport, Checkpoint, CollectionInfo, EventSender,
-    FieldInfo, Lag, LagReporter, Op, Opened, Source, SourceError, SourceEvent, SourceKind,
-    seconds_since_unix_millis,
+    FieldInfo, Lag, LagReporter, Op, Opened, Retention, Source, SourceError, SourceEvent,
+    SourceKind, seconds_since_unix_millis,
 };
 use pgwire_replication::{Lsn, ReplicationClient, ReplicationEvent};
 use tokio_postgres::SimpleQueryMessage;
@@ -932,6 +932,13 @@ impl Source for PostgresSource {
 
     fn report_lag(&mut self, reporter: LagReporter) {
         self.lag = Some(reporter);
+    }
+
+    /// One query on a connection of its own, closed after: the stream's
+    /// sessions are never touched, whatever phase the sync is in.
+    async fn retention(&mut self) -> Result<Option<Retention>, SourceError> {
+        let sql = conn::connect_sql(&self.settings.conn, &CancellationToken::new()).await?;
+        catalog::slot_retention(&sql, &self.settings.slot).await
     }
 }
 

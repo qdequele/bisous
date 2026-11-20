@@ -25,7 +25,7 @@ Crawler (scrapix).
 
 | Crate | Role |
 |---|---|
-| `core` | Contracts only: `Change`, `Checkpoint`, `Source` (with `report_lag`), `SourceFactory` (with `endpoints`), `Sink`, `StateStore` (`record_progress` takes a `Progress` with its `Usage`), `SyncSpec`, errors, `Secret`, `document_id`, `Lag` / `LagReporter`, and `HostPolicy`. No I/O but the DNS lookup of `HostPolicy`. |
+| `core` | Contracts only: `Change`, `Checkpoint`, `Source` (with `report_lag` and `retention`), `SourceFactory` (with `endpoints`), `Sink`, `StateStore` (`record_progress` takes a `Progress` with its `Usage`), `SyncSpec`, errors, `Secret`, `document_id`, `Lag` / `LagReporter`, and `HostPolicy`. No I/O but the DNS lookup of `HostPolicy`. |
 | `sink` | `MeiliSink`: NDJSON batches, task polling, poison-document bisection, swap, settings copy. |
 | `engine` | `run_sync`: drives one sync through its lifecycle; `Supervisor`: runs many, restarts with backoff. Depends on the three traits only. |
 | `store` | Postgres (`sqlx`): sync specs with sealed secrets, `SyncState`, dead letters, progress counters and units, pending usage, the events outbox (one lane per consumer). Also an in-memory store for tests and single-node trials. |
@@ -108,6 +108,15 @@ The engine clears it whenever a run stops streaming; `SyncStatus` carries it
 with the time since the last checkpoint, which the server's lag guard
 (`MAX_LAG_HOLD_*`) uses to warn about a stuck sync. Nothing is dropped
 automatically.
+
+`Source::retention` measures what a sync keeps on its origin in any phase,
+on a fresh value that is never opened and a short-lived connection of its
+own (Postgres: `pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)` of the
+sync's slot, its `wal_status`, `max_slot_wal_keep_size`). The default keeps
+nothing measurable. The server's health probe (`crate::sync_health`) calls
+it through the guarded registry (host policy applied) for Lab tenants'
+Postgres and Supabase syncs, a few at a time with a time limit, and
+reports `sync.health_changed`.
 
 ## Sources
 
