@@ -614,6 +614,25 @@ From [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md):
   emptying the index. `POST /release` applies it.
 - A document Meilisearch refuses goes to the dead letters; the sync carries
   on.
+- **Indexes it creates are set up for a lighter index.** An index the sync
+  creates when it starts gets `proximityPrecision: byAttribute` and
+  `wordPosition.enabled: false` (a setting the Meilisearch does not know is
+  left out). Less to index for tables that can be large, at a cost in
+  search:
+  - a phrase search is no longer exact: `"new york"` matches every document
+    with both words in the same attribute, in any order and at any distance
+    (checked on Meilisearch 1.58);
+  - proximity only ranks on "same attribute", and the `wordPosition` rule
+    (words earlier in an attribute first) no longer sorts anything.
+
+  An index that already exists keeps its settings, and so does one that is
+  rebuilt. To choose otherwise, create the index yourself before the sync
+  (and let that finish: work still queued on the index is waited for, but a
+  creation sent at the very moment the sync starts can still get these
+  settings), or change its settings afterwards. The Meilisearch key needs
+  `settings.update` and `indexes.update` from the first sync on, next to
+  `indexes.create`. An index deleted while its sync streams comes back with
+  Meilisearch's own defaults: the next document write recreates it.
 
 Known limits:
 

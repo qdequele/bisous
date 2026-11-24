@@ -163,7 +163,31 @@ refuses none.
 - Every task is polled to a terminal state. A failed document task is
   bisected until the offending documents are isolated and returned as
   `rejected`.
-- `ensure_index` refuses an existing index with another primary key.
+- `ensure_index` refuses an existing index with another primary key. A
+  missing index is created by a settings update that carries the creation
+  defaults, then given its primary key (`PATCH /indexes/{uid}`), so it never
+  exists without them: a failure in between leaves an index without a
+  primary key, which the next run completes.
+  - The defaults: `proximityPrecision: byAttribute` and
+    `wordPosition.enabled: false`. A lighter index, paid for in search: a
+    phrase search matches any document with the words in the same attribute
+    (no order, no distance), proximity ranks on that alone, and the
+    `wordPosition` rule sorts nothing.
+  - A Meilisearch that does not know a setting (400 `bad_request` naming
+    the field) gets the older ones only, and a bare `POST /indexes` when it
+    knows none. Any other refusal fails the creation: a default is never
+    dropped silently.
+  - An index that exists is left as it is. A settings update, unlike `POST
+    /indexes`, does not fail on an index that appears before it runs, so
+    work still queued on the uid (`GET /tasks?indexUids=…&statuses=enqueued,
+    processing`) is waited for first and the index read again. What is left
+    is a creation somebody enqueues between that check and the sink's own
+    request: it gets the defaults.
+  - A shadow is created with the defaults, then `copy_settings` replaces
+    them with the live index's (it sends the whole `GET /settings`).
+  - Only `ensure_index` creates indexes on purpose (when a sync starts). An
+    index deleted while its sync streams is recreated by the next document
+    write, with Meilisearch's defaults.
 
 ## Tenancy and the Lab
 
