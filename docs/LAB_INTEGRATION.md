@@ -196,7 +196,7 @@ engine sends it (it does since the schema has `syncStateData`).
 | `invalid_config` | The source configuration or the sync spec is invalid |
 | `resync_budget_spent` | The position was lost again after the allowed resyncs in a row |
 | `destination_auth` | Meilisearch refused the API key |
-| `destination_rejected` | Meilisearch refused the index (primary key) or the documents |
+| `destination_rejected` | Meilisearch refused the index (primary key) or the documents, or an index that holds documents cannot be rebuilt aside because its embedder has an API key (its own message says to empty the index or remove the key) |
 | `destination_unreachable` | Meilisearch does not answer (also a batch held after failing 10 times) |
 | `delete_guard` | A truncate or a mass delete was held back |
 | `internal` | Anything else |

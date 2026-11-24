@@ -54,6 +54,15 @@ pub struct SyncState {
     /// resync persisted before this field existed: metered as `System`).
     #[serde(default)]
     pub resync_reason: Option<ResyncReason>,
+    /// The live indexes a snapshot in progress writes to directly because
+    /// they held no document when it started: every document in them comes
+    /// from this sync. If the snapshot is interrupted, the next run empties
+    /// them and fills them again in place instead of building a shadow index
+    /// (whose settings would have to be copied, which Meilisearch does not
+    /// allow for an embedder with an API key). Empty once the snapshot has
+    /// completed, and for a state saved before this field existed.
+    #[serde(default)]
+    pub filling: Vec<String>,
     pub updated_at: DateTime<Utc>,
 }
 

@@ -225,7 +225,7 @@ fn store_err(e: sqlx::Error) -> StoreError {
 impl StateStore for PgStore {
     async fn load(&self, sync_id: &str) -> Result<Option<SyncState>, StoreError> {
         let row = sqlx::query(
-            "SELECT sync_id, phase, checkpoint, message, resyncing, resync_reason, updated_at
+            "SELECT sync_id, phase, checkpoint, message, resyncing, resync_reason, filling, updated_at
              FROM sync_state WHERE sync_id = $1",
         )
         .bind(sync_id)
@@ -244,6 +244,7 @@ impl StateStore for PgStore {
             message: row.try_get("message").map_err(store_err)?,
             resyncing: row.try_get("resyncing").map_err(store_err)?,
             resync_reason: parse_reason(reason.as_deref()),
+            filling: row.try_get("filling").map_err(store_err)?,
             updated_at: row.try_get("updated_at").map_err(store_err)?,
         }))
     }
@@ -252,14 +253,15 @@ impl StateStore for PgStore {
         // One autocommitted statement: durable once it returns.
         sqlx::query(
             "INSERT INTO sync_state
-                (sync_id, phase, checkpoint, message, resyncing, resync_reason, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)
+                (sync_id, phase, checkpoint, message, resyncing, resync_reason, filling, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
              ON CONFLICT (sync_id) DO UPDATE SET
                 phase = EXCLUDED.phase,
                 checkpoint = EXCLUDED.checkpoint,
                 message = EXCLUDED.message,
                 resyncing = EXCLUDED.resyncing,
                 resync_reason = EXCLUDED.resync_reason,
+                filling = EXCLUDED.filling,
                 updated_at = EXCLUDED.updated_at",
         )
         .bind(&state.sync_id)
@@ -268,6 +270,7 @@ impl StateStore for PgStore {
         .bind(state.message.as_deref())
         .bind(state.resyncing)
         .bind(state.resync_reason.map(reason_str))
+        .bind(&state.filling)
         .bind(state.updated_at)
         .execute(&self.pool)
         .await
