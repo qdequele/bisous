@@ -630,6 +630,17 @@ components:
         sync_id: { type: string }
         phase: { $ref: "#/components/schemas/SyncPhase" }
         message: { type: [string, "null"], description: "Why the sync is held, failed or source-paused." }
+        reason:
+          type: [string, "null"]
+          description: |
+            The stable code of `message` while the sync is paused,
+            source-paused, held or failed; `null` otherwise. An open set:
+            `insufficient_credits`, `source_auth`, `source_unreachable`,
+            `source_config`, `invalid_config`, `resync_budget_spent`,
+            `destination_auth` (Meilisearch refused the API key),
+            `destination_rejected`, `destination_unreachable`,
+            `delete_guard`, `internal`. The same code as the `reason` of the
+            Lab's `sync.state_changed` event.
         has_checkpoint: { type: boolean, description: "False until the first snapshot completed." }
         resyncing: { type: boolean }
         updated_at: { type: [string, "null"], format: date-time }

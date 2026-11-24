@@ -180,7 +180,12 @@ engine sends it (it does since the schema has `syncStateData`).
   `failed`): a stable code from one mapping (`crates/server/src/reason.rs`).
   `message` is what `GET /syncs/{id}/status` shows the tenant: the coarse,
   fixed description of the error class, never a host, driver text or what a
-  remote server sent (cut at 1000 bytes).
+  remote server sent (cut at 1000 bytes). The status carries the same
+  `reason` next to it while the sync is stopped, so the Lab can act on a
+  sync it reads (a `destination_auth` hold gets a fresh `lab-connect` key)
+  without waiting for the event. What the remote server really answered is
+  in the engine's log only: Meilisearch's refusals at `warn`, the rest at
+  `debug`.
 
 | reason | When |
 |---|---|

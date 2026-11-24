@@ -15,9 +15,12 @@
 //!   the source and of the sink are reduced to their class and a fixed
 //!   description: no driver cause chain, nothing a remote server sent. The
 //!   policy's own refusals stay as they are (they name the host the tenant
-//!   gave, nothing else). The full error is logged for the operator.
+//!   gave, nothing else). The full error is logged for the operator: at
+//!   `debug`, and at `warn` when Meilisearch refused a request of a running
+//!   sync ([`CoarseSink`]).
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use meili_connect_core::{
@@ -28,6 +31,7 @@ use meili_connect_core::{
 use tokio_util::sync::CancellationToken;
 
 use crate::external_id::Binding;
+use crate::limits::LogLimiter;
 use crate::metrics::Metrics;
 
 /// Why a source spec did not pass the policy.
@@ -325,43 +329,101 @@ impl Source for GuardedSource {
 
 // ------------------------------------------------------------ sink
 
+/// How often one sync's refused Meilisearch requests are logged in detail.
+const REFUSAL_LOG_EVERY: Duration = Duration::from_secs(60);
+/// Longest detail logged: the text is whatever the destination answered.
+const REFUSAL_LOG_MAX: usize = 1_000;
+
 /// A sink whose errors are reduced to their class.
-pub struct CoarseSink(pub Arc<dyn Sink>);
+///
+/// The tenant only ever sees the class and its fixed description, so the
+/// operator's log is the one place that says what Meilisearch answered: a
+/// request it refused (`Config`, `Fatal`: the sync stops on it) is logged
+/// at `warn` with the sync, at most once per [`REFUSAL_LOG_EVERY`]. An
+/// outage (`Transient`) is retried and stays at `debug`. The text is what
+/// the destination answered (Meilisearch's message and code): the client
+/// never puts the API key in it, but a server chooses its own words, so the
+/// detail is cut at [`REFUSAL_LOG_MAX`] bytes and logged escaped, on one
+/// line.
+pub struct CoarseSink {
+    inner: Arc<dyn Sink>,
+    sync_id: String,
+    refusals: Mutex<LogLimiter>,
+}
+
+impl CoarseSink {
+    pub fn new(inner: Arc<dyn Sink>, sync_id: impl Into<String>) -> Self {
+        Self {
+            inner,
+            sync_id: sync_id.into(),
+            refusals: Mutex::new(LogLimiter::new(REFUSAL_LOG_EVERY)),
+        }
+    }
+
+    fn coarse(&self, e: SinkError) -> SinkError {
+        if refusal(&e) {
+            let allowed = self
+                .refusals
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .allow();
+            if let Some(suppressed) = allowed {
+                let detail = e.to_string();
+                let detail = &detail[..detail.floor_char_boundary(REFUSAL_LOG_MAX)];
+                tracing::warn!(
+                    sync_id = %self.sync_id,
+                    reason = crate::reason::classify_sink(&e).code(),
+                    error = ?detail,
+                    suppressed,
+                    "Meilisearch refused a request of a tenant's sync (reported coarsely)"
+                );
+            }
+        }
+        coarse_sink_error(e)
+    }
+}
+
+/// A request Meilisearch refused, as opposed to an outage the engine
+/// retries.
+fn refusal(e: &SinkError) -> bool {
+    matches!(e, SinkError::Config(_) | SinkError::Fatal(_))
+}
 
 #[async_trait]
 impl Sink for CoarseSink {
     async fn ensure_index(&self, target: &IndexTarget) -> Result<(), SinkError> {
-        self.0.ensure_index(target).await.map_err(coarse_sink_error)
+        let r = self.inner.ensure_index(target).await;
+        r.map_err(|e| self.coarse(e))
     }
 
     async fn apply(&self, target: &IndexTarget, ops: Vec<DocOp>) -> Result<ApplyReport, SinkError> {
-        self.0.apply(target, ops).await.map_err(coarse_sink_error)
+        let r = self.inner.apply(target, ops).await;
+        r.map_err(|e| self.coarse(e))
     }
 
     async fn swap(&self, a: &str, b: &str) -> Result<(), SinkError> {
-        self.0.swap(a, b).await.map_err(coarse_sink_error)
+        let r = self.inner.swap(a, b).await;
+        r.map_err(|e| self.coarse(e))
     }
 
     async fn delete_all_documents(&self, uid: &str) -> Result<(), SinkError> {
-        self.0
-            .delete_all_documents(uid)
-            .await
-            .map_err(coarse_sink_error)
+        let r = self.inner.delete_all_documents(uid).await;
+        r.map_err(|e| self.coarse(e))
     }
 
     async fn delete_index(&self, uid: &str) -> Result<(), SinkError> {
-        self.0.delete_index(uid).await.map_err(coarse_sink_error)
+        let r = self.inner.delete_index(uid).await;
+        r.map_err(|e| self.coarse(e))
     }
 
     async fn copy_settings(&self, from: &str, to: &str) -> Result<(), SinkError> {
-        self.0
-            .copy_settings(from, to)
-            .await
-            .map_err(coarse_sink_error)
+        let r = self.inner.copy_settings(from, to).await;
+        r.map_err(|e| self.coarse(e))
     }
 
     async fn document_count(&self, uid: &str) -> Result<Option<u64>, SinkError> {
-        self.0.document_count(uid).await.map_err(coarse_sink_error)
+        let r = self.inner.document_count(uid).await;
+        r.map_err(|e| self.coarse(e))
     }
 }
 
@@ -393,5 +455,140 @@ mod tests {
         let e = coarse_sink_error(SinkError::Fatal("HTTP 500: <html>".into()));
         assert!(matches!(e, SinkError::Fatal(_)));
         assert!(!e.to_string().contains("html"));
+    }
+
+    /// A sink that answers every call with one error.
+    struct Failing(fn() -> SinkError);
+
+    #[async_trait]
+    impl Sink for Failing {
+        async fn ensure_index(&self, _: &IndexTarget) -> Result<(), SinkError> {
+            Err((self.0)())
+        }
+        async fn apply(&self, _: &IndexTarget, _: Vec<DocOp>) -> Result<ApplyReport, SinkError> {
+            Err((self.0)())
+        }
+        async fn swap(&self, _: &str, _: &str) -> Result<(), SinkError> {
+            Err((self.0)())
+        }
+        async fn delete_all_documents(&self, _: &str) -> Result<(), SinkError> {
+            Err((self.0)())
+        }
+        async fn delete_index(&self, _: &str) -> Result<(), SinkError> {
+            Err((self.0)())
+        }
+        async fn copy_settings(&self, _: &str, _: &str) -> Result<(), SinkError> {
+            Err((self.0)())
+        }
+        async fn document_count(&self, _: &str) -> Result<Option<u64>, SinkError> {
+            Err((self.0)())
+        }
+    }
+
+    /// Log lines written while the returned guard lives, on this thread.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Captured {
+        fn start(&self) -> tracing::subscriber::DefaultGuard {
+            let out = self.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::INFO)
+                .with_ansi(false)
+                .with_writer(move || out.clone())
+                .finish();
+            tracing::subscriber::set_default(subscriber)
+        }
+
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap_or_else(PoisonError::into_inner))
+                .into_owned()
+        }
+    }
+
+    /// What Meilisearch answered is nowhere else once the error is coarse:
+    /// the operator's log (at `info` in production) must hold it.
+    #[tokio::test]
+    async fn a_refused_request_is_logged_in_detail_for_the_operator() {
+        let log = Captured::default();
+        let _guard = log.start();
+        let sink = CoarseSink::new(
+            Arc::new(Failing(|| {
+                SinkError::Config(
+                    "add documents: The provided API key is invalid. (invalid_api_key)".into(),
+                )
+            })),
+            "sync-1",
+        );
+
+        let e = sink.document_count("movies").await.unwrap_err();
+        // The tenant still gets the fixed description only.
+        assert!(matches!(e, SinkError::Config(_)));
+        assert!(!e.to_string().contains("invalid_api_key"), "{e}");
+        let text = log.text();
+        assert!(text.contains("WARN"), "{text}");
+        assert!(text.contains("sync-1"), "{text}");
+        assert!(text.contains("destination_auth"), "{text}");
+        assert!(text.contains("invalid_api_key"), "{text}");
+
+        // A sync that keeps failing does not flood the log.
+        for _ in 0..5 {
+            assert!(sink.delete_index("movies").await.is_err());
+        }
+        assert_eq!(log.text().matches("invalid_api_key").count(), 1);
+    }
+
+    /// The destination writes the text: it never gets to add lines to the
+    /// log or to fill it.
+    #[tokio::test]
+    async fn the_logged_detail_is_escaped_and_bounded() {
+        let log = Captured::default();
+        let _guard = log.start();
+        let sink = CoarseSink::new(
+            Arc::new(Failing(|| {
+                SinkError::Config(format!(
+                    "first\nWARN forged line {} (invalid_api_key)",
+                    "x".repeat(5_000)
+                ))
+            })),
+            "sync-1",
+        );
+        assert!(sink.document_count("movies").await.is_err());
+        let text = log.text();
+        assert_eq!(text.lines().count(), 1, "{text}");
+        assert!(text.contains("first\\nWARN forged line"), "{text}");
+        assert!(text.len() < REFUSAL_LOG_MAX + 500, "{}", text.len());
+    }
+
+    #[tokio::test]
+    async fn an_outage_is_not_logged_as_a_refusal() {
+        let log = Captured::default();
+        let _guard = log.start();
+        let sink = CoarseSink::new(
+            Arc::new(Failing(|| SinkError::Transient("HTTP 503".into()))),
+            "sync-1",
+        );
+        assert!(matches!(
+            sink.swap("a", "b").await,
+            Err(SinkError::Transient(_))
+        ));
+        assert_eq!(log.text(), "");
+
+        assert!(refusal(&SinkError::Fatal("payload_too_large".into())));
+        assert!(refusal(&SinkError::Config("index_not_found".into())));
+        assert!(!refusal(&SinkError::Transient("HTTP 503".into())));
     }
 }

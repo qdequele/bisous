@@ -51,6 +51,19 @@ All notable changes to meili-connect are listed here. The format follows
 
 ### Added
 
+- `GET /syncs/{id}/status` (and the answer of every sync action) carries
+  `reason`: the stable code of `message` while the sync is paused,
+  source-paused, held or failed (`destination_auth`, `source_config`,
+  `delete_guard`, …; `null` otherwise), the same code as the Lab's
+  `sync.state_changed` event. A client can tell why a sync stopped without
+  reading the message.
+- When Meilisearch refuses a request of a Lab tenant's sync (the API key, the
+  index, the documents: the errors that stop the sync), the server logs what
+  Meilisearch answered at `warn`, with the sync id and the reason code, at
+  most once a minute per sync, cut at 1,000 bytes and escaped on one line.
+  The tenant still sees only the fixed description, and this detail was
+  logged at `debug` only, so at the default `LOG_LEVEL=info` nothing said
+  which error it was.
 - `planetscale` source: PlanetScale's MySQL (Vitess), which has no binlog
   for outside readers, through Vitess's VStream API (gRPC over TLS, the
   database's user and password). The first copy reads keyset pages over the
@@ -182,6 +195,16 @@ All notable changes to meili-connect are listed here. The format follows
 
 ### Fixed
 
+- A `PUT` that writes the same Meilisearch URL another way (a trailing
+  slash, the host in another case, the default port) no longer counts as
+  another destination: the sync restarted from scratch and copied, and
+  metered, every document again. The Lab's key repair writes a sync back
+  with its instance's URL, so a different spelling there was enough.
+- Only Meilisearch's own codes (`invalid_api_key`,
+  `missing_authorization_header`, `invalid_tenant_token`) give a held sync
+  the reason `destination_auth`. Any error whose text mentioned an API key
+  did, such as the refusal to copy the settings of an index whose embedder
+  has one, which is now `destination_rejected`.
 - Postgres and Supabase: a table nobody has analyzed yet (created or
   filled recently, before autovacuum ran) now gets a row estimate from the
   live-row statistics, so the setup UI shows its first-sync cost instead

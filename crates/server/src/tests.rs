@@ -277,8 +277,52 @@ impl Sink for FakeSink {
     }
 }
 
+/// A Meilisearch that refuses the key on every call, as it answers a key
+/// that was deleted or lacks the action.
+struct KeyRefusingSink;
+
+fn key_refused<T>() -> Result<T, SinkError> {
+    Err(SinkError::Config(
+        "creating index `items`: The provided API key is invalid. (invalid_api_key)".into(),
+    ))
+}
+
+#[async_trait]
+impl Sink for KeyRefusingSink {
+    async fn ensure_index(&self, _: &IndexTarget) -> Result<(), SinkError> {
+        key_refused()
+    }
+    async fn apply(&self, _: &IndexTarget, _: Vec<DocOp>) -> Result<ApplyReport, SinkError> {
+        key_refused()
+    }
+    async fn swap(&self, _: &str, _: &str) -> Result<(), SinkError> {
+        key_refused()
+    }
+    async fn delete_all_documents(&self, _: &str) -> Result<(), SinkError> {
+        key_refused()
+    }
+    async fn delete_index(&self, _: &str) -> Result<(), SinkError> {
+        key_refused()
+    }
+    async fn copy_settings(&self, _: &str, _: &str) -> Result<(), SinkError> {
+        key_refused()
+    }
+    async fn document_count(&self, _: &str) -> Result<Option<u64>, SinkError> {
+        key_refused()
+    }
+}
+
+/// The destination host that stands for a Meilisearch refusing the key.
+const KEY_REFUSING_URL: &str = "http://refuses-the-key:7700";
+
 fn fake_sinks() -> SinkFactory {
-    Arc::new(|_: &MeiliDestination| Ok(Arc::new(FakeSink) as Arc<dyn Sink>))
+    Arc::new(|d: &MeiliDestination| {
+        Ok(if d.url == KEY_REFUSING_URL {
+            Arc::new(KeyRefusingSink) as Arc<dyn Sink>
+        } else {
+            Arc::new(FakeSink)
+        })
+    })
 }
 
 // ------------------------------------------------------------- harness
@@ -1244,6 +1288,8 @@ async fn lab_callers_and_tenant_syncs_get_coarse_errors() {
         st["message"].as_str().unwrap().contains("configuration"),
         "{st}"
     );
+    // The status names the reason with the code the Lab's events carry.
+    assert_eq!(st["reason"], "source_config", "{st}");
     // A global sync keeps the detail for the operator.
     let (status, created) = call(&a.router, "POST", "/syncs", &admin(), Some(body)).await;
     assert_eq!(status, StatusCode::CREATED);
@@ -1256,6 +1302,95 @@ async fn lab_callers_and_tenant_syncs_get_coarse_errors() {
         st["message"].as_str().unwrap().contains("DRIVER-DETAIL"),
         "{st}"
     );
+}
+
+/// The pair the Lab acts on: a tenant's sync whose key Meilisearch refuses
+/// reads `held` with the reason `destination_auth`, and its message says
+/// nothing of what Meilisearch answered.
+#[tokio::test]
+async fn a_refused_key_holds_the_sync_with_the_destination_auth_reason() {
+    let a = app(locked());
+    let mut body = sync_body("refused");
+    body["destination"]["url"] = json!(KEY_REFUSING_URL);
+    let (status, created) = call(&a.router, "POST", "/syncs", &lab("t1"), Some(body)).await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let id = created["id"].as_str().unwrap().to_owned();
+    let uri = format!("/syncs/{id}/status");
+    wait_for(async || call(&a.router, "GET", &uri, &lab("t1"), None).await.1["phase"] == "held")
+        .await;
+    let (_, st) = call(&a.router, "GET", &uri, &lab("t1"), None).await;
+    assert_eq!(st["reason"], "destination_auth", "{st}");
+    assert!(
+        st["message"]
+            .as_str()
+            .unwrap()
+            .contains("refused the API key"),
+        "{st}"
+    );
+    assert!(!st.to_string().contains("invalid_api_key"), "{st}");
+
+    // Resuming it with the same key answers the same status: what the Lab
+    // reads after an action too.
+    let (status, st) = call(
+        &a.router,
+        "POST",
+        &format!("/syncs/{id}/resume"),
+        &lab("t1"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{st}");
+    wait_for(async || call(&a.router, "GET", &uri, &lab("t1"), None).await.1["phase"] == "held")
+        .await;
+}
+
+/// The Lab writes a sync back with its instance's URL, which may be the
+/// same Meilisearch spelled another way: that is no reason to copy
+/// everything again.
+#[tokio::test]
+async fn the_same_meilisearch_written_another_way_keeps_the_checkpoint() {
+    let a = app(locked());
+    let id = create(&a, &lab("t1"), "s").await;
+    let uri = format!("/syncs/{id}");
+    let status_uri = format!("/syncs/{id}/status");
+    let streaming = async || {
+        let st = call(&a.router, "GET", &status_uri, &lab("t1"), None)
+            .await
+            .1;
+        st["phase"] == "streaming" && st["has_checkpoint"] == true && st["running"] == true
+    };
+    // What a full copy leaves behind: the snapshot documents it metered.
+    let copied = async || {
+        let st = call(&a.router, "GET", &status_uri, &lab("t1"), None)
+            .await
+            .1;
+        st["documents"]["documents_snapshot"].as_u64().unwrap_or(0)
+    };
+    wait_for(streaming).await;
+    let first_copy = copied().await;
+    assert!(first_copy > 0, "the first sync copies the rows");
+
+    for url in [
+        "http://meili:7700/",
+        "http://Meili:7700",
+        " http://meili:7700 ",
+    ] {
+        let mut body = sync_body("s");
+        body["destination"]["url"] = json!(url);
+        let (status, updated) = call(&a.router, "PUT", &uri, &lab("t1"), Some(body)).await;
+        assert_eq!(status, StatusCode::OK, "{url}: {updated}");
+        let (_, st) = call(&a.router, "GET", &status_uri, &lab("t1"), None).await;
+        assert_eq!(st["has_checkpoint"], true, "{url}: {st}");
+        wait_for(streaming).await;
+        assert_eq!(copied().await, first_copy, "{url}: copied again");
+    }
+
+    // Another Meilisearch is a fresh start: everything is copied there.
+    let mut body = sync_body("s");
+    body["destination"]["url"] = json!("http://other-meili:7700");
+    let (status, updated) = call(&a.router, "PUT", &uri, &lab("t1"), Some(body)).await;
+    assert_eq!(status, StatusCode::OK, "{updated}");
+    wait_for(async || copied().await > first_copy).await;
 }
 
 // ------------------------------------------------------------- quotas
@@ -2647,6 +2782,7 @@ async fn a_team_out_of_credits_is_held_and_resumes_with_its_credits() {
         (Some("held"), Some("out_of_credits"), Some(false)),
         "{st}"
     );
+    assert_eq!(st["reason"], "insufficient_credits", "{st}");
     assert_eq!(a.probe.teardowns.load(Ordering::SeqCst), 0);
     let (_, other) = call(
         &a.router,
@@ -2687,6 +2823,7 @@ async fn a_team_out_of_credits_is_held_and_resumes_with_its_credits() {
         let st = status_of(&a, sync).await;
         assert_eq!(st["running"], true);
         assert!(st["message"].is_null(), "{st}");
+        assert!(st["reason"].is_null(), "{st}");
     }
 }
 

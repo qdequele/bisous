@@ -234,7 +234,7 @@ impl SyncManager {
             Arc::clone(&self.metrics),
         ));
         Ok(if spec.tenant.is_some() {
-            Arc::new(CoarseSink(sink))
+            Arc::new(CoarseSink::new(sink, spec.id.clone()))
         } else {
             sink
         })
@@ -870,12 +870,27 @@ impl SpecChange {
         if !same_origin(&old.source, &new.source) {
             SpecChange::Origin
         } else if old.streams != new.streams
-            || old.destination.url.trim() != new.destination.url.trim()
+            || !same_meilisearch(&old.destination.url, &new.destination.url)
         {
             SpecChange::Streams
         } else {
             SpecChange::Other
         }
+    }
+}
+
+/// Two URLs of one Meilisearch: the same once parsed (scheme and host in
+/// any case, the default port written or not) and without a trailing
+/// slash, which the client ignores. A full snapshot is too much to pay for
+/// `https://Search.example.com/` becoming `https://search.example.com`.
+fn same_meilisearch(a: &str, b: &str) -> bool {
+    fn normalized(url: &str) -> Option<String> {
+        let url = reqwest::Url::parse(url.trim()).ok()?;
+        Some(url.as_str().trim_end_matches('/').to_owned())
+    }
+    match (normalized(a), normalized(b)) {
+        (Some(a), Some(b)) => a == b,
+        _ => a.trim() == b.trim(),
     }
 }
 
