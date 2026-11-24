@@ -265,6 +265,50 @@ fn shape_problem(op: &DocOp) -> Option<String> {
     })
 }
 
+/// The settings of an index this sink creates, oldest setting first (a
+/// Meilisearch that does not know the last ones gets the others, see
+/// `MeiliSink::create_with_defaults`). They trade search precision for a
+/// lighter index, which is what a database mirrored into Meilisearch wants
+/// by default: its tables can be large, and their rows are rarely prose
+/// where the distance between two words matters.
+///
+/// - `proximityPrecision: byAttribute`: Meilisearch only records that two
+///   words are in the same attribute, not how far apart. The proximity rule
+///   ranks on that alone, and a **phrase search stops being exact**: on
+///   1.58, `"new york"` matches every document with both words in one
+///   attribute, in any order and at any distance.
+/// - `wordPosition.enabled: false`: no word position is indexed, so the
+///   `wordPosition` ranking rule (words earlier in an attribute rank
+///   higher) no longer sorts anything.
+///
+/// Only at creation: an index that exists keeps its settings, and so does
+/// one that is rebuilt (`copy_settings` copies the live index's over these,
+/// which holds as long as `GET /settings` returns every setting listed
+/// here: check it when adding one).
+fn creation_defaults() -> [(&'static str, serde_json::Value); 2] {
+    [
+        ("proximityPrecision", json!("byAttribute")),
+        ("wordPosition", json!({ "enabled": false })),
+    ]
+}
+
+/// The answer of a Meilisearch that does not know one of the `sent`
+/// settings: 400 `bad_request` whose message names it ("Unknown field
+/// `wordPosition`: expected one of ..."). The code alone is not enough: a
+/// body damaged in transit is a `bad_request` too, and must not make the
+/// index lose its defaults.
+fn unknown_setting(api: &client::ApiError, sent: &[(&'static str, serde_json::Value)]) -> bool {
+    api.status == StatusCode::BAD_REQUEST
+        && api.error.code == "bad_request"
+        && sent
+            .iter()
+            .any(|(name, _)| api.error.message.contains(name))
+}
+
+/// How many times `ensure_index` reads the index before giving up on a
+/// creation that does not settle (the engine then retries).
+const ENSURE_ROUNDS: usize = 4;
+
 /// The first embedder of `settings` that holds an `apiKey`, at any depth
 /// (composite embedders nest theirs). `GET /settings` always redacts API
 /// keys (`"sk-XXXXX..."`), so any key found there cannot be copied.
@@ -602,6 +646,103 @@ impl MeiliSink {
         }
     }
 
+    /// A task on index `uid` that has not run yet, if any (the oldest the
+    /// instance lists first).
+    async fn pending_task(&self, uid: &str) -> Result<Option<u64>, SinkError> {
+        #[derive(Deserialize)]
+        struct Pending {
+            uid: u64,
+        }
+        #[derive(Deserialize)]
+        struct Tasks {
+            results: Vec<Pending>,
+        }
+        let query = [
+            ("indexUids", uid),
+            ("statuses", "enqueued,processing"),
+            ("limit", "1"),
+        ];
+        match self
+            .client
+            .call(Method::GET, &["tasks"], &query, None)
+            .await?
+        {
+            Ok(body) => {
+                let tasks: Tasks = serde_json::from_slice(&body).map_err(|e| {
+                    SinkError::Fatal(format!("unexpected tasks from Meilisearch: {e}"))
+                })?;
+                Ok(tasks.results.first().map(|t| t.uid))
+            }
+            Err(api) => Err(map_api_error("reading the tasks of the index", &api)),
+        }
+    }
+
+    /// Creates index `uid` by updating its settings (Meilisearch creates the
+    /// index a settings update names), so that an index this sink creates
+    /// never exists without [`creation_defaults`]: a failure between two
+    /// requests cannot leave one behind with Meilisearch's own defaults,
+    /// which a later run would take for its owner's choice.
+    ///
+    /// A Meilisearch from before a setting existed refuses the whole request
+    /// (400 `bad_request` naming the unknown field): the newest settings are
+    /// left out one at a time. `false` when it knows none of them, and
+    /// nothing was created. Any other refusal is an error like for any
+    /// request: a default whose shape a future Meilisearch rejects fails
+    /// the creation rather than being dropped silently.
+    async fn create_with_defaults(&self, uid: &str) -> Result<bool, SinkError> {
+        let defaults = creation_defaults();
+        for known in (1..=defaults.len()).rev() {
+            let settings: serde_json::Map<String, serde_json::Value> = defaults[..known]
+                .iter()
+                .map(|(name, value)| ((*name).to_owned(), value.clone()))
+                .collect();
+            let enqueued = self
+                .client
+                .enqueue(
+                    Method::PATCH,
+                    &["indexes", uid, "settings"],
+                    &[],
+                    Some(Payload::Json(serde_json::Value::Object(settings))),
+                )
+                .await?;
+            let task_uid = match enqueued {
+                Ok(task_uid) => task_uid,
+                Err(api) if unknown_setting(&api, &defaults[..known]) => {
+                    let (name, _) = &defaults[known - 1];
+                    tracing::info!(
+                        index = uid,
+                        setting = name,
+                        answer = %api.error,
+                        "this Meilisearch does not know a creation setting: trying without the newest"
+                    );
+                    continue;
+                }
+                Err(api) => {
+                    return Err(client::map_api_error(
+                        "creating index with its settings",
+                        &api,
+                    ));
+                }
+            };
+            let task = self.client.wait_task(task_uid).await?;
+            return match task.status {
+                TaskStatus::Succeeded => Ok(true),
+                TaskStatus::Canceled => Err(SinkError::Transient(format!(
+                    "creating index with its settings: task {} was canceled by another client",
+                    task.uid
+                ))),
+                _ => {
+                    let error = task.error.unwrap_or_default();
+                    Err(client::map_task_error(
+                        "creating index with its settings",
+                        &error,
+                    ))
+                }
+            };
+        }
+        Ok(false)
+    }
+
     /// Enqueue + wait; a failed task is mapped with `map_task_error`, except
     /// codes in `ok_codes`, which count as success.
     async fn index_task(
@@ -693,8 +834,10 @@ impl Sink for MeiliSink {
     async fn ensure_index(&self, target: &IndexTarget) -> Result<(), SinkError> {
         let uid = target.uid.as_str();
         let pk = target.primary_key.as_str();
-        // Two rounds: a concurrent creation between GET and POST is re-read.
-        for _ in 0..2 {
+        // A few rounds: one creates the index through its settings, the next
+        // sets its primary key; work found queued on the uid, or a
+        // concurrent creation, is waited for and re-read.
+        for _ in 0..ENSURE_ROUNDS {
             match self.index_primary_key(uid).await? {
                 Some(Some(existing)) if existing == pk => return Ok(()),
                 Some(Some(existing)) => {
@@ -717,6 +860,22 @@ impl Sink for MeiliSink {
                         .await;
                 }
                 None => {
+                    // Somebody may be creating it right now: a creation
+                    // still in the task queue does not show yet. A settings
+                    // update, unlike `POST /indexes`, does not fail on an
+                    // index that exists by the time it runs: it would
+                    // overwrite its owner's settings. So queued work on the
+                    // uid is waited for, and the index read again.
+                    if let Some(pending) = self.pending_task(uid).await? {
+                        self.client.wait_task(pending).await?;
+                        continue;
+                    }
+                    // With the settings that make indexing lighter, in the
+                    // request that creates it; the next round sets its
+                    // primary key.
+                    if self.create_with_defaults(uid).await? {
+                        continue;
+                    }
                     let task = self
                         .client
                         .run_task(
@@ -754,7 +913,8 @@ impl Sink for MeiliSink {
             }
         }
         Err(SinkError::Transient(format!(
-            "index `{uid}` is being created concurrently"
+            "index `{uid}` is still being created (other work on it, or its primary key not \
+             visible yet)"
         )))
     }
 

@@ -1166,6 +1166,12 @@ async fn ensure_index_cases() {
         .expect(0)
         .mount(&server)
         .await;
+    // Its settings are its owner's: never touched.
+    Mock::given(method("PATCH"))
+        .respond_with(task_ok(0))
+        .expect(0)
+        .mount(&server)
+        .await;
     sink(&server, opts()).ensure_index(&target()).await.unwrap();
 
     // Exists with another primary key: Config.
@@ -1182,28 +1188,6 @@ async fn ensure_index_cases() {
         .await
         .unwrap_err();
     assert!(matches!(e, SinkError::Config(_)), "{e:?}");
-
-    // Missing: created with the primary key.
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/indexes/movies"))
-        .respond_with(err(404, "index_not_found", "invalid_request"))
-        .mount(&server)
-        .await;
-    Mock::given(method("POST"))
-        .and(path("/indexes"))
-        .and(wiremock::matchers::body_json(
-            json!({"uid": "movies", "primaryKey": "id"}),
-        ))
-        .respond_with(task_ok(4))
-        .expect(1)
-        .mount(&server)
-        .await;
-    Mock::given(path("/tasks/4"))
-        .respond_with(task_state(4, "succeeded", None))
-        .mount(&server)
-        .await;
-    sink(&server, opts()).ensure_index(&target()).await.unwrap();
 
     // Exists without a primary key: set it.
     let server = MockServer::start().await;
@@ -1226,6 +1210,287 @@ async fn ensure_index_cases() {
         .mount(&server)
         .await;
     sink(&server, opts()).ensure_index(&target()).await.unwrap();
+}
+
+// ------------------------------------------------- creating an index
+
+const DEFAULTS: &str =
+    r#"{"proximityPrecision": "byAttribute", "wordPosition": {"enabled": false}}"#;
+
+fn defaults() -> Value {
+    serde_json::from_str(DEFAULTS).unwrap()
+}
+
+/// What a Meilisearch that does not know `field` answers to a settings
+/// update carrying it.
+fn unknown_field(field: &str) -> ResponseTemplate {
+    ResponseTemplate::new(400).set_body_json(json!({
+        "message": format!("Unknown field `{field}`: expected one of `displayedAttributes`, `rankingRules`"),
+        "code": "bad_request", "type": "invalid_request", "link": ""
+    }))
+}
+
+async fn mount_missing(server: &MockServer) {
+    Mock::given(method("GET"))
+        .and(path("/indexes/movies"))
+        .respond_with(err(404, "index_not_found", "invalid_request"))
+        .mount(server)
+        .await;
+}
+
+/// `GET /indexes/movies`: missing at first, then there with `primary_key`
+/// (`null`: as a settings update leaves an index it created).
+async fn mount_missing_then(server: &MockServer, primary_key: Value) {
+    Mock::given(method("GET"))
+        .and(path("/indexes/movies"))
+        .respond_with(err(404, "index_not_found", "invalid_request"))
+        .up_to_n_times(1)
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/indexes/movies"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"uid": "movies", "primaryKey": primary_key})),
+        )
+        .mount(server)
+        .await;
+}
+
+/// `GET /tasks?indexUids=movies&statuses=enqueued,processing`: the uids of
+/// the tasks still queued on the index.
+async fn mount_pending(server: &MockServer, uids: &[u64]) {
+    let results: Vec<Value> = uids.iter().map(|uid| json!({"uid": uid})).collect();
+    Mock::given(method("GET"))
+        .and(path("/tasks"))
+        .and(wiremock::matchers::query_param("indexUids", "movies"))
+        .and(wiremock::matchers::query_param(
+            "statuses",
+            "enqueued,processing",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"results": results})))
+        .mount(server)
+        .await;
+}
+
+async fn mount_task(server: &MockServer, uid: u64) {
+    Mock::given(path(format!("/tasks/{uid}")))
+        .respond_with(task_state(uid, "succeeded", None))
+        .mount(server)
+        .await;
+}
+
+async fn mount_primary_key(server: &MockServer, uid: u64) {
+    Mock::given(method("PATCH"))
+        .and(path("/indexes/movies"))
+        .and(wiremock::matchers::body_json(json!({"primaryKey": "id"})))
+        .respond_with(task_ok(uid))
+        .expect(1)
+        .mount(server)
+        .await;
+    mount_task(server, uid).await;
+}
+
+/// No request may create the index bare, or touch its settings.
+async fn forbid(server: &MockServer, verb: &str, route: &str) {
+    Mock::given(method(verb))
+        .and(path(route))
+        .respond_with(task_ok(99))
+        .expect(0)
+        .mount(server)
+        .await;
+}
+
+/// An index the sink creates starts with the settings that make indexing
+/// lighter, set in the request that creates it: it never exists without
+/// them.
+#[tokio::test]
+async fn a_created_index_starts_with_the_indexing_defaults() {
+    let server = MockServer::start().await;
+    mount_missing_then(&server, Value::Null).await;
+    mount_pending(&server, &[]).await;
+    Mock::given(method("PATCH"))
+        .and(path("/indexes/movies/settings"))
+        .and(wiremock::matchers::body_json(defaults()))
+        .respond_with(task_ok(4))
+        .expect(1)
+        .mount(&server)
+        .await;
+    mount_task(&server, 4).await;
+    mount_primary_key(&server, 5).await;
+    forbid(&server, "POST", "/indexes").await;
+
+    sink(&server, opts()).ensure_index(&target()).await.unwrap();
+}
+
+/// A Meilisearch from before a setting existed refuses the whole request
+/// (400 `bad_request` naming the field): the newest settings are left out,
+/// one at a time, and the index is still created.
+#[tokio::test]
+async fn a_setting_this_meilisearch_does_not_know_is_left_out() {
+    let server = MockServer::start().await;
+    mount_missing_then(&server, Value::Null).await;
+    mount_pending(&server, &[]).await;
+    Mock::given(method("PATCH"))
+        .and(path("/indexes/movies/settings"))
+        .and(wiremock::matchers::body_json(defaults()))
+        .respond_with(unknown_field("wordPosition"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path("/indexes/movies/settings"))
+        .and(wiremock::matchers::body_json(
+            json!({"proximityPrecision": "byAttribute"}),
+        ))
+        .respond_with(task_ok(4))
+        .expect(1)
+        .mount(&server)
+        .await;
+    mount_task(&server, 4).await;
+    mount_primary_key(&server, 5).await;
+
+    sink(&server, opts()).ensure_index(&target()).await.unwrap();
+}
+
+/// None of them known: created the way it always was, with its primary key.
+#[tokio::test]
+async fn an_index_is_created_bare_when_no_default_is_known() {
+    let server = MockServer::start().await;
+    mount_missing(&server).await;
+    mount_pending(&server, &[]).await;
+    Mock::given(method("PATCH"))
+        .and(path("/indexes/movies/settings"))
+        .respond_with(unknown_field("proximityPrecision"))
+        .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/indexes"))
+        .and(wiremock::matchers::body_json(
+            json!({"uid": "movies", "primaryKey": "id"}),
+        ))
+        .respond_with(task_ok(4))
+        .expect(1)
+        .mount(&server)
+        .await;
+    mount_task(&server, 4).await;
+
+    sink(&server, opts()).ensure_index(&target()).await.unwrap();
+}
+
+/// Only "unknown setting" is tolerated. A refused key, a rejected value, a
+/// `bad_request` that names none of the settings (a body damaged in
+/// transit), an outage: each stops the creation like any other request,
+/// and nothing is created bare behind its back.
+#[tokio::test]
+async fn any_other_refusal_of_the_defaults_stops_the_creation() {
+    let cases = [
+        (err(403, "invalid_api_key", "auth"), "config"),
+        (
+            err(
+                400,
+                "invalid_settings_proximity_precision",
+                "invalid_request",
+            ),
+            "fatal",
+        ),
+        (err(400, "bad_request", "invalid_request"), "fatal"),
+        (err(503, "internal", "internal"), "transient"),
+    ];
+    for (reply, expected) in cases {
+        let server = MockServer::start().await;
+        mount_missing(&server).await;
+        mount_pending(&server, &[]).await;
+        Mock::given(method("PATCH"))
+            .and(path("/indexes/movies/settings"))
+            .respond_with(reply)
+            .mount(&server)
+            .await;
+        forbid(&server, "POST", "/indexes").await;
+
+        let e = sink(&server, opts())
+            .ensure_index(&target())
+            .await
+            .unwrap_err();
+        let class = match e {
+            SinkError::Config(_) => "config",
+            SinkError::Fatal(_) => "fatal",
+            SinkError::Transient(_) => "transient",
+        };
+        assert_eq!(class, expected, "{e:?}");
+    }
+}
+
+/// The settings update is accepted, then its task fails or is cancelled:
+/// an error, and no bare index either.
+#[tokio::test]
+async fn a_failed_or_cancelled_creation_task_is_an_error() {
+    let cases = [
+        // What a key without `indexes.create` gets from a settings update.
+        (task_state(4, "failed", Some("index_not_found")), "config"),
+        (task_state(4, "canceled", None), "transient"),
+    ];
+    for (state, expected) in cases {
+        let server = MockServer::start().await;
+        mount_missing(&server).await;
+        mount_pending(&server, &[]).await;
+        Mock::given(method("PATCH"))
+            .and(path("/indexes/movies/settings"))
+            .respond_with(task_ok(4))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path("/tasks/4"))
+            .respond_with(state)
+            .mount(&server)
+            .await;
+        forbid(&server, "POST", "/indexes").await;
+
+        let e = sink(&server, opts())
+            .ensure_index(&target())
+            .await
+            .unwrap_err();
+        let class = match e {
+            SinkError::Config(_) => "config",
+            SinkError::Fatal(_) => "fatal",
+            SinkError::Transient(_) => "transient",
+        };
+        assert_eq!(class, expected, "{e:?}");
+    }
+}
+
+/// Somebody is creating the index: their task is still queued, so the index
+/// does not show yet. It is waited for, and their index, with their
+/// settings, is left as it is.
+#[tokio::test]
+async fn an_index_being_created_by_somebody_else_is_waited_for_not_overwritten() {
+    let server = MockServer::start().await;
+    mount_missing_then(&server, json!("id")).await;
+    mount_pending(&server, &[7]).await;
+    mount_task(&server, 7).await;
+    forbid(&server, "PATCH", "/indexes/movies/settings").await;
+    forbid(&server, "PATCH", "/indexes/movies").await;
+    forbid(&server, "POST", "/indexes").await;
+
+    sink(&server, opts()).ensure_index(&target()).await.unwrap();
+}
+
+/// Work that never stops arriving on the uid is not waited for forever: the
+/// engine retries.
+#[tokio::test]
+async fn a_creation_that_does_not_settle_is_transient() {
+    let server = MockServer::start().await;
+    mount_missing(&server).await;
+    mount_pending(&server, &[7]).await;
+    mount_task(&server, 7).await;
+    forbid(&server, "PATCH", "/indexes/movies/settings").await;
+
+    let e = sink(&server, opts())
+        .ensure_index(&target())
+        .await
+        .unwrap_err();
+    assert!(matches!(e, SinkError::Transient(_)), "{e:?}");
 }
 
 #[tokio::test]

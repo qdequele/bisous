@@ -95,6 +95,103 @@ async fn wait_task(l: &Live, uid: u64) {
     panic!("task {uid} did not finish");
 }
 
+/// An index the sink creates starts with the indexing defaults, whatever
+/// the version: a Meilisearch that does not know `wordPosition` still gets
+/// `proximityPrecision`.
+#[tokio::test]
+async fn a_created_index_has_the_indexing_defaults() {
+    let Some(l) = live() else { return };
+    let s = sink(&l, opts());
+    let target = IndexTarget {
+        uid: uid("defaults"),
+        primary_key: "pk".into(),
+    };
+    s.ensure_index(&target).await.unwrap();
+
+    let settings = get_settings(&l, &target.uid).await;
+    assert_eq!(
+        settings["proximityPrecision"],
+        json!("byAttribute"),
+        "{settings}"
+    );
+    if let Some(word_position) = settings.get("wordPosition") {
+        assert_eq!(word_position["enabled"], json!(false), "{settings}");
+    }
+    // Created through its settings, then given its primary key.
+    s.ensure_index(&target).await.unwrap();
+    s.apply(&target, vec![replace("1", json!({"title": "t"}))])
+        .await
+        .unwrap();
+    assert!(get_doc(&l, &target.uid, "1").await.is_some());
+
+    // Settings somebody chose are never put back to the defaults.
+    let http = reqwest::Client::new();
+    let patched: Value = http
+        .patch(format!("{}/indexes/{}/settings", l.url, target.uid))
+        .bearer_auth(&l.key)
+        .json(&json!({"proximityPrecision": "byWord"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(patched["taskUid"].is_u64(), "{patched}");
+    s.delete_all_documents(&target.uid).await.unwrap(); // waits behind the settings task
+    s.ensure_index(&target).await.unwrap();
+    let settings = get_settings(&l, &target.uid).await;
+    assert_eq!(
+        settings["proximityPrecision"],
+        json!("byWord"),
+        "{settings}"
+    );
+
+    s.delete_index(&target.uid).await.unwrap();
+}
+
+/// The engine's order for a rebuild: the shadow is created (with the
+/// defaults), then given the live index's settings. Nothing of the defaults
+/// may survive the copy, or a resync would change the settings of an index
+/// somebody set up on purpose.
+#[tokio::test]
+async fn a_shadow_takes_the_live_settings_over_the_defaults() {
+    let Some(l) = live() else { return };
+    let s = sink(&l, opts());
+    // A live index somebody created with Meilisearch's own defaults, not
+    // through the sink.
+    let live_uid = uid("their_live");
+    let http = reqwest::Client::new();
+    let created: Value = http
+        .post(format!("{}/indexes", l.url))
+        .bearer_auth(&l.key)
+        .json(&json!({"uid": live_uid, "primaryKey": "pk"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(created["taskUid"].is_u64(), "{created}");
+    let live_ix = IndexTarget {
+        uid: live_uid.clone(),
+        primary_key: "pk".into(),
+    };
+    s.ensure_index(&live_ix).await.unwrap(); // waits for the creation
+    let theirs = get_settings(&l, &live_uid).await;
+    assert_eq!(theirs["proximityPrecision"], json!("byWord"), "{theirs}");
+
+    let shadow = IndexTarget {
+        uid: uid("shadow"),
+        primary_key: "pk".into(),
+    };
+    s.ensure_index(&shadow).await.unwrap();
+    s.copy_settings(&live_uid, &shadow.uid).await.unwrap();
+    assert_eq!(get_settings(&l, &shadow.uid).await, theirs);
+
+    s.delete_index(&shadow.uid).await.unwrap();
+    s.delete_index(&live_uid).await.unwrap();
+}
+
 #[tokio::test]
 async fn apply_lifecycle() {
     let Some(l) = live() else { return };
