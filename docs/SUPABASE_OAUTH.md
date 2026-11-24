@@ -90,9 +90,11 @@ New sync wizard (`/connect/<slug>/syncs/new`), Supabase source, step 1:
    back to `/connect/supabase/callback`, which completes the grant and
    returns them to the wizard (`?source=supabase`).
 3. With a connection, the wizard shows the **project picker**: the projects
-   of the connected organization, each with its region and status. A project
-   that is not `ACTIVE_HEALTHY` (paused, restoring…) is shown but disabled,
-   with the reason. "Switch organization" re-runs the consent.
+   of every connected organization, grouped by organization, each with its
+   region and status. A project that is not `ACTIVE_HEALTHY` (paused,
+   restoring…) is shown but disabled, with the reason. "Add organization"
+   re-runs the consent: the organization the user picks there is added
+   beside the ones already connected.
 4. When the user picks a project, the Lab **provisions** it (§4): about a
    second, with a spinner. It fails with an actionable message (Postgres
    older than 17, `wal_level` not logical, project paused).
@@ -100,14 +102,15 @@ New sync wizard (`/connect/<slug>/syncs/new`), Supabase source, step 1:
    engine's `/sources/discover`, run with the provisioned role. Check,
    mapping, destination and review are unchanged.
 
-Team settings (Integrations) list the Supabase connection: the organization,
-who connected it and when, the provisioned projects, and **Disconnect**.
+Team settings (Integrations) list the Supabase connections: for each
+organization, who connected it, its provisioned projects, and its own
+**Disconnect**.
 
 ## 3. Where things live
 
 | Data | Where | Notes |
 |---|---|---|
-| OAuth access and refresh tokens | Lab, `supabase_connections` (one row per team), `encrypts` | Never sent to the console or the engine |
+| OAuth access and refresh tokens | Lab, `supabase_connections` (one row per team and Supabase organization), `encrypts` | Never sent to the console or the engine |
 | Provisioned role name and password | Lab, `supabase_projects` (one row per team and project ref), password `encrypts` | The browser never sees it |
 | Connection spec with the password | Engine sync spec, encrypted with `CONNECT_SECRET_KEY` | As today for pasted specs |
 | Publication name and tables per sync | Lab, `supabase_publications` | The Lab owns the publication (§5) |
@@ -242,13 +245,15 @@ checks the password only when a connection logs in. A reconnect between
 steps 1 and 2 fails transiently and is retried. If step 2 fails, the job
 retries; the new password is stored before step 1.
 
-**Disconnect** (team admin, in Integrations):
+**Disconnect** (team admin, in Integrations) acts on one organization's
+connection; the team's other organizations stay connected:
 
 1. Refused with `409 supabase_in_use` while a sync uses a project of the
    connection. The console lists those syncs and offers to delete them
    first; deleting a sync drops its slot and publication.
-2. For each project: drop any `meili_connect_lab_*` publication carrying our
-   comment, then `drop owned by <role>; drop role <role>`. `DROP OWNED` is
+2. For each project of the connection: drop any `meili_connect_lab_*`
+   publication carrying our comment, then
+   `drop owned by <role>; drop role <role>`. `DROP OWNED` is
    what revokes the grants. Slots are not dropped here: each sync drops its
    own slot when it is deleted, and a slot has no owner to find it by.
 3. Revoke the token at Supabase (`/v1/oauth/revoke`), then delete the rows.
@@ -291,9 +296,9 @@ Lab vendors the new `openapi.yaml`, and the Lab PR that uses
 ## 8. Lab changes (`meilisearch-lab`)
 
 - **Migrations** (additive):
-  - `supabase_connections`: `account_id` (unique), `organization_slug`,
+  - `supabase_connections`: `account_id`, `organization_slug`,
     `organization_name`, `access_token`, `refresh_token`, `expires_at`,
-    `status`, `connected_by_id`.
+    `status`, `connected_by_id`; unique on `(account_id, organization_slug)`.
   - `supabase_projects`: `account_id`, `supabase_connection_id`, `ref`,
     `name`, `host`, `role_name`, `role_password`, `password_rotated_at`,
     `status`; unique on `(account_id, ref)`.
@@ -309,12 +314,15 @@ Lab vendors the new `openapi.yaml`, and the Lab PR that uses
   - `ConnectSupabaseSources`, the proxy rewrite next to
     `ConnectDestinations`.
 - **Routes** (account scope):
-  - `GET /account/supabase` returns `{enabled, connection}`;
+  - `GET /account/supabase` returns `{configured, connected, connections,
+    projects}`;
   - `POST /account/supabase/authorize` and `POST /account/supabase/callback`;
-  - `GET /account/supabase/projects`;
-  - `POST /account/supabase/projects/:ref` (provision);
+  - `GET /account/supabase/projects` (every connected organization's
+    projects, each with its `connection_id`);
+  - `POST /account/supabase/projects/:ref` (provision, through the
+    connection named in `connection_id`);
   - `POST /account/supabase/projects/:ref/rotate`;
-  - `DELETE /account/supabase`.
+  - `DELETE /account/supabase/connections/:id`.
 - **Roles:** connect and disconnect need owner or admin, as Meilisearch
   Cloud does. Picking or provisioning a project needs member, the role
   needed to create a sync.
@@ -400,9 +408,15 @@ Where the build differs from the sections above:
 - **`slot_name` is refused** with `manage_publication: false`. Only the slot
   name derived from the sync id marks a slot as the sync's, so a custom name
   would leak the slot.
-- **One organization per team.** "Switch organization" authorizes again and
-  replaces the tokens. Provisioned projects stay, and they work again as soon
-  as the new grant reaches them.
+- **Several organizations per team.** A grant covers one organization, so
+  the Lab keeps one connection per team and organization. The callback finds
+  the organization from `GET /v1/organizations` (or, when that does not list
+  exactly one, from the `organization_slug` of the projects the grant
+  reaches) and refuses a grant whose organization it cannot tell. A new
+  organization adds a connection; one the team already connected gets the
+  new tokens. The team's projects the grant reaches are attached to that
+  connection, and every later call on a project (grants, publications,
+  rotation, teardown) goes through its own organization's connection.
 - **Console.** The Supabase source has a third mode, "Your Supabase account",
   which is the default. Its config is `{"project": "<id>"}` and nothing else.
   The team page has a Supabase card: the projects, password rotation (owner
