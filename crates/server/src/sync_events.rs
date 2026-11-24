@@ -145,15 +145,14 @@ fn event(sync_id: &str, tenant: &str, label: &str, c: &Change) -> Value {
     if let Some(resync) = c.resync {
         data.insert("resync".into(), json!(resync));
     }
-    let troubled = !matches!(
-        c.to,
-        Reported::Phase(SyncPhase::Pending | SyncPhase::Snapshotting | SyncPhase::Streaming)
-            | Reported::Deleted
-    );
+    let reason = match c.to {
+        Reported::Phase(phase) => reason::for_phase(phase, c.message.as_deref()),
+        Reported::Deleted => None,
+    };
+    if let Some(reason) = reason {
+        data.insert("reason".into(), json!(reason.code()));
+    }
     if let Some(message) = c.message.as_deref().filter(|m| !m.is_empty()) {
-        if troubled {
-            data.insert("reason".into(), json!(reason::for_state(message).code()));
-        }
         data.insert("message".into(), json!(truncate(message, MAX_MESSAGE)));
     }
     json!({

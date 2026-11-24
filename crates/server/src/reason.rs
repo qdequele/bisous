@@ -19,7 +19,7 @@
 //! `lab-events.schema.json`): never rename one, add new ones only after the
 //! Lab knows them.
 
-use meili_connect_core::{SinkError, SourceError};
+use meili_connect_core::{SinkError, SourceError, SyncPhase};
 
 use crate::credits::OUT_OF_CREDITS;
 
@@ -194,6 +194,16 @@ const AUTH: [&str; 11] = [
     "sasl authentication",
 ];
 
+/// Meilisearch's error codes for a key it refuses (missing, unknown,
+/// expired, or without the action or the index). Codes only: other
+/// messages talk about API keys too (an embedder's, when copying settings),
+/// and the Lab answers this reason by replacing the sync's key.
+const KEY_REFUSED: [&str; 3] = [
+    "invalid_api_key",
+    "missing_authorization_header",
+    "invalid_tenant_token",
+];
+
 /// The reason of a detailed source error.
 pub fn classify_source(e: &SourceError) -> Reason {
     match e {
@@ -226,16 +236,7 @@ pub fn classify_sink(e: &SinkError) -> Reason {
             let lower = text.to_ascii_lowercase();
             if let Some(reason) = coarse_reason(text) {
                 reason
-            } else if has_any(
-                &lower,
-                &[
-                    "invalid_api_key",
-                    "missing_authorization_header",
-                    "invalid_tenant_token",
-                    "api key",
-                    "authorization",
-                ],
-            ) {
+            } else if has_any(&lower, &KEY_REFUSED) {
                 Reason::DestinationAuth
             } else if has_any(&lower, &DNS) {
                 Reason::DestinationUnreachable
@@ -274,6 +275,19 @@ fn coarse_reason(message: &str) -> Option<Reason> {
         .iter()
         .find(|(text, _)| message.contains(text))
         .map(|(_, reason)| *reason)
+}
+
+/// The reason a sync is in `phase`, from the message persisted with it:
+/// only a phase that stopped the sync has one (`paused`, `source_paused`,
+/// `held`, `failed`), and only with a message. What `sync.state_changed`
+/// and `GET /syncs/{id}/status` report as `reason`.
+pub fn for_phase(phase: SyncPhase, message: Option<&str>) -> Option<Reason> {
+    let stopped = !matches!(
+        phase,
+        SyncPhase::Pending | SyncPhase::Snapshotting | SyncPhase::Streaming
+    );
+    let message = message.filter(|m| !m.is_empty())?;
+    stopped.then(|| for_state(message))
 }
 
 /// The reason of the message persisted with a sync's phase (what
@@ -439,6 +453,22 @@ mod tests {
                 Reason::DestinationRejected,
             ),
             (
+                // Not the sync's key: a new one would change nothing.
+                SinkError::Config(
+                    "cannot copy the settings of index `a` to `b`: embedder `e` has an API \
+                     key, which Meilisearch only returns redacted; copying it would install a \
+                     broken key"
+                        .into(),
+                ),
+                Reason::DestinationRejected,
+            ),
+            (
+                SinkError::Config(
+                    "HTTP 403 Forbidden: the reply is not a Meilisearch error".into(),
+                ),
+                Reason::DestinationRejected,
+            ),
+            (
                 SinkError::Config("dns error: failed to lookup address information".into()),
                 Reason::DestinationUnreachable,
             ),
@@ -455,6 +485,35 @@ mod tests {
             assert_eq!(classify_sink(&e), reason, "{e}");
             let coarse = coarse_sink(&e);
             assert_eq!(for_state(&persisted(coarse)), reason, "{e}");
+        }
+    }
+
+    #[test]
+    fn only_a_stopped_phase_with_a_message_has_a_reason() {
+        let refused = persisted(coarse_sink(&SinkError::Config(
+            "add documents: The provided API key is invalid. (invalid_api_key)".into(),
+        )));
+        for phase in [
+            SyncPhase::Paused,
+            SyncPhase::SourcePaused,
+            SyncPhase::Held,
+            SyncPhase::Failed,
+        ] {
+            assert_eq!(
+                for_phase(phase, Some(&refused)),
+                Some(Reason::DestinationAuth),
+                "{phase:?}"
+            );
+            assert_eq!(for_phase(phase, None), None, "{phase:?}");
+            assert_eq!(for_phase(phase, Some("")), None, "{phase:?}");
+        }
+        // A sync that runs again may still carry its last message.
+        for phase in [
+            SyncPhase::Pending,
+            SyncPhase::Snapshotting,
+            SyncPhase::Streaming,
+        ] {
+            assert_eq!(for_phase(phase, Some(&refused)), None, "{phase:?}");
         }
     }
 

@@ -158,7 +158,7 @@ curl -s $API/syncs/$ID -H "$AUTH" | jq '.name = "products v2"' \
 
 ```bash
 curl -s $API/syncs/$ID/status -H "$AUTH"
-# {"phase": "streaming", "message": null, "has_checkpoint": true, "resyncing": false,
+# {"phase": "streaming", "message": null, "reason": null, "has_checkpoint": true, "resyncing": false,
 #  "running": true, "progress": {"written": 1000, "deleted": 0, "rejected": 0},
 #  "documents": {"documents_streamed": 0, "documents_snapshot": 1000, "documents_resync": 0},
 #  "bytes": 98213, "sync_seconds": 42, "lag": {"seconds": 0.0, "bytes": 0},

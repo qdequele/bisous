@@ -507,10 +507,14 @@ async fn status_json(state: &AppState, scope: &Scope, id: &str) -> ApiResult<Val
         units.add(&d.usage);
     }
     let phase = saved.as_ref().map_or(SyncPhase::Pending, |s| s.phase);
+    let message = saved.as_ref().and_then(|s| s.message.as_deref());
     Ok(json!({
         "sync_id": id,
         "phase": phase,
-        "message": saved.as_ref().and_then(|s| s.message.clone()),
+        "message": message,
+        // The stable code of `message` while the sync is stopped (the
+        // `reason` of `sync.state_changed`).
+        "reason": crate::reason::for_phase(phase, message).map(crate::reason::Reason::code),
         "has_checkpoint": saved.as_ref().is_some_and(|s| s.checkpoint.is_some()),
         "resyncing": saved.as_ref().is_some_and(|s| s.resyncing),
         "updated_at": saved.as_ref().map(|s| s.updated_at),
