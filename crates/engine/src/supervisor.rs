@@ -409,6 +409,7 @@ async fn persist_phase(
         message: None,
         resyncing: false,
         resync_reason: None,
+        filling: Vec::new(),
         updated_at: Utc::now(),
     });
     state.phase = phase;

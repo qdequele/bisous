@@ -495,7 +495,8 @@ impl SyncManager {
     ///   unless `force`. Then the checkpoint is cleared: a fresh sync.
     /// - the streams or the Meilisearch URL: the checkpoint is cleared, so
     ///   the next start snapshots everything again (into shadow indexes
-    ///   where the live ones hold data).
+    ///   where the live ones hold data; in place for the indexes an
+    ///   interrupted first copy was filling, see `still_filling`).
     /// - anything else (name, guard, secrets, tuning): a plain restart.
     ///
     /// A paused sync stays paused.
@@ -543,6 +544,17 @@ impl SyncManager {
             SpecChange::Other => {}
         }
 
+        // What an interrupted first copy was filling, when the state is about
+        // to be reset. Read again now that the sync is stopped (its last run
+        // may have completed the snapshot since `saved` was read), and
+        // before the spec is written: a store error here changes nothing.
+        let filling = match change {
+            SpecChange::Other => Vec::new(),
+            SpecChange::Origin | SpecChange::Streams => match self.store.load(id).await? {
+                Some(state) => still_filling(&state.filling, old, &spec),
+                None => Vec::new(),
+            },
+        };
         let stored = self.backend.update_sync(tenant, &spec).await?;
         if change != SpecChange::Other {
             let phase = if paused {
@@ -558,6 +570,7 @@ impl SyncManager {
                     message: None,
                     resyncing: false,
                     resync_reason: None,
+                    filling,
                     updated_at: Utc::now(),
                 })
                 .await?;
@@ -667,7 +680,8 @@ impl SyncManager {
     }
 
     /// Rebuild every index from a fresh snapshot (shadow indexes swapped in
-    /// when complete). Starts the sync if it was not running.
+    /// when complete; in place for the indexes a first copy never finished
+    /// filling). Starts the sync if it was not running.
     pub async fn resync(&self, tenant: Option<&str>, id: &str) -> ApiResult<()> {
         let _op = self.serialize(id).await;
         let spec = self.row(tenant, id).await?.spec;
@@ -879,6 +893,21 @@ impl SpecChange {
     }
 }
 
+/// What is left of `SyncState::filling` when a `PUT` starts the sync over:
+/// the indexes an interrupted first copy was filling from empty, on the
+/// same Meilisearch and still mapped. Their documents are still nothing but
+/// this sync's partial copy, so the next snapshot refills them in place.
+fn still_filling(filling: &[String], old: &SyncSpec, new: &SyncSpec) -> Vec<String> {
+    if !same_meilisearch(&old.destination.url, &new.destination.url) {
+        return Vec::new();
+    }
+    filling
+        .iter()
+        .filter(|uid| new.streams.iter().any(|m| &m.index == *uid))
+        .cloned()
+        .collect()
+}
+
 /// Two URLs of one Meilisearch: the same once parsed (scheme and host in
 /// any case, the default port written or not) and without a trailing
 /// slash, which the client ignores. A full snapshot is too much to pay for
@@ -907,6 +936,7 @@ async fn persist_phase(
         message: None,
         resyncing: false,
         resync_reason: None,
+        filling: Vec::new(),
         updated_at: Utc::now(),
     });
     state.phase = phase;

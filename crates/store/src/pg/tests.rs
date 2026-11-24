@@ -83,6 +83,13 @@ async fn state_round_trip() {
         store.save(&st).await.unwrap();
         assert_eq!(store.load("s1").await.unwrap(), Some(st.clone()));
     }
+    // The indexes an interrupted first copy was filling survive too.
+    st.filling = vec!["products".into(), "orders".into()];
+    store.save(&st).await.unwrap();
+    assert_eq!(store.load("s1").await.unwrap(), Some(st.clone()));
+    st.filling.clear();
+    store.save(&st).await.unwrap();
+    assert_eq!(store.load("s1").await.unwrap(), Some(st.clone()));
     // A row written before the column existed reads as no reason.
     sqlx::query("UPDATE sync_state SET resync_reason = NULL")
         .execute(store.pool())

@@ -68,6 +68,27 @@ Rules the engine enforces:
 - Shadow index name: `{index}__connect_{sync_id_short}`. On completion:
   `copy_settings(live → shadow)` happens before the snapshot,
   `swap(live, shadow)` after, then `delete_index(shadow)`.
+- A snapshot writes straight into a live index that holds no document, and
+  into a shadow of one that does. The indexes it fills from empty are saved
+  in `SyncState::filling` before the first document is written, and cleared
+  with the checkpoint that ends the snapshot. An interrupted snapshot (a
+  crash, a deploy, a hold) leaves them half filled: the next run finds them
+  in `filling`, empties them (`delete_all_documents`) and fills them again in
+  place. No shadow means no `copy_settings`, which Meilisearch makes
+  impossible for an index whose embedder has an API key (it only returns the
+  key redacted). An index that held documents before the sync started, or
+  that a snapshot has completed, is never in `filling`: it is only ever
+  rebuilt aside. A `PUT` that starts the sync over keeps the entries still
+  mapped on the same Meilisearch (`server::manager`). Two things this
+  accepts:
+  - The engine takes every document of such an index for this sync's own,
+    and nothing checks it: what another writer added meanwhile (a second
+    sync mapped to the same index, a script) is emptied with the rest, at the
+    start of the run. A shadow replaced it too, but only at the swap.
+  - A run that dies after the last row of the snapshot and before the
+    checkpoint is saved leaves a complete copy that never streamed. It is in
+    `filling`, so it is emptied and copied again, and searches see it empty
+    then partial meanwhile; a shadow would have kept it serving.
 
 ## Metering
 
@@ -301,7 +322,9 @@ lock is bounded by `SHUTDOWN_GRACE_SECS`.
 down with the old spec first (nothing changes when that fails, unless
 `force`), then the checkpoint is cleared; new streams or another Meilisearch
 URL clear the checkpoint (full snapshot, into shadow indexes where the live
-ones hold data); anything else restarts. A paused sync stays paused.
+ones hold data, in place for the indexes an interrupted first copy was
+filling: `SyncState::filling` is kept for those still mapped on the same
+Meilisearch); anything else restarts. A paused sync stays paused.
 
 Bounds: `MAX_SYNCS_PER_TENANT`, probe slots (global and per tenant), a
 request timeout, dead letters per sync (enforced by the store, overflow

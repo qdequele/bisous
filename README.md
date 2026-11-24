@@ -138,7 +138,8 @@ spec the API returns has the Meilisearch key and the source's secrets
 - **Other streams** (index, primary key, fields, renames, vector, a new
   collection) **or another Meilisearch URL**: the checkpoint is cleared and
   the sync snapshots everything again, into shadow indexes where the live
-  ones hold data, so new mappings are backfilled.
+  ones hold data, so new mappings are backfilled. An index the sync was
+  still filling for the first time is emptied and filled again in place.
 - **Anything else** (name, guard, secrets, tuning): a plain restart.
 
 A paused sync stays paused. Send
@@ -198,7 +199,7 @@ UTC day or per sync; at most 366 days, the last 30 by default.
 ```bash
 curl -s -X POST $API/syncs/$ID/pause   -H "$AUTH"   # stays paused across restarts
 curl -s -X POST $API/syncs/$ID/resume  -H "$AUTH"   # also restarts a held or failed sync
-curl -s -X POST $API/syncs/$ID/resync  -H "$AUTH"   # full rebuild through shadow indexes
+curl -s -X POST $API/syncs/$ID/resync  -H "$AUTH"   # full rebuild through shadow indexes (in place while the first copy never completed)
 curl -s -X POST $API/syncs/$ID/release -H "$AUTH"   # apply the TRUNCATE / mass delete that held it
 ```
 

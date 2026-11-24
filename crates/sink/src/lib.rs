@@ -5,6 +5,12 @@
 
 mod client;
 
+/// What the refusal of [`MeiliSink`]'s `copy_settings` says when an embedder
+/// of the index to rebuild holds an API key. The server gives that refusal a
+/// description of its own (`server::reason`): its usual one for a refused
+/// request talks about the primary key.
+pub const EMBEDDER_KEY_NOT_COPIED: &str = "which Meilisearch only returns redacted";
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -803,8 +809,8 @@ impl Sink for MeiliSink {
         if let Some(embedder) = embedder_with_api_key(&settings) {
             return Err(SinkError::Config(format!(
                 "cannot copy the settings of index `{from}` to `{to}`: embedder `{embedder}` has \
-                 an API key, which Meilisearch only returns redacted; copying it would install a \
-                 broken key"
+                 an API key, {EMBEDDER_KEY_NOT_COPIED}; copying it would install a broken key. \
+                 Empty `{from}` (its settings are kept) or remove the key, then resume"
             )));
         }
         // Every key of `GET /settings` is accepted back by `PATCH` (checked

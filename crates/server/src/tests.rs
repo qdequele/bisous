@@ -1393,6 +1393,66 @@ async fn the_same_meilisearch_written_another_way_keeps_the_checkpoint() {
     wait_for(async || copied().await > first_copy).await;
 }
 
+/// A `PUT` that starts the sync over keeps what an interrupted first copy
+/// was filling from empty, while that still describes the index: on the
+/// same Meilisearch, for an index still mapped.
+#[tokio::test]
+async fn a_put_keeps_the_indexes_an_interrupted_first_copy_was_filling() {
+    let a = app(locked());
+    let id = create(&a, &lab("t1"), "s").await;
+    let uri = format!("/syncs/{id}");
+    let status_uri = format!("/syncs/{id}/status");
+    wait_for(async || {
+        call(&a.router, "GET", &status_uri, &lab("t1"), None)
+            .await
+            .1["phase"]
+            == "streaming"
+    })
+    .await;
+    // Paused, so no run touches the state: what an interruption in the
+    // middle of a first copy into `items` and `gone` leaves.
+    let (status, _) = call(
+        &a.router,
+        "POST",
+        &format!("/syncs/{id}/pause"),
+        &lab("t1"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let interrupted = async || {
+        let mut state = a.state.state_store().load(&id).await.unwrap().unwrap();
+        state.checkpoint = None;
+        state.filling = vec!["items".into(), "gone".into()];
+        a.state.state_store().save(&state).await.unwrap();
+    };
+    let filling = async || {
+        let state = a.state.state_store().load(&id).await.unwrap().unwrap();
+        assert_eq!(state.phase, meili_connect_core::SyncPhase::Paused);
+        state.filling
+    };
+
+    // Another stream is added: `items` is still this sync's partial copy,
+    // `gone` is no longer mapped.
+    interrupted().await;
+    let mut body = sync_body("s");
+    body["streams"] = json!([
+        {"collection": "public.items", "index": "items"},
+        {"collection": "public.orders", "index": "orders"},
+    ]);
+    let (status, updated) = call(&a.router, "PUT", &uri, &lab("t1"), Some(body)).await;
+    assert_eq!(status, StatusCode::OK, "{updated}");
+    assert_eq!(filling().await, vec!["items".to_owned()]);
+
+    // Another Meilisearch: nothing there is this sync's.
+    interrupted().await;
+    let mut body = sync_body("s");
+    body["destination"]["url"] = json!("http://other-meili:7700");
+    let (status, updated) = call(&a.router, "PUT", &uri, &lab("t1"), Some(body)).await;
+    assert_eq!(status, StatusCode::OK, "{updated}");
+    assert!(filling().await.is_empty());
+}
+
 // ------------------------------------------------------------- quotas
 
 #[tokio::test]

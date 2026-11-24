@@ -525,6 +525,7 @@ pub(crate) mod tests {
             message: message.map(str::to_owned),
             resyncing,
             resync_reason: None,
+            filling: Vec::new(),
             updated_at: Utc::now(),
         }
     }

@@ -780,6 +780,7 @@ fn interrupted_resync(reason: ResyncReason) -> SyncState {
         message: None,
         resyncing: true,
         resync_reason: Some(reason),
+        filling: Vec::new(),
         updated_at: chrono::Utc::now(),
     }
 }
@@ -818,4 +819,274 @@ fn a_state_saved_before_the_reason_existed_still_reads() {
     });
     let state: SyncState = serde_json::from_value(old).expect("old state");
     assert_eq!(state.resync_reason, None);
+    assert!(state.filling.is_empty());
+}
+
+// ------------------------------------------- a first copy that is interrupted
+
+/// What an interruption (a crash, a deploy, a hold) in the middle of a first
+/// copy leaves in the store: no checkpoint, and the indexes the copy was
+/// filling from empty.
+fn interrupted_first_copy(phase: SyncPhase, message: Option<&str>) -> SyncState {
+    SyncState {
+        sync_id: SYNC_ID.into(),
+        phase,
+        checkpoint: None,
+        message: message.map(str::to_owned),
+        resyncing: false,
+        resync_reason: None,
+        filling: vec![INDEX.into()],
+        updated_at: chrono::Utc::now(),
+    }
+}
+
+/// The settings of an index whose embedder holds an API key: Meilisearch
+/// only gives the key back redacted, so they cannot be copied to a shadow.
+fn embedder_settings() -> serde_json::Value {
+    json!({"embedders": {"default": {"source": "openAi", "apiKey": "sk-XXXX..."}}})
+}
+
+fn shadow_calls(h: &Harness) -> Vec<String> {
+    let shadow = shadow_index_uid(INDEX, SYNC_ID);
+    h.sink
+        .calls()
+        .into_iter()
+        .filter(|c| c.contains(&shadow) || c.starts_with("copy_settings") || c.starts_with("swap"))
+        .collect()
+}
+
+#[tokio::test]
+async fn a_first_copy_records_the_indexes_it_fills_from_empty_before_writing() {
+    let h = Harness::new();
+    seed_rows(&h, 1..=3);
+    h.origin.state().snapshot_delay = Duration::from_millis(400);
+
+    let (cancel, handle) = spawn(&h, spec(), options());
+    wait_for("the copy says which index it fills", 5, || {
+        h.store
+            .state(SYNC_ID)
+            .is_some_and(|s| s.filling == vec![INDEX.to_owned()])
+    })
+    .await;
+    // Recorded before the first document: an interruption right after the
+    // first batch must already find it.
+    assert!(h.sink.docs(INDEX).is_empty(), "nothing written yet");
+    assert_eq!(h.store.phase(SYNC_ID), Some(SyncPhase::Snapshotting));
+
+    wait_synced(&h).await;
+    stop(cancel, handle).await;
+    let state = h.store.state(SYNC_ID).expect("state");
+    assert!(
+        state.filling.is_empty(),
+        "cleared once the copy is complete"
+    );
+    assert!(shadow_calls(&h).is_empty(), "{:?}", h.sink.calls());
+}
+
+/// Batches of the interrupted run may still be queued on Meilisearch when
+/// the next one starts, the index still counting zero documents: it is
+/// emptied all the same, and the delete runs after them.
+#[tokio::test]
+async fn a_recorded_index_is_emptied_even_when_it_counts_no_document_yet() {
+    let h = Harness::new();
+    seed_rows(&h, 1..=3);
+    h.sink.create(INDEX, embedder_settings(), vec![]);
+    h.store.inner().states.insert(
+        SYNC_ID.into(),
+        interrupted_first_copy(SyncPhase::Snapshotting, None),
+    );
+
+    let (cancel, handle) = spawn(&h, spec(), options());
+    wait_synced(&h).await;
+    stop(cancel, handle).await;
+
+    let calls = h.sink.calls();
+    assert!(calls.contains(&format!("delete_all {INDEX}")), "{calls:?}");
+    assert!(shadow_calls(&h).is_empty(), "{calls:?}");
+}
+
+#[tokio::test]
+async fn an_interrupted_first_copy_is_refilled_in_place() {
+    let h = Harness::new();
+    seed_rows(&h, 1..=3);
+    // The partial copy: row 1, and row 99 that the origin deleted since.
+    h.sink.create(
+        INDEX,
+        embedder_settings(),
+        vec![
+            ("1".into(), doc(json!({"id": "1", "name": "old"}))),
+            ("99".into(), doc(json!({"id": "99", "name": "gone"}))),
+        ],
+    );
+    h.store.inner().states.insert(
+        SYNC_ID.into(),
+        interrupted_first_copy(SyncPhase::Snapshotting, None),
+    );
+
+    let (cancel, handle) = spawn(&h, spec(), options());
+    wait_synced(&h).await;
+    stop(cancel, handle).await;
+
+    // Emptied, then written to directly: no shadow index, so no settings to
+    // copy, and the document of the deleted row is gone.
+    assert_eq!(h.sink.docs(INDEX), h.origin.expected());
+    let calls = h.sink.calls();
+    assert!(calls.contains(&format!("delete_all {INDEX}")), "{calls:?}");
+    assert!(shadow_calls(&h).is_empty(), "{calls:?}");
+    assert_eq!(h.sink.state().indexes[INDEX].settings, embedder_settings());
+
+    let state = h.store.state(SYNC_ID).expect("state");
+    assert!(state.filling.is_empty());
+    assert!(
+        h.store.inner().history.iter().all(|s| !s.resyncing),
+        "a first copy, not a resync"
+    );
+    assert_eq!(metered(&h).documents_snapshot, 3);
+    h.assert_acks_sound();
+}
+
+#[tokio::test]
+async fn a_held_first_copy_resumes_in_place_even_when_a_resync_is_asked() {
+    let h = Harness::new();
+    seed_rows(&h, 1..=3);
+    h.sink.create(
+        INDEX,
+        embedder_settings(),
+        vec![("99".into(), doc(json!({"id": "99", "name": "gone"})))],
+    );
+    h.store.inner().states.insert(
+        SYNC_ID.into(),
+        interrupted_first_copy(SyncPhase::Held, Some("Meilisearch configuration error: x")),
+    );
+
+    // Resuming a held sync, or pressing Resync on it, starts a run with the
+    // stored state: both must take the same path.
+    let mut opts = options();
+    opts.resync = true;
+    let (cancel, handle) = spawn(&h, spec(), opts);
+    wait_synced(&h).await;
+    stop(cancel, handle).await;
+
+    assert_eq!(h.sink.docs(INDEX), h.origin.expected());
+    assert!(shadow_calls(&h).is_empty(), "{:?}", h.sink.calls());
+    let state = h.store.state(SYNC_ID).expect("state");
+    assert!(
+        state.filling.is_empty() && !state.resyncing && state.message.is_none(),
+        "{state:?}"
+    );
+}
+
+/// The limit that stays: an index with a keyed embedder that held documents
+/// before the sync cannot be rebuilt aside, and is not this sync's to empty.
+/// Held, nothing touched (`embedder_settings` makes the fake sink refuse the
+/// copy like Meilisearch's redacted keys make the real one).
+#[tokio::test]
+async fn a_populated_index_with_a_keyed_embedder_that_is_not_ours_is_held_untouched() {
+    let h = Harness::new();
+    seed_rows(&h, 1..=3);
+    let theirs = vec![("99".to_owned(), doc(json!({"id": "99", "name": "theirs"})))];
+    h.sink.create(INDEX, embedder_settings(), theirs.clone());
+
+    let result = finish(spawn(&h, spec(), options()).1).await;
+    assert!(
+        matches!(&result, Err(EngineError::Sink(SinkError::Config(m))) if m.contains("API key")),
+        "{result:?}"
+    );
+    assert_eq!(h.sink.docs(INDEX), theirs.into_iter().collect());
+    let calls = h.sink.calls();
+    assert!(!calls.contains(&format!("delete_all {INDEX}")), "{calls:?}");
+    assert!(
+        h.store.inner().history.iter().all(|s| s.filling.is_empty()),
+        "never recorded as this sync's"
+    );
+}
+
+/// A state that still lists an index although the sync has a checkpoint
+/// (written by an older binary after a rollback, say) must not empty a
+/// complete index: resuming the stream drops the stale entry.
+#[tokio::test]
+async fn resuming_a_stream_drops_a_stale_entry_without_emptying_anything() {
+    let h = Harness::new();
+    seed_rows(&h, 1..=3);
+    let (cancel, handle) = spawn(&h, spec(), options());
+    wait_synced(&h).await;
+    stop(cancel, handle).await;
+    h.store
+        .inner()
+        .states
+        .get_mut(SYNC_ID)
+        .expect("state")
+        .filling = vec![INDEX.into()];
+
+    h.origin.tx(vec![upsert(4, json!({"name": "p4"}))]);
+    let (cancel, handle) = spawn(&h, spec(), options());
+    wait_for("the entry is dropped", 5, || {
+        h.store.state(SYNC_ID).is_some_and(|s| s.filling.is_empty())
+    })
+    .await;
+    wait_synced(&h).await;
+    stop(cancel, handle).await;
+
+    assert_eq!(h.sink.docs(INDEX).len(), 4);
+    let calls = h.sink.calls();
+    assert!(!calls.contains(&format!("delete_all {INDEX}")), "{calls:?}");
+    assert_eq!(h.origin.state().snapshots, 1, "no second snapshot");
+}
+
+/// The whole life of a first copy: once it is complete the index is no
+/// longer this sync's to empty, and a resync builds it aside again.
+#[tokio::test]
+async fn a_completed_first_copy_is_resynced_through_a_shadow_again() {
+    let h = Harness::new();
+    seed_rows(&h, 1..=3);
+    let (cancel, handle) = spawn(&h, spec(), options());
+    wait_synced(&h).await;
+    stop(cancel, handle).await;
+    h.sink
+        .state()
+        .indexes
+        .get_mut(INDEX)
+        .expect("live index")
+        .settings = json!({"rankingRules": ["words"]});
+
+    let mut opts = options();
+    opts.resync = true;
+    let (cancel, handle) = spawn(&h, spec(), opts);
+    wait_for("resynced", 5, || {
+        h.origin.state().snapshots == 2
+            && h.store
+                .state(SYNC_ID)
+                .is_some_and(|s| s.phase == SyncPhase::Streaming && !s.resyncing)
+    })
+    .await;
+    stop(cancel, handle).await;
+
+    resync_calls_ok(&h);
+    let calls = h.sink.calls();
+    assert!(!calls.contains(&format!("delete_all {INDEX}")), "{calls:?}");
+}
+
+#[tokio::test]
+async fn an_index_that_held_documents_before_the_sync_is_never_emptied() {
+    let h = Harness::new();
+    seed_rows(&h, 1..=3);
+    // Somebody else's documents: the sync has no state yet.
+    h.sink.create(
+        INDEX,
+        json!({"rankingRules": ["words"]}),
+        vec![("99".into(), doc(json!({"id": "99", "name": "theirs"})))],
+    );
+
+    let (cancel, handle) = spawn(&h, spec(), options());
+    wait_synced(&h).await;
+    stop(cancel, handle).await;
+
+    // Built aside and swapped in, as before: the live index kept serving.
+    resync_calls_ok(&h);
+    let calls = h.sink.calls();
+    assert!(!calls.contains(&format!("delete_all {INDEX}")), "{calls:?}");
+    assert!(
+        h.store.inner().history.iter().all(|s| s.filling.is_empty()),
+        "not an index this sync fills from empty"
+    );
 }

@@ -660,6 +660,16 @@ impl Sink for FakeSink {
             .get(from)
             .map(|i| i.settings.clone())
             .ok_or_else(|| SinkError::Config(format!("{from} missing")))?;
+        // Like the real sink: Meilisearch only returns an embedder's API key
+        // redacted, so such settings cannot be copied.
+        let keyed = settings["embedders"]
+            .as_object()
+            .is_some_and(|e| e.values().any(|v| !v["apiKey"].is_null()));
+        if keyed {
+            return Err(SinkError::Config(format!(
+                "cannot copy the settings of index `{from}` to `{to}`: an embedder has an API key"
+            )));
+        }
         st.indexes.entry(to.into()).or_default().settings = settings;
         Ok(())
     }

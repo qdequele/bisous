@@ -264,8 +264,9 @@ impl RunMonitor {
 /// Runs one sync until it is cancelled (`Ok`) or an error stops it.
 ///
 /// `PositionLost` (from `open` or `stream`) and `options.resync` are handled
-/// here by a resync into shadow indexes, at most three in a row; past that
-/// the sync is held. Guards save the state as `Held` and return
+/// here by a resync into shadow indexes (in place for the indexes of
+/// `SyncState::filling`), at most three in a row; past that the sync is
+/// held. Guards save the state as `Held` and return
 /// [`EngineError::Held`]. Every other error is returned as is; mapping it
 /// to a phase and a retry policy is the supervisor's job.
 pub async fn run_sync(
@@ -301,6 +302,7 @@ pub async fn run_sync_monitored(
         message: None,
         resyncing: false,
         resync_reason: None,
+        filling: Vec::new(),
         updated_at: Utc::now(),
     });
     let live = spec
@@ -554,6 +556,7 @@ impl Runner<'_> {
                     s.message = None;
                     s.resyncing = false;
                     s.resync_reason = None;
+                    s.filling.clear();
                 })
                 .await?;
                 self.monitor.checkpointed();
@@ -568,12 +571,14 @@ impl Runner<'_> {
                 if self.state.phase != SyncPhase::Streaming
                     || self.state.message.is_some()
                     || self.state.resyncing
+                    || !self.state.filling.is_empty()
                 {
                     self.update(|s| {
                         s.phase = SyncPhase::Streaming;
                         s.message = None;
                         s.resyncing = false;
                         s.resync_reason = None;
+                        s.filling.clear();
                     })
                     .await?;
                 }
@@ -591,8 +596,9 @@ impl Runner<'_> {
     }
 
     /// Prepares the targets (shadow indexes for live indexes that hold
-    /// data), runs the snapshot when the source can, then swaps the shadows
-    /// in.
+    /// data, the live index itself when it is empty or when an interrupted
+    /// snapshot of this sync was filling it), runs the snapshot when the
+    /// source can, then swaps the shadows in.
     async fn initial_load(
         &mut self,
         source: Box<dyn Source>,
@@ -608,13 +614,30 @@ impl Runner<'_> {
         for live in &self.live {
             guarded(self.cancel, sink.ensure_index(live)).await?;
         }
+        // The live indexes this snapshot writes to directly because they hold
+        // nothing that is not this sync's own (`SyncState::filling`).
+        let mut filling: Vec<String> = Vec::new();
         for live in self.live.clone() {
             let populated = snapshot
                 && guarded(self.cancel, sink.document_count(&live.uid))
                     .await?
                     .unwrap_or(0)
                     > 0;
-            if populated {
+            if snapshot && self.state.filling.contains(&live.uid) {
+                // An earlier snapshot of this sync found the index empty and
+                // was interrupted while filling it: what it holds is a
+                // partial copy, possibly of rows deleted since. Emptied and
+                // filled again in place. No shadow index, so no settings to
+                // copy: an index whose embedder has an API key cannot be
+                // rebuilt aside, and a first copy into one would otherwise
+                // be held for good after any interruption. Emptied whatever
+                // it counts now: batches of the interrupted run may still
+                // be queued on Meilisearch, which runs this delete after
+                // them.
+                guarded(self.cancel, sink.delete_all_documents(&live.uid)).await?;
+                filling.push(live.uid.clone());
+                targets.push(live);
+            } else if populated {
                 let shadow = IndexTarget {
                     uid: shadow_index_uid(&live.uid, &self.spec.id),
                     primary_key: live.primary_key.clone(),
@@ -627,15 +650,21 @@ impl Runner<'_> {
                 targets.push(shadow.clone());
                 swaps.push((live, shadow));
             } else {
+                if snapshot {
+                    filling.push(live.uid.clone());
+                }
                 targets.push(live);
             }
         }
 
         let resyncing = !swaps.is_empty() || self.state.resyncing;
+        // Saved before the first document is written: an interruption right
+        // after it must find the indexes this snapshot was filling.
         self.update(|s| {
             s.phase = SyncPhase::Snapshotting;
             s.message = None;
             s.resyncing = resyncing;
+            s.filling = filling;
             if !resyncing {
                 s.resync_reason = None;
             } else if s.resync_reason.is_none() {

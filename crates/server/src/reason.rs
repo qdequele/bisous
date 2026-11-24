@@ -101,6 +101,11 @@ impl Reason {
         match (class, self) {
             (SinkError::Transient(_), _) => SINK_UNREACHABLE,
             (SinkError::Fatal(_), _) => SINK_FATAL,
+            (SinkError::Config(text), _)
+                if text.contains(meili_connect_sink::EMBEDDER_KEY_NOT_COPIED) =>
+            {
+                SINK_EMBEDDER_KEY
+            }
             (SinkError::Config(_), Reason::DestinationAuth) => SINK_AUTH,
             (SinkError::Config(_), Reason::DestinationUnreachable) => SINK_UNRESOLVED,
             (SinkError::Config(_), _) => SINK_CONFIG,
@@ -131,10 +136,13 @@ const SINK_UNREACHABLE: &str = "Meilisearch could not be reached or did not answ
 const SINK_UNRESOLVED: &str = "the Meilisearch host could not be found: check the URL";
 const SINK_AUTH: &str = "Meilisearch refused the API key: check the key and its actions";
 const SINK_CONFIG: &str = "Meilisearch refused the request: check the index and its primary key";
+const SINK_EMBEDDER_KEY: &str = "an index that already holds documents has an embedder with an API \
+     key, which Meilisearch does not give back, so the index cannot be rebuilt next to itself: \
+     empty that index (its settings are kept) or remove the key, then resume";
 const SINK_FATAL: &str = "Meilisearch rejected the request";
 
 /// Every fixed description with its reason.
-const COARSE: [(&str, Reason); 13] = [
+const COARSE: [(&str, Reason); 14] = [
     (SOURCE_UNREACHABLE, Reason::SourceUnreachable),
     (SOURCE_UNRESOLVED, Reason::SourceUnreachable),
     (SOURCE_POSITION_LOST, Reason::SourceConfig),
@@ -147,6 +155,7 @@ const COARSE: [(&str, Reason); 13] = [
     (SINK_UNRESOLVED, Reason::DestinationUnreachable),
     (SINK_AUTH, Reason::DestinationAuth),
     (SINK_CONFIG, Reason::DestinationRejected),
+    (SINK_EMBEDDER_KEY, Reason::DestinationRejected),
     (SINK_FATAL, Reason::DestinationRejected),
 ];
 
@@ -486,6 +495,32 @@ mod tests {
             let coarse = coarse_sink(&e);
             assert_eq!(for_state(&persisted(coarse)), reason, "{e}");
         }
+    }
+
+    /// The refusal to rebuild an index whose embedder has a key gets a
+    /// description that says what to do, not the one about primary keys.
+    #[test]
+    fn the_embedder_key_refusal_tells_what_to_do() {
+        let detailed = SinkError::Config(format!(
+            "cannot copy the settings of index `a` to `b`: embedder `e` has an API key, {}; \
+             copying it would install a broken key. Empty `a` (its settings are kept) or remove \
+             the key, then resume",
+            meili_connect_sink::EMBEDDER_KEY_NOT_COPIED
+        ));
+        let coarse = coarse_sink(&detailed);
+        let text = coarse.to_string();
+        assert!(matches!(coarse, SinkError::Config(_)));
+        assert!(text.contains("empty that index"), "{text}");
+        assert!(!text.contains("primary key"), "{text}");
+        // Nothing of the detail: no index or embedder name.
+        assert!(!text.contains('`'), "{text}");
+        assert_eq!(for_state(&persisted(coarse)), Reason::DestinationRejected);
+
+        // Any other refused request keeps the usual description.
+        let other = coarse_sink(&SinkError::Config(
+            "index_primary_key_already_exists".into(),
+        ));
+        assert!(other.to_string().contains("primary key"), "{other}");
     }
 
     #[test]

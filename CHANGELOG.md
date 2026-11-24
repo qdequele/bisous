@@ -195,6 +195,21 @@ All notable changes to meili-connect are listed here. The format follows
 
 ### Fixed
 
+- A first sync interrupted while it copied into an index whose embedder has
+  an API key no longer stays held. On restart the engine found the index
+  half filled, took it for somebody else's data and rebuilt it in a shadow
+  index, whose settings it cannot copy (Meilisearch only returns the
+  embedder's key redacted): `held`, on every resume. The indexes a snapshot
+  fills from empty are now remembered (`filling` in the sync's state, new
+  column `sync_state.filling`, migration `20261124000001`), and an
+  interrupted snapshot empties them and fills them again in place: no shadow
+  index, no settings copy. An index that held documents before the sync, or
+  a completed one that is resynced, is still rebuilt aside and swapped in,
+  and still held when its embedder has an API key: the hold now says so and
+  what to do (empty the index, whose settings are kept, or remove the key,
+  then resume), instead of "check the index and its primary key". A sync
+  interrupted before this version has no record of what it was filling:
+  empty its index once, then resume.
 - A `PUT` that writes the same Meilisearch URL another way (a trailing
   slash, the host in another case, the default port) no longer counts as
   another destination: the sync restarted from scratch and copied, and
