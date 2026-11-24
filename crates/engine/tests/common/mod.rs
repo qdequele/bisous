@@ -803,6 +803,7 @@ pub fn spec() -> SyncSpec {
         destination: MeiliDestination {
             url: "http://localhost:7700".into(),
             api_key: Secret::new("key"),
+            embedder_keys: Default::default(),
         },
         streams: vec![StreamMapping {
             collection: COLLECTION.into(),

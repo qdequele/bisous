@@ -141,6 +141,16 @@ pub fn redact_spec(spec: &mut Value) {
         redact_source_config(kind, config);
     }
     redact_at(spec, &["destination", "api_key"]);
+    // Keyed by the embedder's URL, so no field name gives these away.
+    if let Some(keys) = spec
+        .get_mut("destination")
+        .and_then(|d| d.get_mut("embedder_keys"))
+        .and_then(Value::as_object_mut)
+    {
+        for key in keys.values_mut().filter(|k| !k.is_null()) {
+            *key = Value::String(REDACTED.to_owned());
+        }
+    }
     if let Some(source) = spec.get_mut("source") {
         redact_by_name(source);
     }

@@ -40,6 +40,22 @@ on all indexes; same lifecycle as `lab-pipelines`). On responses the Lab maps
 the URL back to the instance slug. Standalone meili-connect keeps the
 `{"url", "api_key"}` form.
 
+When that instance has Lumen embedders (the console's embedder wizard), the
+Lab adds `"embedder_keys": {"<Gateway public URL>/v1/embeddings": "<the
+instance's lab-embedder key>"}` to the destination: the URL those embedders
+call, exactly as the wizard writes it in the index settings, and the key it
+writes there. Meilisearch never gives that key back, so without it an index
+with such an embedder cannot be rebuilt in a shadow index (a resync) and the
+sync is held (`destination_rejected`). The engine writes the key only into
+an embedder whose `url` is exactly that one; an embedder calling anything
+else with a key of its own (a team's own provider key) is still refused.
+The key is redacted in every answer like `api_key`, under its URL: the Lab
+reads `destination.embedder_keys` in the answer to a sync write to know the
+engine took the key (an engine that predates the field ignores it and
+answers without). The Lab sends the destination again when the embedder key
+or the Gateway's address changes, as it does for `lab-connect`, and only to
+its hosted engine.
+
 ## Supabase OAuth
 
 "Connect with Supabase" is a Lab feature; the engine only sees a plain
@@ -196,7 +212,7 @@ engine sends it (it does since the schema has `syncStateData`).
 | `invalid_config` | The source configuration or the sync spec is invalid |
 | `resync_budget_spent` | The position was lost again after the allowed resyncs in a row |
 | `destination_auth` | Meilisearch refused the API key |
-| `destination_rejected` | Meilisearch refused the index (primary key) or the documents, or an index that holds documents cannot be rebuilt aside because its embedder has an API key (its own message says to empty the index or remove the key) |
+| `destination_rejected` | Meilisearch refused the index (primary key) or the documents, or an index that holds documents cannot be rebuilt aside because its embedder has an API key the destination's `embedder_keys` does not name (its own message says to empty the index or remove the key) |
 | `destination_unreachable` | Meilisearch does not answer (also a batch held after failing 10 times) |
 | `delete_guard` | A truncate or a mass delete was held back |
 | `internal` | Anything else |
