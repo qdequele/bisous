@@ -764,6 +764,18 @@ components:
           properties:
             url: { type: string }
             api_key: { type: string, writeOnly: true }
+            embedder_keys:
+              type: object
+              maxProperties: 16
+              additionalProperties: { type: string, writeOnly: true, minLength: 1 }
+              description: >-
+                API keys of embedders on the destination's indexes, by the exact
+                `url` the embedder calls (an http(s) URL, as written in the index
+                settings). Meilisearch never returns an embedder's key, so the
+                engine puts these back when it copies an index's settings to the
+                shadow index a resync builds. A key is only written as the
+                `apiKey` of an embedder at exactly that URL. The URL may not
+                carry a user or a password. Returned as `"<redacted>"`.
         streams:
           type: array
           items: { $ref: "#/components/schemas/StreamMapping" }

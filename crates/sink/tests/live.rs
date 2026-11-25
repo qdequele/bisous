@@ -1,5 +1,7 @@
 //! Against a real Meilisearch. Set `MEILI_TEST_URL` (and `MEILI_TEST_KEY`
-//! when the instance has a master key); skipped otherwise.
+//! when the instance has a master key); skipped otherwise. The test where
+//! Meilisearch calls an embedding server back also needs
+//! `MEILI_TEST_CALLBACK_HOST` (see `callback_host`).
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -31,6 +33,7 @@ fn sink(l: &Live, opts: SinkOptions) -> MeiliSink {
     let dest = MeiliDestination {
         url: l.url.clone(),
         api_key: Secret::new(l.key.clone()),
+        embedder_keys: Default::default(),
     };
     MeiliSink::new(&dest, opts).unwrap()
 }
@@ -512,6 +515,122 @@ async fn copy_settings_with_embedders() {
     );
 
     for ix in [keyed, keyless, copy] {
+        s.delete_index(&ix).await.unwrap();
+    }
+}
+
+/// The name under which Meilisearch reaches this test process (for
+/// example `host.docker.internal`, or `127.0.0.1` on the same host): set
+/// `MEILI_TEST_CALLBACK_HOST` to run the tests where Meilisearch calls an
+/// embedding server back. Meilisearch refuses embedders at internal
+/// addresses unless started with `MEILI_EXPERIMENTAL_ALLOWED_IP_NETWORKS`
+/// (for example `0.0.0.0/0`): without it the embedding never ends.
+fn callback_host() -> Option<String> {
+    let host = std::env::var("MEILI_TEST_CALLBACK_HOST")
+        .ok()
+        .filter(|h| !h.is_empty());
+    if host.is_none() {
+        eprintln!("MEILI_TEST_CALLBACK_HOST is unset: skipping live embedder test");
+    }
+    host
+}
+
+/// An index whose embedder has a key is rebuilt aside when the destination
+/// names that key: the shadow gets the real key, not the redacted one
+/// Meilisearch returns, so it embeds.
+#[tokio::test]
+async fn a_shadow_embeds_with_the_named_embedder_key() {
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let Some(l) = live() else { return };
+    let Some(host) = callback_host() else { return };
+    const REAL: &str = "embedder-key-0123456789abcdef";
+    // An embedding server that only knows the real key.
+    let listener = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = MockServer::builder().listener(listener).start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/embeddings"))
+        .and(header("authorization", format!("Bearer {REAL}").as_str()))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"embedding": [0.1, 0.2, 0.3]})),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(401).set_body_json(json!({"error": "bad key"})))
+        .mount(&server)
+        .await;
+    let embedder_url = format!("http://{host}:{port}/v1/embeddings");
+
+    let live_ix = uid("embedder_live");
+    patch_settings(
+        &l,
+        &live_ix,
+        json!({"embedders": {"remote": {
+            "source": "rest",
+            "url": embedder_url,
+            "apiKey": REAL,
+            "dimensions": 3,
+            "request": {"input": "{{text}}"},
+            "response": {"embedding": "{{embedding}}"},
+            "documentTemplate": "{{doc.title}}",
+        }}}),
+    )
+    .await;
+    let shown = get_settings(&l, &live_ix).await["embedders"]["remote"]["apiKey"].clone();
+    assert_ne!(shown, REAL, "Meilisearch redacts the key");
+
+    let dest = MeiliDestination {
+        url: l.url.clone(),
+        api_key: Secret::new(l.key.clone()),
+        embedder_keys: [(embedder_url.clone(), Secret::new(REAL))].into(),
+    };
+    let s = MeiliSink::new(&dest, opts()).unwrap();
+    let shadow = IndexTarget {
+        uid: uid("embedder_shadow"),
+        primary_key: "id".into(),
+    };
+    s.copy_settings(&live_ix, &shadow.uid).await.unwrap();
+    // Redacted again on the way out, like the live one.
+    assert_eq!(
+        get_settings(&l, &shadow.uid).await,
+        get_settings(&l, &live_ix).await
+    );
+
+    // Nothing was embedded yet (`dimensions` spares the probe): the shadow
+    // embeds this document, with the key it was given.
+    assert!(server.received_requests().await.unwrap().is_empty());
+    s.ensure_index(&shadow).await.unwrap();
+    let r = s
+        .apply(
+            &shadow,
+            vec![replace("1", json!({"id": "1", "title": "Alien"}))],
+        )
+        .await
+        .unwrap();
+    assert_eq!((r.written, r.rejected.len()), (1, 0), "{:?}", r.rejected);
+    let calls = server.received_requests().await.unwrap();
+    assert!(!calls.is_empty());
+    for call in &calls {
+        assert_eq!(
+            call.headers.get("authorization").unwrap(),
+            &format!("Bearer {REAL}")
+        );
+    }
+
+    // The same index without the key named is still refused.
+    let e = sink(&l, opts())
+        .copy_settings(&live_ix, &uid("embedder_refused"))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&e, SinkError::Config(m) if m.contains("`remote`")),
+        "{e:?}"
+    );
+
+    for ix in [live_ix, shadow.uid] {
         s.delete_index(&ix).await.unwrap();
     }
 }

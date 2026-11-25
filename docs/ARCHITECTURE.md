@@ -75,8 +75,9 @@ Rules the engine enforces:
   crash, a deploy, a hold) leaves them half filled: the next run finds them
   in `filling`, empties them (`delete_all_documents`) and fills them again in
   place. No shadow means no `copy_settings`, which Meilisearch makes
-  impossible for an index whose embedder has an API key (it only returns the
-  key redacted). An index that held documents before the sync started, or
+  impossible for an index whose embedder has an API key the spec does not
+  name (it only returns the key redacted; see `embedder_keys` under
+  "Meilisearch writes"). An index that held documents before the sync started, or
   that a snapshot has completed, is never in `filling`: it is only ever
   rebuilt aside. A `PUT` that starts the sync over keeps the entries still
   mapped on the same Meilisearch (`server::manager`). Two things this
@@ -209,6 +210,23 @@ refuses none.
   - Only `ensure_index` creates indexes on purpose (when a sync starts). An
     index deleted while its sync streams is recreated by the next document
     write, with Meilisearch's defaults.
+- `copy_settings` reads the live index's settings and writes them to the
+  shadow. Meilisearch returns an embedder's `apiKey` redacted, so the key is
+  put back from `MeiliDestination::embedder_keys` (embedder `url` → key),
+  which the sink holds from the sync's spec. Only an embedder holds a key
+  Meilisearch redacts: the object under its name, and the `searchEmbedder`
+  and `indexingEmbedder` of a composite one. Its `apiKey` gets the key
+  named for the `url` written next to it, compared byte for byte.
+  Meilisearch sends an embedder's key to its `url`, so a key is never
+  written next to another URL, nor anywhere else in the embedder
+  (`headers`, `request` and fragments go as they are to wherever the
+  embedder points). Refused with `SinkError::Config`, since the redacted
+  key would be installed as is: an embedder holding a key the spec does not
+  name, a key whose readable start (Meilisearch leaves a few characters) is
+  not the named key's, or an `apiKey` anywhere a key is not restored. The
+  keys are stored and redacted like the Meilisearch key, and removed from
+  the errors of a settings copy and of document writes (the embedding
+  server's refusal, quoted by Meilisearch, may repeat one).
 
 ## Tenancy and the Lab
 

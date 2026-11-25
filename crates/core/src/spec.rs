@@ -1,6 +1,8 @@
 //! What a user configures: one sync = one source → one Meilisearch
 //! instance, with one or more collection → index mappings.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::Secret;
@@ -60,7 +62,17 @@ impl std::fmt::Debug for SourceSpec {
 pub struct MeiliDestination {
     pub url: String,
     pub api_key: Secret,
+    /// The API keys of embedders on the destination's indexes, by the exact
+    /// `url` the embedder calls. Meilisearch never gives an embedder's key
+    /// back, so settings copied to a shadow index would lose it: the sink
+    /// puts the key named here back into every embedder that calls that
+    /// URL, and into no other.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub embedder_keys: BTreeMap<String, Secret>,
 }
+
+/// More embedder keys than this on one destination is a mistake.
+pub const MAX_EMBEDDER_KEYS: usize = 16;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -182,6 +194,31 @@ impl SyncSpec {
         {
             return Err("mass_delete_guard must be between 0 and 1".to_owned());
         }
+        let keys = &self.destination.embedder_keys;
+        if keys.len() > MAX_EMBEDDER_KEYS {
+            return Err(format!(
+                "destination.embedder_keys holds more than {MAX_EMBEDDER_KEYS} keys"
+            ));
+        }
+        for (url, key) in keys {
+            // The sink compares it to an embedder's `url` byte for byte. It
+            // is not a secret (every answer shows it), so it may carry none.
+            let authority = url
+                .split_once("://")
+                .filter(|(scheme, _)| matches!(*scheme, "http" | "https"))
+                .map(|(_, rest)| rest.split(['/', '?', '#']).next().unwrap_or_default());
+            let plain = authority.is_some_and(|a| !a.is_empty() && !a.contains('@'));
+            if !plain || url.chars().any(char::is_whitespace) {
+                return Err(
+                    "destination.embedder_keys is keyed by the http(s) URL an embedder calls, \
+                     written exactly as in the embedder's settings, without a user or a password"
+                        .to_owned(),
+                );
+            }
+            if key.is_empty() {
+                return Err("destination.embedder_keys holds an empty key".to_owned());
+            }
+        }
         Ok(())
     }
 }
@@ -209,6 +246,7 @@ mod tests {
             destination: MeiliDestination {
                 url: "http://m".into(),
                 api_key: Secret::new("k"),
+                embedder_keys: Default::default(),
             },
             streams: streams
                 .into_iter()
@@ -247,5 +285,35 @@ mod tests {
         let mut s = spec(vec![("public.a", "a")]);
         s.mass_delete_guard = Some(1.5);
         assert!(s.validate().is_err());
+    }
+
+    #[test]
+    fn validate_checks_embedder_keys() {
+        let with = |keys: Vec<(String, &str)>| {
+            let mut s = spec(vec![("public.a", "a")]);
+            s.destination.embedder_keys = keys
+                .into_iter()
+                .map(|(url, key)| (url, Secret::new(key)))
+                .collect();
+            s.validate()
+        };
+        let url = "https://gateway.example/v1/embeddings";
+        assert!(with(vec![(url.to_owned(), "k")]).is_ok());
+        assert!(with(vec![("http://10.0.0.1:8080/embed?model=m".to_owned(), "k")]).is_ok());
+        for bad in [
+            "gateway.example/v1/embeddings".to_owned(),
+            "ftp://gateway.example/".to_owned(),
+            "https://".to_owned(),
+            format!("{url} "),
+            format!(" {url}"),
+            "https://user:password@gateway.example/v1/embeddings".to_owned(),
+            "https://token@gateway.example/".to_owned(),
+        ] {
+            assert!(with(vec![(bad.clone(), "k")]).is_err(), "{bad:?}");
+        }
+        assert!(with(vec![(url.to_owned(), "")]).is_err());
+        let many = |n: usize| (0..n).map(|i| (format!("{url}/{i}"), "k")).collect();
+        assert!(with(many(MAX_EMBEDDER_KEYS)).is_ok());
+        assert!(with(many(MAX_EMBEDDER_KEYS + 1)).is_err());
     }
 }

@@ -543,6 +543,7 @@ pub(crate) mod test_support {
             destination: MeiliDestination {
                 url: "http://meili:7700".into(),
                 api_key: Secret::new("meili-key"),
+                embedder_keys: Default::default(),
             },
             streams: vec![StreamMapping {
                 collection: "public.orders".into(),

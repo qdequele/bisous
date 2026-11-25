@@ -506,6 +506,7 @@ pub(crate) mod tests {
             destination: MeiliDestination {
                 url: "http://meili:7700".into(),
                 api_key: Secret::new("k"),
+                embedder_keys: Default::default(),
             },
             streams: vec![
                 serde_json::from_value::<StreamMapping>(

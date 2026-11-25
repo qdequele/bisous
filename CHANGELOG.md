@@ -192,6 +192,20 @@ All notable changes to meili-connect are listed here. The format follows
   next start, paused syncs stay paused.
 - Dockerfile, `compose.yaml` with a demo origin, CI, and `scripts/e2e.sh`
   (Postgres and MongoDB scenarios against real containers).
+- `destination.embedder_keys`: the API keys of embedders on the destination's
+  indexes, by the exact `url` the embedder calls. Meilisearch never returns
+  an embedder's key, so an index that holds documents and has such an
+  embedder could not be rebuilt in a shadow index: every resync of it was
+  held. The engine now puts a named key back when it copies the index's
+  settings to the shadow, only as the `apiKey` of an embedder whose `url` is
+  exactly the one named: never next to another URL, never in its headers or
+  request. An embedder with a key that is not named, or whose key does not
+  start like the named one, still holds the sync. The keys are stored
+  and redacted like `api_key`, a `"<redacted>"` placeholder only stands for
+  the key stored under the same embedder URL on the same Meilisearch, they
+  are removed from the errors Meilisearch answers, and changing them is a
+  plain restart (the checkpoint is kept). The Lab sends
+  the key of a team instance's Lumen embedders this way.
 
 ### Changed
 

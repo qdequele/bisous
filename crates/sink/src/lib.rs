@@ -11,13 +11,14 @@ mod client;
 /// request talks about the primary key.
 pub const EMBEDDER_KEY_NOT_COPIED: &str = "which Meilisearch only returns redacted";
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use meili_connect_core::{
-    ApplyReport, DocOp, Document, HostPolicy, IndexTarget, MeiliDestination, RejectedDoc, Sink,
-    SinkError,
+    ApplyReport, DocOp, Document, HostPolicy, IndexTarget, MeiliDestination, RejectedDoc, Secret,
+    Sink, SinkError,
 };
 use reqwest::{Method, StatusCode};
 use serde::Deserialize;
@@ -100,6 +101,8 @@ impl Default for SinkOptions {
 /// blocking pool finishes and is discarded.
 pub struct MeiliSink {
     client: Client,
+    /// Embedder `url` to its API key (`MeiliDestination::embedder_keys`).
+    embedder_keys: BTreeMap<String, Secret>,
 }
 
 impl std::fmt::Debug for MeiliSink {
@@ -309,25 +312,105 @@ fn unknown_setting(api: &client::ApiError, sent: &[(&'static str, serde_json::Va
 /// creation that does not settle (the engine then retries).
 const ENSURE_ROUNDS: usize = 4;
 
-/// The first embedder of `settings` that holds an `apiKey`, at any depth
-/// (composite embedders nest theirs). `GET /settings` always redacts API
-/// keys (`"sk-XXXXX..."`), so any key found there cannot be copied.
-fn embedder_with_api_key(settings: &serde_json::Value) -> Option<&str> {
-    fn has_key(v: &serde_json::Value) -> bool {
+/// Puts the real API key back into the embedders of `settings`, which
+/// `GET /settings` only returns redacted (`"sk-XXXXX..."`). Only an
+/// embedder itself holds a key Meilisearch redacts: the object under its
+/// name, and the `searchEmbedder` and `indexingEmbedder` of a composite
+/// one. Such an object with an `apiKey` gets the key `keys` names for the
+/// exact `url` written next to it. Meilisearch sends an embedder's key to
+/// its `url`, so a key is never written next to another one, however close
+/// (no trimming, no case folding, no parent's URL), and never anywhere else
+/// in the embedder: `headers`, `request` and fragments are sent as they
+/// are, wherever the embedder points.
+///
+/// Returns the first embedder that cannot be copied: it holds a key `keys`
+/// does not name, a key that does not start like the named one (Meilisearch
+/// leaves the first characters readable), or an `apiKey` somewhere a key
+/// is never restored.
+fn restore_embedder_keys(
+    settings: &mut serde_json::Value,
+    keys: &BTreeMap<String, Secret>,
+) -> Option<String> {
+    type Object = serde_json::Map<String, serde_json::Value>;
+
+    /// A non-null `apiKey` at any depth.
+    fn holds_key(v: &serde_json::Value) -> bool {
         match v {
             serde_json::Value::Object(o) => o
                 .iter()
-                .any(|(k, v)| (k == "apiKey" && !v.is_null()) || has_key(v)),
-            serde_json::Value::Array(a) => a.iter().any(has_key),
+                .any(|(k, v)| (k == "apiKey" && !v.is_null()) || holds_key(v)),
+            serde_json::Value::Array(a) => a.iter().any(holds_key),
             _ => false,
         }
     }
+
+    /// The readable start of a redacted key (`"sk-XXXXX..."` → `"sk-"`),
+    /// empty when the value does not look redacted.
+    fn readable_start(shown: &str) -> &str {
+        shown
+            .strip_suffix("...")
+            .map_or("", |s| s.trim_end_matches('X'))
+    }
+
+    /// One embedder object, not what it nests.
+    fn restore(embedder: &mut Object, keys: &BTreeMap<String, Secret>) -> bool {
+        let shown = match embedder.get("apiKey") {
+            None | Some(serde_json::Value::Null) => return true,
+            Some(shown) => shown.as_str().unwrap_or_default(),
+        };
+        let key = embedder
+            .get("url")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|url| keys.get(url));
+        match key {
+            Some(key) if key.expose().starts_with(readable_start(shown)) => {
+                embedder.insert("apiKey".to_owned(), key.expose().into());
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn copyable(embedder: &mut serde_json::Value, keys: &BTreeMap<String, Secret>) -> bool {
+        let Some(embedder) = embedder.as_object_mut() else {
+            return true;
+        };
+        restore(embedder, keys)
+            && embedder.iter_mut().all(|(field, value)| match value {
+                serde_json::Value::Object(nested)
+                    if field == "searchEmbedder" || field == "indexingEmbedder" =>
+                {
+                    restore(nested, keys)
+                        && nested.iter().all(|(f, v)| f == "apiKey" || !holds_key(v))
+                }
+                _ => field == "apiKey" || !holds_key(value),
+            })
+    }
+
     settings
-        .get("embedders")?
-        .as_object()?
-        .iter()
-        .find(|(_, e)| has_key(e))
-        .map(|(name, _)| name.as_str())
+        .get_mut("embedders")?
+        .as_object_mut()?
+        .iter_mut()
+        .find_map(|(name, embedder)| (!copyable(embedder, keys)).then(|| name.clone()))
+}
+
+/// `text` without the embedder keys the sink holds: Meilisearch, or the
+/// embedding server it quotes, may repeat a key it refuses.
+fn scrub(mut text: String, keys: &BTreeMap<String, Secret>) -> String {
+    for key in keys.values().filter(|k| !k.is_empty()) {
+        if text.contains(key.expose()) {
+            text = text.replace(key.expose(), "<redacted>");
+        }
+    }
+    text
+}
+
+fn without_keys(error: SinkError, keys: &BTreeMap<String, Secret>) -> SinkError {
+    match error {
+        SinkError::Transient(text) => SinkError::Transient(scrub(text, keys)),
+        SinkError::Config(text) => SinkError::Config(scrub(text, keys)),
+        SinkError::Fatal(text) => SinkError::Fatal(scrub(text, keys)),
+    }
 }
 
 /// What became of a document isolated with a possibly transient failure.
@@ -340,6 +423,7 @@ impl MeiliSink {
     pub fn new(destination: &MeiliDestination, options: SinkOptions) -> Result<Self, SinkError> {
         Ok(Self {
             client: Client::new(destination, options)?,
+            embedder_keys: destination.embedder_keys.clone(),
         })
     }
 
@@ -921,8 +1005,14 @@ impl Sink for MeiliSink {
     async fn apply(&self, target: &IndexTarget, ops: Vec<DocOp>) -> Result<ApplyReport, SinkError> {
         let mut report = ApplyReport::default();
         for (kind, range) in runs(&ops) {
+            // An embedder runs on these documents, with the key a settings
+            // copy may have given it.
             self.apply_run(target, kind, &ops[range], &mut report)
-                .await?;
+                .await
+                .map_err(|e| without_keys(e, &self.embedder_keys))?;
+        }
+        for rejected in &mut report.rejected {
+            rejected.reason = scrub(std::mem::take(&mut rejected.reason), &self.embedder_keys);
         }
         Ok(report)
     }
@@ -955,7 +1045,7 @@ impl Sink for MeiliSink {
     }
 
     async fn copy_settings(&self, from: &str, to: &str) -> Result<(), SinkError> {
-        let settings = match self
+        let mut settings = match self
             .client
             .call(Method::GET, &["indexes", from, "settings"], &[], None)
             .await?
@@ -966,11 +1056,12 @@ impl Sink for MeiliSink {
             Err(api) if api.status == StatusCode::NOT_FOUND => return Ok(()),
             Err(api) => return Err(map_api_error("reading settings", &api)),
         };
-        if let Some(embedder) = embedder_with_api_key(&settings) {
+        if let Some(embedder) = restore_embedder_keys(&mut settings, &self.embedder_keys) {
             return Err(SinkError::Config(format!(
                 "cannot copy the settings of index `{from}` to `{to}`: embedder `{embedder}` has \
                  an API key, {EMBEDDER_KEY_NOT_COPIED}; copying it would install a broken key. \
-                 Empty `{from}` (its settings are kept) or remove the key, then resume"
+                 Empty `{from}` (its settings are kept), remove the key, or name that key in \
+                 the destination's `embedder_keys` under the embedder's `url`, then resume"
             )));
         }
         // Every key of `GET /settings` is accepted back by `PATCH` (checked
@@ -985,6 +1076,7 @@ impl Sink for MeiliSink {
             &[],
         )
         .await
+        .map_err(|e| without_keys(e, &self.embedder_keys))
     }
 
     async fn document_count(&self, uid: &str) -> Result<Option<u64>, SinkError> {

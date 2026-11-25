@@ -840,6 +840,143 @@ async fn put_keeps_redacted_secrets() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
+const GATEWAY: &str = "https://gateway.example/v1/embeddings";
+
+fn stored_embedder_keys(spec: &meili_connect_core::SyncSpec) -> Vec<(String, String)> {
+    spec.destination
+        .embedder_keys
+        .iter()
+        .map(|(url, key)| (url.clone(), key.expose().to_owned()))
+        .collect()
+}
+
+#[tokio::test]
+async fn embedder_keys_are_write_only_and_follow_their_url() {
+    let a = app(AuthConfig::open());
+    let key = format!("embedder-{SECRET_MARK}");
+    let mut body = sync_body("s");
+    body["destination"]["embedder_keys"] = json!({ GATEWAY: key });
+    let (status, created) = call(&a.router, "POST", "/syncs", &[], Some(body)).await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    assert_no_secret(&created);
+    assert_eq!(
+        created["destination"]["embedder_keys"],
+        json!({ GATEWAY: "<redacted>" })
+    );
+    let id = created["id"].as_str().unwrap().to_owned();
+    let stored = async || {
+        a.store
+            .get_sync(None, &id)
+            .await
+            .unwrap()
+            .unwrap()
+            .readable()
+            .unwrap()
+            .spec
+    };
+    assert_eq!(
+        stored_embedder_keys(&stored().await),
+        [(GATEWAY.to_owned(), key.clone())]
+    );
+    for uri in ["/syncs".to_owned(), format!("/syncs/{id}")] {
+        let (_, body) = call(&a.router, "GET", &uri, &[], None).await;
+        assert_no_secret(&body);
+    }
+
+    // What was read goes back as is: the key is kept.
+    let (_, mut current) = call(&a.router, "GET", &format!("/syncs/{id}"), &[], None).await;
+    current["name"] = json!("renamed");
+    let put =
+        async |body: Value| call(&a.router, "PUT", &format!("/syncs/{id}"), &[], Some(body)).await;
+    let (status, updated) = put(current.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{updated}");
+    assert_no_secret(&updated);
+    assert_eq!(
+        stored_embedder_keys(&stored().await),
+        [(GATEWAY.to_owned(), key.clone())]
+    );
+
+    // A placeholder never follows another embedder URL...
+    let mut moved = current.clone();
+    moved["destination"]["embedder_keys"] =
+        json!({ "https://attacker.example/v1/embeddings": "<redacted>" });
+    let (status, body) = put(moved).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap()
+            .contains("destination.embedder_keys"),
+        "{body}"
+    );
+    // ...nor another Meilisearch.
+    let mut moved = current.clone();
+    moved["destination"]["url"] = json!("http://attacker.example:7700");
+    moved["destination"]["api_key"] = json!("other-key");
+    let (status, body) = put(moved).await;
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (StatusCode::UNPROCESSABLE_ENTITY, Some("secret_required")),
+        "{body}"
+    );
+    assert_eq!(
+        stored_embedder_keys(&stored().await),
+        [(GATEWAY.to_owned(), key.clone())],
+        "nothing changed"
+    );
+
+    // A new key replaces the stored one; leaving the field out drops it.
+    let mut rotated = current.clone();
+    rotated["destination"]["embedder_keys"] = json!({ GATEWAY: "rotated" });
+    assert_eq!(put(rotated).await.0, StatusCode::OK);
+    assert_eq!(
+        stored_embedder_keys(&stored().await),
+        [(GATEWAY.to_owned(), "rotated".to_owned())]
+    );
+    let mut dropped = current.clone();
+    dropped["destination"]
+        .as_object_mut()
+        .unwrap()
+        .remove("embedder_keys");
+    let (status, updated) = put(dropped).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(updated["destination"].get("embedder_keys").is_none());
+    assert!(stored_embedder_keys(&stored().await).is_empty());
+
+    // What names no URL an embedder could call, or no key, is refused.
+    for keys in [
+        json!({ "gateway.example/v1/embeddings": "k" }),
+        json!({ format!("{GATEWAY} "): "k" }),
+        json!({ "https://user:pw@gateway.example/v1/embeddings": "k" }),
+        json!({ GATEWAY: "" }),
+        json!({ GATEWAY: 1 }),
+        json!([GATEWAY]),
+    ] {
+        let mut body = sync_body("other");
+        body["destination"]["embedder_keys"] = keys.clone();
+        let (status, body) = call(&a.router, "POST", "/syncs", &[], Some(body)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{keys}: {body}");
+    }
+}
+
+#[tokio::test]
+async fn a_new_embedder_key_keeps_the_checkpoint() {
+    let old: meili_connect_core::SyncSpec = {
+        let mut body = sync_body("s");
+        body["id"] = json!("s1");
+        body["tenant"] = Value::Null;
+        serde_json::from_value(body).unwrap()
+    };
+    let mut new = old.clone();
+    new.destination
+        .embedder_keys
+        .insert(GATEWAY.to_owned(), meili_connect_core::Secret::new("k"));
+    assert_eq!(
+        crate::manager::SpecChange::between(&old, &new),
+        crate::manager::SpecChange::Other
+    );
+}
+
 // ------------------------------------------------------------- validation
 
 #[tokio::test]

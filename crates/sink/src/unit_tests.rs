@@ -30,6 +30,7 @@ fn sink(server: &MockServer, opts: SinkOptions) -> MeiliSink {
     let dest = MeiliDestination {
         url: server.uri(),
         api_key: Secret::new(KEY),
+        embedder_keys: Default::default(),
     };
     MeiliSink::new(&dest, opts).unwrap()
 }
@@ -1033,6 +1034,7 @@ async fn connection_refused_is_transient() {
     let dest = MeiliDestination {
         url: format!("http://127.0.0.1:{port}"),
         api_key: Secret::new(KEY),
+        embedder_keys: Default::default(),
     };
     let s = MeiliSink::new(&dest, opts()).unwrap();
     let e = s.document_count("x").await.unwrap_err();
@@ -1044,6 +1046,7 @@ fn policed(url: String, policy: HostPolicy) -> Result<MeiliSink, SinkError> {
     let dest = MeiliDestination {
         url,
         api_key: Secret::new(KEY),
+        embedder_keys: Default::default(),
     };
     MeiliSink::new(
         &dest,
@@ -1129,6 +1132,7 @@ fn bad_urls_are_config_errors() {
         let dest = MeiliDestination {
             url: url.into(),
             api_key: Secret::new(KEY),
+            embedder_keys: Default::default(),
         };
         assert!(matches!(
             MeiliSink::new(&dest, opts()),
@@ -1669,6 +1673,224 @@ async fn copy_settings_refuses_redacted_api_keys() {
         .unwrap();
 }
 
+const GATEWAY: &str = "https://gateway.example/v1/embeddings";
+const EMBEDDER_KEY: &str = "lm-real-embedder-key";
+
+/// A sink that holds the key of the embedders calling [`GATEWAY`].
+fn sink_with_embedder_key(server: &MockServer) -> MeiliSink {
+    let dest = MeiliDestination {
+        url: server.uri(),
+        api_key: Secret::new(KEY),
+        embedder_keys: [(GATEWAY.to_owned(), Secret::new(EMBEDDER_KEY))].into(),
+    };
+    MeiliSink::new(&dest, opts()).unwrap()
+}
+
+async fn mount_settings(server: &MockServer, index: &str, settings: &Value) {
+    Mock::given(method("GET"))
+        .and(path(format!("/indexes/{index}/settings")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(settings.clone()))
+        .mount(server)
+        .await;
+}
+
+#[tokio::test]
+async fn copy_settings_restores_the_key_of_an_embedder_at_a_named_url() {
+    let server = MockServer::start().await;
+    let embedders = |key: &str| {
+        json!({"searchableAttributes": ["*"], "embedders": {
+            "default": {"source": "rest", "url": GATEWAY, "apiKey": key,
+                "request": {"model": "m", "input": ["{{text}}", "{{..}}"]},
+                "documentTemplate": "{{ doc.title }}"},
+            "mix": {"source": "composite",
+                "searchEmbedder": {"source": "userProvided", "dimensions": 3},
+                "indexingEmbedder": {"source": "rest", "url": GATEWAY, "apiKey": key}},
+            "mine": {"source": "userProvided", "dimensions": 3},
+        }})
+    };
+    mount_settings(&server, "live", &embedders("lm-realXXX...")).await;
+    // Everything else is copied as read; only the keys change.
+    Mock::given(method("PATCH"))
+        .and(path("/indexes/shadow/settings"))
+        .and(wiremock::matchers::body_json(embedders(EMBEDDER_KEY)))
+        .respond_with(task_ok(5))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(path("/tasks/5"))
+        .respond_with(task_state(5, "succeeded", None))
+        .mount(&server)
+        .await;
+    sink_with_embedder_key(&server)
+        .copy_settings("live", "shadow")
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn copy_settings_gives_the_key_to_no_other_url() {
+    let server = MockServer::start().await;
+    // The key is only ever written next to the exact URL it was named for.
+    let elsewhere = [
+        json!({"source": "rest", "url": "https://attacker.example/v1/embeddings", "apiKey": "XXX..."}),
+        json!({"source": "rest", "url": format!("{GATEWAY}/"), "apiKey": "XXX..."}),
+        json!({"source": "rest", "url": format!("{GATEWAY}?to=attacker.example"), "apiKey": "XXX..."}),
+        json!({"source": "rest", "url": "https://GATEWAY.example/v1/embeddings", "apiKey": "XXX..."}),
+        json!({"source": "rest", "url": format!("{GATEWAY}@attacker.example/"), "apiKey": "XXX..."}),
+        json!({"source": "openAi", "model": "m", "apiKey": "sk-XXXXX..."}),
+        json!({"source": "rest", "url": [GATEWAY], "apiKey": "XXX..."}),
+        json!({"source": "composite",
+            "searchEmbedder": {"source": "rest", "url": GATEWAY, "apiKey": "XXX..."},
+            "indexingEmbedder": {"source": "rest", "url": "https://attacker.example/", "apiKey": "XXX..."}}),
+        // The URL of the parent says nothing about a nested embedder.
+        json!({"source": "composite", "url": GATEWAY,
+            "indexingEmbedder": {"source": "rest", "apiKey": "XXX..."}}),
+        // Only an embedder holds a key: nothing that looks like one inside
+        // what Meilisearch sends as is (headers, the request, fragments) to
+        // wherever the embedder points gets the key.
+        json!({"source": "rest", "url": "https://attacker.example/embed",
+            "headers": {"apiKey": "x", "url": GATEWAY}}),
+        json!({"source": "rest", "url": "https://attacker.example/embed",
+            "request": {"input": "{{text}}", "auth": {"apiKey": "x", "url": GATEWAY}}}),
+        json!({"source": "rest", "url": "https://attacker.example/embed",
+            "indexingFragments": {"f": {"value": {"apiKey": "x", "url": GATEWAY}}}}),
+        json!({"source": "composite",
+            "searchEmbedder": {"source": "rest", "url": "https://attacker.example/embed",
+                "headers": {"apiKey": "x", "url": GATEWAY}},
+            "indexingEmbedder": {"source": "userProvided", "dimensions": 3}}),
+        json!({"source": "composite",
+            "searchEmbedder": {"source": "userProvided", "dimensions": 3},
+            "indexingEmbedder": {"source": "composite",
+                "indexingEmbedder": {"source": "rest", "url": GATEWAY, "apiKey": "XXX..."}}}),
+        // At the named URL, with a key that does not start like the named
+        // one: another key, which the named one would replace.
+        json!({"source": "rest", "url": GATEWAY, "apiKey": "sk-otXXXX..."}),
+    ];
+    Mock::given(method("PATCH"))
+        .respond_with(task_ok(5))
+        .expect(0)
+        .mount(&server)
+        .await;
+    for (i, embedder) in elsewhere.into_iter().enumerate() {
+        let from = format!("live{i}");
+        // One the sink has the key of, next to the one it must refuse.
+        let settings = json!({"embedders": {
+            "a-lumen": {"source": "rest", "url": GATEWAY, "apiKey": "lm-realXXX..."},
+            "other": embedder,
+        }});
+        mount_settings(&server, &from, &settings).await;
+        let e = sink_with_embedder_key(&server)
+            .copy_settings(&from, "shadow")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&e, SinkError::Config(m)
+                if m.contains("`other`") && m.contains(crate::EMBEDDER_KEY_NOT_COPIED)),
+            "case {i}: {e:?}"
+        );
+        assert!(!e.to_string().contains(EMBEDDER_KEY), "case {i}");
+    }
+}
+
+#[tokio::test]
+async fn copy_settings_restores_a_key_however_much_of_it_meilisearch_shows() {
+    // Meilisearch leaves more or less of a key readable with its length.
+    for (i, shown) in [
+        "XXX...",
+        "lmXXXX...",
+        "lm-XXXXX...",
+        "lm-reXXXXXX...",
+        7.to_string().as_str(),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let server = MockServer::start().await;
+        let embedder = |key: Value| json!({"embedders": {"default": {"source": "rest", "url": GATEWAY, "apiKey": key}}});
+        // Not a string: nothing readable to compare, the named key goes in.
+        let shown = if i == 4 { json!(7) } else { json!(shown) };
+        mount_settings(&server, "live", &embedder(shown)).await;
+        Mock::given(method("PATCH"))
+            .and(path("/indexes/shadow/settings"))
+            .and(wiremock::matchers::body_json(embedder(json!(EMBEDDER_KEY))))
+            .respond_with(task_ok(5))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path("/tasks/5"))
+            .respond_with(task_state(5, "succeeded", None))
+            .mount(&server)
+            .await;
+        sink_with_embedder_key(&server)
+            .copy_settings("live", "shadow")
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn a_failed_write_never_shows_the_embedder_key() {
+    let server = MockServer::start().await;
+    // The embedding server's refusal, quoted by Meilisearch.
+    Mock::given(method("POST"))
+        .and(path("/indexes/movies/documents"))
+        .respond_with(ResponseTemplate::new(403).set_body_json(json!({
+            "message": format!("the embedding server refused `Bearer {EMBEDDER_KEY}`"),
+            "code": "invalid_api_key", "type": "auth", "link": "",
+        })))
+        .mount(&server)
+        .await;
+    let e = sink_with_embedder_key(&server)
+        .apply(&target(), vec![replace("1", json!({"t": "x"}))])
+        .await
+        .unwrap_err();
+    let text = format!("{e} {e:?}");
+    assert!(!text.contains(EMBEDDER_KEY), "{text}");
+    assert!(text.contains("<redacted>"), "{text}");
+}
+
+#[tokio::test]
+async fn a_refused_settings_copy_never_shows_the_embedder_key() {
+    let server = MockServer::start().await;
+    let settings = json!({"embedders": {
+        "default": {"source": "rest", "url": GATEWAY, "apiKey": "lm-realXXX..."},
+    }});
+    mount_settings(&server, "live", &settings).await;
+    mount_settings(&server, "live2", &settings).await;
+    // Meilisearch, or the embedding server it quotes, echoing the key back.
+    Mock::given(method("PATCH"))
+        .and(path("/indexes/shadow/settings"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "message": format!("embedder `default` cannot authenticate with {EMBEDDER_KEY}"),
+            "code": "invalid_settings_embedders", "type": "invalid_request", "link": "",
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path("/indexes/shadow2/settings"))
+        .respond_with(task_ok(7))
+        .mount(&server)
+        .await;
+    Mock::given(path("/tasks/7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "uid": 7, "status": "failed", "error": {
+                "message": format!("the embedding server refused `Bearer {EMBEDDER_KEY}`"),
+                "code": "vector_embedding_error", "type": "invalid_request",
+            },
+        })))
+        .mount(&server)
+        .await;
+    for (from, to) in [("live", "shadow"), ("live2", "shadow2")] {
+        let e = sink_with_embedder_key(&server)
+            .copy_settings(from, to)
+            .await
+            .unwrap_err();
+        let text = format!("{e} {e:?}");
+        assert!(!text.contains(EMBEDDER_KEY), "{from}: {text}");
+        assert!(text.contains("<redacted>"), "{from}: {text}");
+    }
+}
+
 #[tokio::test]
 async fn document_count_cases() {
     let server = MockServer::start().await;
@@ -1698,6 +1920,7 @@ async fn url_prefix_and_escaping() {
     let dest = MeiliDestination {
         url: format!("{}/meili/", server.uri()),
         api_key: Secret::new(""),
+        embedder_keys: Default::default(),
     };
     let s = MeiliSink::new(&dest, opts()).unwrap();
     assert_eq!(s.document_count("a/b").await.unwrap(), Some(1));

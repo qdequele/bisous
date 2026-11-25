@@ -106,8 +106,9 @@ pub trait Sink: Send + Sync {
     /// Copy the settings of `from` onto `to` and wait for the task, so a
     /// shadow index is built with the live index's configuration. `to` may
     /// not exist yet (it is created). When `from` does not exist this is a
-    /// no-op. Settings that Meilisearch returns redacted (embedder API
-    /// keys) cannot be copied: fail with `SinkError::Config` naming the
+    /// no-op. Meilisearch returns embedder API keys redacted: one the
+    /// destination names (`MeiliDestination::embedder_keys`) is put back,
+    /// any other cannot be copied: fail with `SinkError::Config` naming the
     /// embedder instead of installing a broken key.
     async fn copy_settings(&self, from: &str, to: &str) -> Result<(), SinkError>;
 
