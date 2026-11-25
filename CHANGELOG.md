@@ -207,6 +207,30 @@ All notable changes to meili-connect are listed here. The format follows
   plain restart (the checkpoint is kept). The Lab sends
   the key of a team instance's Lumen embedders this way.
 
+### Changed
+
+- An index the engine creates when a sync starts gets
+  `proximityPrecision: byAttribute` and `wordPosition.enabled: false`
+  instead of Meilisearch's defaults: a lighter index for tables that can be
+  large. The cost is in search: a phrase search is no longer exact (on
+  Meilisearch 1.58, `"new york"` matches every document with both words in
+  the same attribute, in any order and at any distance), proximity only
+  ranks on "same attribute", and the `wordPosition` ranking rule no longer
+  sorts anything.
+  - The settings go in the request that creates the index (a settings
+    update, then its primary key), so it never exists without them. A
+    Meilisearch that does not know `wordPosition` gets `proximityPrecision`
+    only (checked on 1.34, which does not know it, and 1.58, which does).
+  - An index that already exists keeps its settings, and so does one
+    rebuilt by a resync. Create the index yourself first, or change its
+    settings afterwards, to choose otherwise. Work still queued on an index
+    is waited for before it is created, so an index being created by
+    somebody else is not given these settings.
+  - The Meilisearch key needs `settings.update` and `indexes.update` from
+    the first sync on (the Lab's `lab-connect` key has both). A key with
+    `indexes.create` only could create indexes before; it is now refused at
+    creation.
+
 ### Fixed
 
 - A first sync interrupted while it copied into an index whose embedder has
